@@ -1,2 +1,8 @@
-# medical
+# medical by LAION
 This repository will be a summary and outlook on all our open, medical, AI advancements.
+
+## Project ideas
+
+## Datasets
+
+## Methods
