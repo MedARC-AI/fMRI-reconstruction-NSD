@@ -8,6 +8,6 @@ This repository will be a summary and outlook on all our open, medical, AI advan
 - Replicate [PLOS paper](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1006633) with current image generation techniques
 
 ## Datasets
-- image-text pairs of pathology images (~10k) https://warwick.ac.uk/fac/cross_fac/tia/data/arch
+- image-text pairs of pathology images (~10k) [Go to dataset](https://warwick.ac.uk/fac/cross_fac/tia/data/arch)
 
 ## Methods
