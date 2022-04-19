@@ -5,6 +5,7 @@ This repository will be a summary and outlook on all our open, medical, AI advan
 
 ## Project ideas
 - Fine-tune clip for pathology images
+- Replicate [PLOS paper](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1006633) with current image generation techniques
 
 ## Datasets
 - image-text pairs of pathology images (~10k) https://warwick.ac.uk/fac/cross_fac/tia/data/arch
