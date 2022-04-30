@@ -8,5 +8,15 @@ To follow along you will need to grab a few files:
 2. An MRI scan, located [here](https://openneuro.org/datasets/ds001506/versions/1.3.1/file-display/sub-01:ses-imagery01:anat:sub-01_ses-imagery01_inplaneT2.nii.gz)
 3. A training data sample, in [this repo](https://github.com/KamitaniLab/DeepImageReconstruction/tree/master/data/fmri)
 
----
+### Project outline
+- [x] Sowcase of fMRI datasets in [jupyter notebook](fMRI_h5_to_wds.ipynb)
+- [x] [WebDataset conversion](fMRI_FileTypes.ipynb) for easy use in exisiting training setups
+- [ ] [CLIP inference](fMRI_CLIP_inference.ipynb) on a sample fMRI record
+- [ ] [Whole training example](fMRI_CLIP_training.ipynb) for CLIP fine-tuning
+- [ ] Scaling up training runs with WandB
+- [ ] In-project evaluation metrics
+- [ ] Comparison with results of the previous paper
+- [ ] Publication process
+
+--- 
 🚧 Under Construction 🚧
