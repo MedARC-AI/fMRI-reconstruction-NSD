@@ -9,8 +9,8 @@ To follow along you will need to grab a few files:
 3. A training data sample, in [this repo](https://github.com/KamitaniLab/DeepImageReconstruction/tree/master/data/fmri)
 
 ### Project outline
-- [x] Sowcase of fMRI datasets in [jupyter notebook](fMRI_h5_to_wds.ipynb)
-- [x] [WebDataset conversion](fMRI_FileTypes.ipynb) for easy use in exisiting training setups
+- [x] Sowcase of fMRI datasets in [jupyter notebook](fMRI_FileTypes.ipynb)
+- [x] [WebDataset conversion](fMRI_h5_to_wds.ipynb) for easy use in exisiting training setups
 - [ ] [CLIP inference](fMRI_CLIP_inference.ipynb) on a sample fMRI record
 - [ ] [Whole training example](fMRI_CLIP_training.ipynb) for CLIP fine-tuning
 - [ ] Scaling up training runs with WandB
