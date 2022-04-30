@@ -16,7 +16,6 @@ To follow along you will need to grab a few files:
 - [ ] Scaling up training runs with WandB
 - [ ] In-project evaluation metrics
 - [ ] Comparison with results of the previous paper
-- [ ] Publication process
 
 --- 
 🚧 Under Construction 🚧
