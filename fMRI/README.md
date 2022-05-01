@@ -20,6 +20,7 @@ To follow along you will need to grab a few files:
 
 ### Literature
 - [Preprocessing script](https://github.com/KamitaniLab/End2EndDeepImageReconstruction/blob/master/end2end_create_lmdb.py)
+    - https://github.com/KamitaniLab/bdpy
 - [Repository from 2019 fMRI paper](https://github.com/KamitaniLab/End2EndDeepImageReconstruction)
 - [Related paper from 2019 from the same lab](https://www.frontiersin.org/articles/10.3389/fncom.2019.00021/full)
 - [Recent preprint from the same lab](https://www.biorxiv.org/content/10.1101/2021.12.31.474501v1.full.pdf+html )
