@@ -17,5 +17,13 @@ To follow along you will need to grab a few files:
 - [ ] In-project evaluation metrics
 - [ ] Comparison with results of the previous paper
 
+### Literature
+- [Preprocessing script](https://github.com/KamitaniLab/End2EndDeepImageReconstruction/blob/master/end2end_create_lmdb.py)
+- [Repository from 2019 fMRI paper](https://github.com/KamitaniLab/End2EndDeepImageReconstruction)
+- [Related paper from 2019 from the same lab](https://www.frontiersin.org/articles/10.3389/fncom.2019.00021/full)
+- [Recent preprint from the same lab](https://www.biorxiv.org/content/10.1101/2021.12.31.474501v1.full.pdf+html )
+- [Overview of fine-tuned CLIP models](http://sujitpal.blogspot.com/2021/10/fine-tuning-openai-clip-for-different.html)
+- [Elsevier CLIP-trained model for image-search](https://github.com/elsevierlabs-os/clip-image-search)
+
 --- 
 🚧 Under Construction 🚧
