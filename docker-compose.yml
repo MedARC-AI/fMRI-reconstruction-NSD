@@ -1,0 +1,12 @@
+version: "2.3"
+
+services:
+  laion_medical_research:
+    build: ./Docker
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - "./:/opt/laion_medical"
+    ports:
+      - "127.0.0.1:8888:8888"

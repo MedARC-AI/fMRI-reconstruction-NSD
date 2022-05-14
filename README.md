@@ -15,3 +15,7 @@ This repository will be a summary and outlook on all our open, medical, AI advan
 
 ## Methods
 - Fine-tuning existing CLIP models
+
+## Installation of development environment (for contributors)
+
+- See [dev_environment.md](./dev_environment.md)
