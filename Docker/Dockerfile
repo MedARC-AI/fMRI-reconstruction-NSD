@@ -17,4 +17,4 @@ RUN useradd -ms /bin/zsh dev && \
     echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 USER dev
 
-CMD ["jupyter", "lab", "--ip=0.0.0.0", "--NotebookApp.custom_display_url=http://localhost:8888"]
+CMD ["jupyter", "lab", "--ip=0.0.0.0", "--NotebookApp.custom_display_url=http://127.0.0.1:8888"]
