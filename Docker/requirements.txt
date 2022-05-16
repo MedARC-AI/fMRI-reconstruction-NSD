@@ -10,6 +10,7 @@ audioread==2.1.9
 Babel==2.9.1
 backcall==0.2.0
 backports.functools-lru-cache==1.6.4
+bdpy==0.18
 beautifulsoup4==4.11.1
 bleach==5.0.0
 blis==0.7.7
@@ -62,6 +63,7 @@ google-auth-oauthlib==0.4.6
 graphsurgeon==0.4.5
 grpcio==1.44.0
 h5py==3.6.0
+hdf5storage==0.1.18
 HeapDict==1.0.1
 hypothesis==4.50.8
 idna==3.3
