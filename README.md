@@ -12,7 +12,7 @@ This repository will be a summary and outlook on all our open, medical, AI advan
 
 ## Datasets
 - [1] image-text pairs of pathology images (~10k) [Go to dataset](https://warwick.ac.uk/fac/cross_fac/tia/data/arch)
-
+- TCGA Slide-caption pairs (~3K) with captions scraped from pathology reports [Go to dataset](https://gitlab.com/BioAI/pathology-report-information-extraction) [Scraping methodology](https://ieeexplore.ieee.org/document/9313347)
 ## Methods
 - Fine-tuning existing CLIP models
 
