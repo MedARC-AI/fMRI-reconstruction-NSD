@@ -1,3 +1,4 @@
-.ipynb_checkpoints/
-fMRI/checkpoints
-fMRI/__pycache__
+**/__pycache__/
+**/*.ipynb_checkpoints
+**/checkpoints
+**/.DS_Store
