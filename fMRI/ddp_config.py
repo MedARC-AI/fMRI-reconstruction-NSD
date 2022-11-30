@@ -1,5 +1,7 @@
 # Distributed Data Parallel initialization
 # Setup multi-gpu PyTorch distributed parallel processing (ddp) if multiple gpus are found
+import os
+import torch
 def ddp_test():
     try:
         # set up multi-gpu distributed parallel processing
@@ -28,7 +30,7 @@ def ddp_test():
         print("DistributedDataParallel enabled!")
     else:
         print("NOT using distributed parallel processing!")
-    return using_ddp
+    return using_ddp, local_rank
 
 # Slurm reference for DDP:
 ## !/bin/bash
