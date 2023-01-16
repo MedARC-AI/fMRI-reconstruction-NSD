@@ -104,28 +104,6 @@ def dcl(preds, targs, temp=0.1):
     negative_loss = torch.logsumexp(neg_similarity + neg_mask, dim=1, keepdim=False)
     return (positive_loss + negative_loss).mean()
 
-def mixco(voxels, beta=0.15, s_thresh=0.5):
-    perm = torch.randperm(voxels.shape[0]).to(voxels.device)
-    voxels_shuffle = voxels[perm]
-    betas = torch.distributions.Beta(beta, beta).sample([voxels.shape[0]]).to(voxels.device)
-    select = (torch.rand(voxels.shape[0]) <= s_thresh).to(voxels.device)
-    
-    voxels[select] = voxels[select] * betas[select].reshape(-1, 1) + voxels_shuffle[select] * (1 - betas[select]).reshape(-1, 1)
-    betas[~select] = 1
-    return voxels, perm, betas, select
-
-
-def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None):
-    brain_clip = (preds @ targs.T)/temp
-    if perm is not None and betas is not None and select is not None:
-        probs = torch.diag(betas)
-        probs[torch.arange(preds.shape[0]).to(preds.device), perm] = 1 - betas
-
-        loss = -(brain_clip.log_softmax(-1) * probs).sum(-1).mean()
-        return loss
-    else:
-        return F.cross_entropy(brain_clip, torch.arange(brain_clip.shape[0]).to(brain_clip.device))
-
 def count_params(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -273,12 +251,43 @@ def load_sd_pipeline():
 
     return sd_pipe, unet, vae, noise_scheduler
 
-def sample_images(
-    clip_extractor, brain_net, unet, vae, noise_scheduler, diffusion_prior,
-    voxel, img_input,
-    num_inference_steps=50, clip_guidance_scale=7.5, vox_guidance_scale=7.5, num_per_sample=4,
-    prior_timesteps=100,
+@torch.no_grad()
+def denoising_loop(
+    unet, noise_scheduler, num_inference_steps, num_per_sample, encoder_hidden_states,
+    guidance_scale, latents=None,
 ):
+    noise_scheduler.set_timesteps(num_inference_steps, device=device)
+    timesteps = noise_scheduler.timesteps
+
+    if latents is None:
+        print("generating latents")
+        latents = torch.randn([num_per_sample, 4, 64, 64], device=device)
+    
+    # Denoising loop (original clip)
+    for i, t in enumerate(timesteps):
+        # expand the latents if we are doing classifier free guidance
+        latent_model_input = torch.cat([latents] * 2)
+        latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
+
+        # predict the noise residual
+        noise_pred = unet(latent_model_input, t, encoder_hidden_states=encoder_hidden_states).sample
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+        # compute the previous noisy sample x_t -> x_t-1
+        latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
+
+    return latents
+
+#@torch.no_grad()
+def sample_images(
+    clip_extractor, brain_net, unet, vae, noise_scheduler, diffusion_prior, voxel, img_input,
+    num_inference_steps=50, clip_guidance_scale=7.5, vox_guidance_scale=7.5, num_per_sample=4,
+    prior_timesteps=None,
+    seed=None,
+):
+    print('seed', seed)
+    
     assert voxel.shape[0] == img_input.shape[0], 'batches must be the same for voxels and images'
     n_examples = voxel.shape[0]
 
@@ -313,6 +322,9 @@ def sample_images(
     # ])
 
     for idx in range(n_examples):
+        if seed is not None:
+            seed_everything(seed)
+
         image = clip_extractor.resize_image(img_input[[idx]])
         
         # Original clip embedding:
@@ -320,10 +332,6 @@ def sample_images(
         # clip_emb = sd_pipe._encode_image(tform(image), device, 1, False).squeeze(1)
         # print('clip_emb', clip_emb.shape)
         norm_orig = clip_emb.norm().item()
-        
-        # duplicate the embedding to serve classifier free guidance
-        clip_emb = torch.cat([torch.zeros_like(clip_emb), clip_emb]).unsqueeze(1).to(device).float()
-        clip_latents = torch.randn([1, 4, 64, 64], device=device)
 
         # Encode voxels to CLIP space
         image_embeddings = brain_net(voxel[[idx]].to(device).float())
@@ -335,63 +343,82 @@ def sample_images(
                                             text_cond = dict(text_embed = image_embeddings), 
                                             cond_scale = 1., timesteps = prior_timesteps)
         norm_post_prior = image_embeddings.norm().item()
-        cos_sim = nn.functional.cosine_similarity(image_embeddings, clip_emb[1], dim=1).item()
+        cos_sim = nn.functional.cosine_similarity(image_embeddings, clip_emb, dim=1).item()
         
         print(f"Cosine sim: {cos_sim:.3f}")
         print(f"norms | orig: {norm_orig:.3f}, pre_prior: {norm_pre_prior:.3f}, post_prior: {norm_post_prior:.3f}")
 
-        plt.plot(clip_emb[1].detach().cpu().numpy().flatten(),label='CLIP-image emb.')
+        plt.plot(clip_emb.detach().cpu().numpy().flatten(),label='CLIP-image emb.')
         plt.plot(image_embeddings.detach().cpu().numpy().flatten(),label='CLIP-voxel emb.')
-        plt.title('MSE: %.5f' % nn.functional.mse_loss(image_embeddings, clip_emb[1]).item())
+        plt.title('MSE: %.5f' % nn.functional.mse_loss(image_embeddings, clip_emb).item())
         plt.legend()
         plt.show()
-
-        # break
 
         # duplicate the embedding to serve classifier free guidance
         image_embeddings = image_embeddings.repeat(num_per_sample, 1)
         image_embeddings = torch.cat([torch.zeros_like(image_embeddings), image_embeddings]).unsqueeze(1).to(device)
 
         # Prepare timesteps
-        noise_scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = noise_scheduler.timesteps
+        # noise_scheduler.set_timesteps(num_inference_steps, device=device)
+        # timesteps = noise_scheduler.timesteps
         latents = torch.randn([num_per_sample, 4, 64, 64], device=device)
+
+        # duplicate the embedding to serve classifier free guidance
+        clip_emb = torch.cat([torch.zeros_like(clip_emb), clip_emb]).unsqueeze(1).to(device).float()
+        # clip_latents = torch.randn([1, 4, 64, 64], device=device)
+        clip_latents = latents[0].unsqueeze(0).clone() # use the same latent as the first brain image
+
+        if seed is not None:
+            seed_everything(seed)
+
+        clip_latents = denoising_loop(
+            unet, noise_scheduler, num_inference_steps, 1, clip_emb, clip_guidance_scale, 
+            latents=clip_latents
+        )
+
+        if seed is not None:
+            seed_everything(seed)
+
+        latents = denoising_loop(
+            unet, noise_scheduler, num_inference_steps, num_per_sample, image_embeddings, vox_guidance_scale, 
+            latents=latents
+        )
         
-        # Denoising loop (original clip)
-        for i, t in enumerate(timesteps):
-            # expand the latents if we are doing classifier free guidance
-            latent_model_input = torch.cat([clip_latents] * 2)
-            latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
+        # # Denoising loop (original clip)
+        # for i, t in enumerate(timesteps):
+        #     # expand the latents if we are doing classifier free guidance
+        #     latent_model_input = torch.cat([clip_latents] * 2)
+        #     latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
 
-            # predict the noise residual
-            noise_pred = unet(latent_model_input, t, encoder_hidden_states=clip_emb).sample
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + clip_guidance_scale * (noise_pred_text - noise_pred_uncond)
+        #     # predict the noise residual
+        #     noise_pred = unet(latent_model_input, t, encoder_hidden_states=clip_emb).sample
+        #     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        #     noise_pred = noise_pred_uncond + clip_guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-            # compute the previous noisy sample x_t -> x_t-1
-            clip_latents = noise_scheduler.step(noise_pred, t, clip_latents).prev_sample
+        #     # compute the previous noisy sample x_t -> x_t-1
+        #     clip_latents = noise_scheduler.step(noise_pred, t, clip_latents).prev_sample
         
-        decoded_clip_image = decode_latents(clip_latents)
+        # decoded_clip_image = decode_latents(clip_latents)
         
-        # Denoising loop (brain recon)
-        for i, t in enumerate(timesteps):
-            # expand the latents if we are doing classifier free guidance
-            latent_model_input = torch.cat([latents] * 2)
-            latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
+        # # Denoising loop (brain recon)
+        # for i, t in enumerate(timesteps):
+        #     # expand the latents if we are doing classifier free guidance
+        #     latent_model_input = torch.cat([latents] * 2)
+        #     latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
 
-            # predict the noise residual
-            noise_pred = unet(latent_model_input, t, encoder_hidden_states=image_embeddings).sample
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + vox_guidance_scale * (noise_pred_text - noise_pred_uncond)
+        #     # predict the noise residual
+        #     noise_pred = unet(latent_model_input, t, encoder_hidden_states=image_embeddings).sample
+        #     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        #     noise_pred = noise_pred_uncond + vox_guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-            # compute the previous noisy sample x_t -> x_t-1
-            latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
+        #     # compute the previous noisy sample x_t -> x_t-1
+        #     latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
             
         fig, ax = plt.subplots(1, 2+num_per_sample, figsize=(23,3))
         ax[0].set_title(f"Original Image")
         ax[0].imshow(torch_to_Image(image))
         ax[1].set_title(f"Recon from original CLIP")
-        ax[1].imshow(torch_to_Image(decoded_clip_image))
+        ax[1].imshow(torch_to_Image(decode_latents(clip_latents)))
         for i in range(2, 2+num_per_sample):
             recon = decode_latents(latents[i-2].unsqueeze(0))
             ax[i].set_title(f"Recon {i-1} from brain")
