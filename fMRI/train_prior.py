@@ -44,6 +44,8 @@ if __name__ == '__main__':
     n_samples_save = 8
     # how many pairs of (orig, augmented) images to save
     n_aug_save = 16
+    remote_data = False
+    data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
     # -----------------------------------------------------------------------------
     # params for all models
     outdir = os.path.expanduser(f'~/data/neuro/models/{model_name}')
@@ -123,7 +125,20 @@ if __name__ == '__main__':
     # annots = np.load('/scratch/gpfs/KNORMAN/nsdgeneral_hdf5/COCO_73k_annots_curated.npy',allow_pickle=True)
     # subj01_annots = annots[subj01_order]
 
-    train_dl, val_dl = utils.get_dataloaders(batch_size, image_var, num_workers=num_workers)
+    if remote_data:
+        # pull from huggingface datasets
+        train_url, val_url = utils.get_huggingface_urls(data_commit)
+    else:
+        # local paths
+        train_url = "/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/train/train_subj01_{0..49}.tar"
+        val_url = "/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/val/val_subj01_0.tar"
+
+    train_dl, val_dl = utils.get_dataloaders(
+        batch_size, image_var, 
+        num_workers=num_workers,
+        train_url=train_url,
+        val_url=val_url,
+    )
 
     # get first batches
     for train_i, (voxel0, image0) in enumerate(train_dl):
@@ -406,7 +421,7 @@ if __name__ == '__main__':
             )
             grid.save(os.path.join(outdir, f'augmented-pairs.png'))
             if wandb_log:
-                logs['train/augmented-pairs'] = wandb.Image(grid)
+                logs['train/samples-aug'] = wandb.Image(grid)
             
         if wandb_log:
             wandb.log(logs)

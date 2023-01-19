@@ -16,7 +16,7 @@ conda env update -f environment.yaml
 # this one must be run individually since it uses git
 pip install git+https://github.com/openai/CLIP.git
 ```
-The `setup.sh` script list the conda and pip commands to create this environment.
+The `setup.sh` script lists the conda and pip commands to create this environment.
 
 ## Train DiffusionPrior
 

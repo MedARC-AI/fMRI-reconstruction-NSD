@@ -194,14 +194,33 @@ def image_grid(imgs, rows, cols):
         grid.paste(img, box=(i%cols*w, i//cols*h))
     return grid
 
+def get_huggingface_urls(commit='9947586218b6b7c8cab804009ddca5045249a38d'):
+    """
+    You can use commit='main' is the most up to date data.
+    Before the new data was added is commit "9947586218b6b7c8cab804009ddca5045249a38d".
+    """
+    base_url = "https://huggingface.co/datasets/pscotti/naturalscenesdataset/resolve/"
+    train_url = base_url + commit + "/webdataset/train/train_subj01_{0..49}.tar"
+    val_url = base_url + commit + "/webdataset/val/val_subj01_0.tar",
+    return train_url, val_url
+
 def get_dataloaders(
     batch_size,
     image_var,
     num_devices=None,
     num_workers=None,
-    train_url="/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/train/train_subj01_{0..49}.tar",
-    val_url="/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/val/val_subj01_0.tar",
+    train_url=None,
+    val_url=None,
 ):
+    train_url_hf, val_url_hf = get_huggingface_urls()
+    if train_url is None:
+        train_url = train_url_hf
+    if val_url is None:
+        val_url = val_url_hf
+        
+    print("train_url", train_url)
+    print("val_url", val_url)
+
     print("batch_size",batch_size)
     if num_devices is None:
         num_devices = torch.cuda.device_count()
@@ -221,12 +240,16 @@ def get_dataloaders(
                         wds.shuffle(500,initial=500),
                         wds.decode("torch"),
                         wds.rename(images="jpg;png", voxels="nsdgeneral.npy", 
-                                    embs="sgxl_emb.npy", trial="trial.npy"),
+                                    trial="trial.npy"),
                         wds.to_tuple("voxels", image_var),
                         wds.batched(batch_size, partial=True),
                     ]).with_epoch(num_worker_batches)
     train_dl = wds.WebLoader(train_data, num_workers=num_workers,
                             batch_size=None, shuffle=False, persistent_workers=True)
+    # train_data = wds.DataPipeline([
+    #     wds.ResampledShards("train/train_subj01_{0..49}.tar"),
+    #     ...
+    # ]).with_epoch(num_worker_batches)
 
     # Validation #
     num_samples = 492
@@ -238,7 +261,7 @@ def get_dataloaders(
                         wds.tarfile_to_samples(),
                         wds.decode("torch"),
                         wds.rename(images="jpg;png", voxels="nsdgeneral.npy", 
-                                    embs="sgxl_emb.npy", trial="trial.npy"),
+                                    trial="trial.npy"),
                         wds.to_tuple("voxels", image_var),
                         wds.batched(batch_size, partial=True),
                     ]).with_epoch(num_worker_batches)

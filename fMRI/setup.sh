@@ -5,6 +5,8 @@
 
 set -e
 
+conda install -y mamba -n base -c conda-forge
+
 ## create env first
 # mamba create -n medical-v1 python=3.10 -y
 
