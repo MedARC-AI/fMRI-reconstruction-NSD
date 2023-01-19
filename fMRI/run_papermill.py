@@ -7,14 +7,12 @@ if __name__ == '__main__':
         clip_vit_version=['ViT-L/14', 'ViT-B/32'],
         use_img_aug=[True, False],
     ))
-
     for params in list(grid):
         print(params)
         tag = '|'.join([f'{k}={v}' for k, v in params.items()])
         print(tag)
-
-        # res = pm.execute_notebook(
-        #     'Voxel_to_CLIPvoxel.ipynb',
-        #     f'Voxel_to_CLIPvoxel_{tag}.ipynb',
-        #     parameters=params
-        # )
+        res = pm.execute_notebook(
+            'Voxel_to_CLIPvoxel.ipynb',
+            f'Voxel_to_CLIPvoxel_{tag}.ipynb',
+            parameters=params
+        )

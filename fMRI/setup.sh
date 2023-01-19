@@ -1,3 +1,5 @@
+#!/bin/bash
+#
 # Commands to setup a new conda environment and install all the necessary packages
 # See the environment.yaml file for a conda freeze after running this.
 

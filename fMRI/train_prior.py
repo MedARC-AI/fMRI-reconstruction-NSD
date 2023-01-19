@@ -20,10 +20,11 @@ import utils
 from models import Clipper, BrainNetwork, BrainDiffusionPrior, BrainSD
 
 if __name__ == '__main__':
-    
+    model_name = "prior" # ("prior", "3d")
     outdir = os.path.expanduser('~/data/neuro/diffusion-prior')
-    modality = "image"
-    clip_variant = "ViT-L/14"
+    modality = "image" # ("image", "text")
+    clip_variant = "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
+    norm_embs = False # l2 normalize embeddings
     clamp_embs = False # clamp embeddings to (-1.5, 1.5)
     ckpt_path = f'checkpoints/clip_image_vitL_2stage_mixco_lotemp_125ep_subj01_best.pth'
     dim = 768
@@ -47,7 +48,7 @@ if __name__ == '__main__':
     max_lr = 3e-4
     wandb_log = True
     wandb_project = 'laion-fmri'
-    wandb_run_name = 'prior-' + str(time.time())
+    wandb_run_name = f'{model_name}-{str(time.time())}'
     wandb_notes = ""
     first_batch = False
     ckpt_saving = True
@@ -104,7 +105,7 @@ if __name__ == '__main__':
     sd_pipe.vae.requires_grad_(False)
 
     # load clipper
-    clip_extractor = Clipper(clip_variant, clamp_embs=clamp_embs, norm_embs=False)
+    clip_extractor = Clipper(clip_variant, clamp_embs=clamp_embs, norm_embs=norm_embs)
 
     # # load COCO annotations curated in the same way as the mind_reader (Lin Sprague Singh) preprint
     # f = h5py.File('/scratch/gpfs/KNORMAN/nsdgeneral_hdf5/COCO_73k_subj_indices.hdf5', 'r')
