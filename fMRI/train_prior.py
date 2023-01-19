@@ -56,8 +56,8 @@ if __name__ == '__main__':
     clip_aug_prob = 0.3
     # how many samples from train and val to save
     n_samples_save = 4
-    # how many pairs of (orig, augmented) of images to save
-    n_aug_save = 8
+    # how many batches of pairs of (orig, augmented) images to save
+    n_aug_save = 1
 
     # -----------------------------------------------------------------------------
     config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -140,11 +140,8 @@ if __name__ == '__main__':
     brain_net.eval()
     brain_net.requires_grad_(False)
 
-    def get_ckpt_path(tag):
-        return os.path.join(outdir, f'diffusionprior_{tag}.pth')
-
     def save_ckpt(tag):
-        ckpt_path = get_ckpt_path(tag)
+        ckpt_path = os.path.join(outdir, f'ckpt-{tag}.pth')
         print(f'saving {ckpt_path}')
         if (using_ddp==False) or (using_ddp==True and local_rank==0):
             state_dict = brain_net.state_dict()
@@ -188,9 +185,7 @@ if __name__ == '__main__':
 
     utils.count_params(diffusion_prior)
 
-    epoch = 0
     optimizer = torch.optim.AdamW(diffusion_prior.parameters(), lr=initial_lr)
-
     if lr_scheduler == 'fixed':
         lr_scheduler = None
     elif lr_scheduler == 'cycle':
@@ -203,17 +198,18 @@ if __name__ == '__main__':
             last_epoch=-1, pct_start=2/num_epochs
         )
 
+    epoch = 0
     losses, val_losses, lrs = [], [], []
     sims, val_sims = [], []
     best_val_loss = 1e9
 
     # resume from checkpoint:
-    # prior_checkpoint = torch.load(f'{ckpt_path[:-12]}_epoch{epoch}_diffusionprior.pth', 
-    #                               map_location=device)
-    # epoch = prior_checkpoint['epoch']+1
+    # prior_checkpoint = torch.load(ckpt_path, map_location=device)
     # diffusion_prior.load_state_dict(prior_checkpoint['model_state_dict'])
-    # losses = prior_checkpoint['train_losses']
     # optimizer.load_state_dict(prior_checkpoint['optimizer_state_dict'])
+    # lr = prior_checkpoint['lr']
+    # epoch = prior_checkpoint['epoch']+1
+    # losses = prior_checkpoint['train_losses']
     # optimizer.param_groups[0]['lr'] = lr
 
     if wandb_log:
@@ -255,9 +251,18 @@ if __name__ == '__main__':
                         num_inference_steps=50,
                         guidance_scale=7.5,
                         num_images_per_prompt=1,
+                        width=256,
+                        height=256,
                     )
                     # get the CLIP embedding for the variation and use it for x
                     clip_embed = clip_extractor.embed_image(image_aug).float()
+
+                    # utils.torch_to_Image(image[0]).save('test-orig.png')
+                    # utils.torch_to_Image(image_aug[0]).save('test-aug.png')
+                    # import ipdb; ipdb.set_trace()
+                    # utils.torch_to_Image(
+                    #     make_grid(torch.cat((image, image_aug)), nrow=image.shape[0], padding=10)
+                    # ).save('test-aug.png')
 
                     loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
                     loss_on_aug.append(loss.item())
@@ -283,10 +288,6 @@ if __name__ == '__main__':
                     )
                     # get the CLIP embedding for the variation and use it for y
                     image_clip = clip_extractor.embed_image(image_aug).float()
-
-                    # utils.torch_to_Image(image).save('test-orig.png')
-                    # utils.torch_to_Image(image_aug).save('test-aug.png')
-                    # import ipdb; ipdb.set_trace()
 
                     loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
                     loss_on_aug.append(loss.item())
@@ -351,14 +352,14 @@ if __name__ == '__main__':
         progress_bar.set_postfix(**logs)
 
         logs = {
-            "train/loss": np.mean(losses[-(train_i+1):]),
-            "val/loss": np.mean(val_losses[-(val_i+1):]),
-            "train/lr": lrs[-1],
-            "train/cosine_sim": np.mean(sims[-(train_i+1):]),
-            "val/cosine_sim": np.mean(val_sims[-(val_i+1):]),
-            "train/num_steps": len(losses),
-            "train/loss_on_aug": np.mean(loss_on_aug),
-            "train/loss_off_aug": np.mean(loss_off_aug),
+            "metrics/train/loss": np.mean(losses[-(train_i+1):]),
+            "metrics/val/loss": np.mean(val_losses[-(val_i+1):]),
+            "metrics/train/lr": lrs[-1],
+            "metrics/train/cosine_sim": np.mean(sims[-(train_i+1):]),
+            "metrics/val/cosine_sim": np.mean(val_sims[-(val_i+1):]),
+            "metrics/train/num_steps": len(losses),
+            "metrics/train/loss_on_aug": np.mean(loss_on_aug),
+            "metrics/train/loss_off_aug": np.mean(loss_off_aug),
         }
 
         if n_samples_save > 0:
@@ -367,23 +368,25 @@ if __name__ == '__main__':
                 clip_extractor, brain_net, sd_pipe, diffusion_prior,
                 voxel0[:n_samples_save], image0[:n_samples_save], seed=42,
             )
-            logs['train/samples'] = [wandb.Image(grid) for grid in grids]
+            logs['media/train/samples'] = [wandb.Image(grid) for grid in grids]
 
             grids = utils.sample_images(
                 clip_extractor, brain_net, sd_pipe, diffusion_prior,
                 val_voxel0[:n_samples_save], val_image0[:n_samples_save], seed=42,
             )
-            logs['val/samples'] = [wandb.Image(grid) for grid in grids]
+            logs['media/val/samples'] = [wandb.Image(grid) for grid in grids]
 
             if len(aug_pairs) > 0:
                 # import ipdb; ipdb.set_trace()
                 imgs_orig, imgs_aug = zip(*aug_pairs)
+                imgs_orig = imgs_orig[:8]
+                imgs_aug = imgs_aug[:8]
                 imgs_orig = nn.functional.interpolate(imgs_orig[0], (256,256), mode="area", antialias=False)
                 imgs_aug = nn.functional.interpolate(imgs_aug[0], (256,256), mode="area", antialias=False)
                 aug_grid = utils.torch_to_Image(
                     make_grid(torch.cat((imgs_orig, imgs_aug)), nrow=imgs_orig.shape[0], padding=10)
                 )
-                logs['train/augmented-pairs'] = wandb.Image(aug_grid)
+                logs['media/train/augmented-pairs'] = wandb.Image(aug_grid)
             
         if wandb_log:
             wandb.log(logs)
