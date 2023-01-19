@@ -13,31 +13,24 @@ from torchvision.utils import make_grid
 from tqdm import tqdm
 import pandas as pd
 from collections import OrderedDict
-from dalle2_pytorch import DiffusionPriorNetwork #, DiffusionPrior
+from info_nce import InfoNCE
 
 import ddp_config
 import utils
-from models import Clipper, BrainNetwork, BrainDiffusionPrior, BrainSD
+from models import Clipper, BrainNetwork, NewVoxel3dConvEncoder
 
 if __name__ == '__main__':
-    model_name = "prior"
+    model_name = "voxel2clip"
+    outdir = os.path.expanduser(f'~/data/neuro/{model_name}')
     modality = "image" # ("image", "text")
     clip_variant = "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
+    norm_embs = True # l2 normalize embeddings
     clamp_embs = False # clamp embeddings to (-1.5, 1.5)
-    # BrainNet checkpoint
-    ckpt_path = f'checkpoints/clip_image_vitL_2stage_mixco_lotemp_125ep_subj01_best.pth'
-    dim = 768
-    depth = 6
-    dim_head = 64
-    heads = 12 # heads * dim_head = 12 * 64 = 768
-    # timesteps = 1000
-    timesteps = 100
-    cond_drop_prob = 0.2
-    image_embed_scale = None
-    # image_embed_scale = 1.0
-    condition_on_text_encodings = False
+    img_augmenting = True # augment images with random crops
+    soft_clip = False
+
     seed = 0
-    batch_size = 128
+    batch_size = 300
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
     num_devices = torch.cuda.device_count()
     num_workers = num_devices
@@ -52,13 +45,6 @@ if __name__ == '__main__':
     first_batch = False
     ckpt_saving = True
     ckpt_interval = None
-    clip_aug_mode = 'x'
-    clip_aug_prob = 0.3
-    # how many samples from train and val to save
-    n_samples_save = 8
-    # how many pairs of (orig, augmented) images to save
-    n_aug_save = 16
-    outdir = os.path.expanduser(f'~/data/neuro/models/{model_name}')
 
     # -----------------------------------------------------------------------------
     config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -72,7 +58,6 @@ if __name__ == '__main__':
     utils.seed_everything(seed)
 
     assert clip_variant in ("RN50", "ViT-L/14", "ViT-B/32")
-    assert clip_aug_mode in ('x', 'y', 'n')
     
     if modality == "text":
         image_var = "trail"
@@ -90,23 +75,8 @@ if __name__ == '__main__':
     # TODO: only on master process
     os.makedirs(outdir, exist_ok=True)
 
-    # load SD image variation pipeline
-    sd_pipe = BrainSD.from_pretrained(
-        "lambdalabs/sd-image-variations-diffusers", 
-        revision="v2.0",
-        safety_checker=None,
-        requires_safety_checker=False,
-    ).to(device)
-    
-    assert sd_pipe.image_encoder.training == False
-    sd_pipe.unet.eval()
-    sd_pipe.unet.requires_grad_(False)
-    sd_pipe.vae.eval()
-    sd_pipe.vae.requires_grad_(False)
-
-    # load clipper - don't L2 norm the extracted CLIP embeddings since we want the prior 
-    # to learn un-normed embeddings for usage with the SD image variation pipeline
-    clip_extractor = Clipper(clip_variant, clamp_embs=clamp_embs, norm_embs=False)
+    # load clipper
+    clip_extractor = Clipper(clip_variant, clamp_embs=clamp_embs, norm_embs=norm_embs)
 
     # # load COCO annotations curated in the same way as the mind_reader (Lin Sprague Singh) preprint
     # f = h5py.File('/scratch/gpfs/KNORMAN/nsdgeneral_hdf5/COCO_73k_subj_indices.hdf5', 'r')
@@ -132,15 +102,14 @@ if __name__ == '__main__':
         brain_net = brain_net.to(device)
 
     # Loading checkpoint
-    print("ckpt_path", ckpt_path)
-    checkpoint = torch.load(ckpt_path, map_location=device)    
-    if 'model_state_dict' in checkpoint:
-        brain_net.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        brain_net.load_state_dict(checkpoint)
-        
-    brain_net.eval()
-    brain_net.requires_grad_(False)
+    # print("ckpt_path",  ckpt_path)
+    # checkpoint = torch.load(ckpt_path, map_location=device)    
+    # if 'model_state_dict' in checkpoint:
+    #     brain_net.load_state_dict(checkpoint['model_state_dict'])
+    # else:
+    #     brain_net.load_state_dict(checkpoint)
+    # brain_net.eval()
+    # brain_net.requires_grad_(False)
 
     def save_ckpt(tag):
         ckpt_path = os.path.join(outdir, f'ckpt-{tag}.pth')
@@ -167,27 +136,9 @@ if __name__ == '__main__':
                 # this tells the other gpus wait for the first gpu to finish saving the model
                 dist.barrier()
 
-    # setup prior network
-    prior_network = DiffusionPriorNetwork(
-        dim=dim,
-        depth=depth,
-        dim_head=dim_head,
-        heads=heads
-    ).to(device)
+    utils.count_params(brain_net)
 
-    # custom version that can fix seeds
-    diffusion_prior = BrainDiffusionPrior(
-        net=prior_network,
-        image_embed_dim=dim,
-        condition_on_text_encodings=condition_on_text_encodings,
-        timesteps=timesteps,
-        cond_drop_prob=cond_drop_prob,
-        image_embed_scale=image_embed_scale,
-    ).to(device)
-
-    utils.count_params(diffusion_prior)
-
-    optimizer = torch.optim.AdamW(diffusion_prior.parameters(), lr=initial_lr)
+    optimizer = torch.optim.AdamW(brain_net.parameters(), lr=initial_lr)
     if lr_scheduler == 'fixed':
         lr_scheduler = None
     elif lr_scheduler == 'cycle':
@@ -204,10 +155,11 @@ if __name__ == '__main__':
     losses, val_losses, lrs = [], [], []
     sims, val_sims = [], []
     best_val_loss = 1e9
+    nce = InfoNCE(temperature=0.01)
 
     # resume from checkpoint:
     # prior_checkpoint = torch.load(ckpt_path, map_location=device)
-    # diffusion_prior.load_state_dict(prior_checkpoint['model_state_dict'])
+    # brain_net.load_state_dict(prior_checkpoint['model_state_dict'])
     # optimizer.load_state_dict(prior_checkpoint['optimizer_state_dict'])
     # lr = prior_checkpoint['lr']
     # epoch = prior_checkpoint['epoch']+1
@@ -230,82 +182,50 @@ if __name__ == '__main__':
         train_dl = [(voxel0[:bs], image0[:bs])]
         val_dl = [(val_voxel0[:bs], val_image0[:bs])]
 
+    def check_loss(loss):
+        if loss.isnan().any():
+            raise ValueError('NaN loss')
+
     # feed text and images into diffusion prior network
     progress_bar = tqdm(range(epoch, num_epochs), desc='train loop')
 
     for epoch in progress_bar:
-        diffusion_prior.train()
+        brain_net.train()
         
-        loss_on_aug, loss_off_aug = [], []
+        loss_on_aug, loss_off_aug, aug_pairs = [], [], []
 
         for train_i, (voxel, image) in enumerate(train_dl):
             optimizer.zero_grad()
             image = image.to(device)
-            image_aug = None
+            
+            with torch.cuda.amp.autocast():
+                if image_var=='images': # using images
+                    if img_augmenting:
+                        img_input = utils.img_augment(img_input)
+                    emb = clip_extractor.embed_image(img_input)
+                else: 
+                    # using text captions of the images 
+                    # emb = clip_extractor.embed_curated_annotations(subj01_annots[img_input])
+                    raise NotImplementedError()
 
-            if clip_aug_mode == 'x':
-                # the target y is fixed
-                image_clip = clip_extractor.embed_image(image).float()
+                emb_ = brain_net(voxel)
+                
+                # l2 norm before doing cosine similarity
+                emb_ = nn.functional.normalize(emb_, dim=-1)
+                labels = torch.arange(len(emb)).to(device)
 
-                if random.random() < clip_aug_prob:
-                    # get an image variation
-                    image_aug = sd_pipe(
-                        image=image,
-                        num_inference_steps=50,
-                        guidance_scale=7.5,
-                        num_images_per_prompt=1,
-                        width=256,
-                        height=256,
-                    )
-                    # get the CLIP embedding for the variation and use it for x
-                    clip_embed = clip_extractor.embed_image(image_aug).float()
-
-                    # utils.torch_to_Image(image[0]).save('test-orig.png')
-                    # utils.torch_to_Image(image_aug[0]).save('test-aug.png')
-                    # import ipdb; ipdb.set_trace()
-                    # utils.torch_to_Image(
-                    #     make_grid(torch.cat((image, image_aug)), nrow=image.shape[0], padding=10)
-                    # ).save('test-aug.png')
-
-                    loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
-                    loss_on_aug.append(loss.item())
-                    # if len(aug_pairs) < n_aug_save:
-                    #     aug_pairs.append((image, image_aug))
+                if soft_clip:
+                    if epoch<10:
+                        loss = nce(emb_.reshape(len(emb),-1),emb.reshape(len(emb),-1))
+                    else:
+                        loss = utils.soft_clip_loss(emb_.reshape(len(emb),-1), emb.reshape(len(emb),-1))
+                    # loss = nce(emb_.reshape(len(emb),-1),emb.reshape(len(emb),-1)) + \
+                    #        soft_clip_loss(emb_.reshape(len(emb),-1), emb.reshape(len(emb),-1))
                 else:
-                    clip_embed = brain_net(voxel.to(device).float())
-                    loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
-                    loss_off_aug.append(loss.item())
-
-            elif clip_aug_mode == 'y':
-                # the input x is fixed
-                clip_embed = brain_net(voxel.to(device).float())
-
-                if random.random() < clip_aug_prob:
-                    # get an image variation
-                    image_aug = sd_pipe(
-                        # duplicate the embedding to serve classifier free guidance
-                        image_embeddings=torch.cat([torch.zeros_like(clip_embed), clip_embed]).unsqueeze(1),
-                        num_inference_steps=50,
-                        guidance_scale=7.5,
-                        num_images_per_prompt=1,
-                    )
-                    # get the CLIP embedding for the variation and use it for y
-                    image_clip = clip_extractor.embed_image(image_aug).float()
-
-                    loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
-                    loss_on_aug.append(loss.item())
-                    # if len(aug_pairs) < n_aug_save:
-                    #     aug_pairs.append((image, image_aug))
-                else:
-                    image_clip = clip_extractor.embed_image(image).float()
-                    loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
-                    loss_off_aug.append(loss.item())
-            else:
-                # the input x is fixed
-                clip_embed = brain_net(voxel.to(device).float())
-                # the target y is fixed
-                image_clip = clip_extractor.embed_image(image).float()
-                loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
+                    loss = nce(emb_.reshape(len(emb),-1), emb.reshape(len(emb),-1))
+                check_loss(loss)
+                fwd_percent_correct = utils.topk(utils.batchwise_cosine_similarity(emb, emb_), labels, k=1)
+                bwd_percent_correct = utils.topk(utils.batchwise_cosine_similarity(emb_, emb), labels, k=1)
 
             loss.backward()
             optimizer.step()
@@ -314,9 +234,9 @@ if __name__ == '__main__':
 
             losses.append(loss.item())
             lrs.append(optimizer.param_groups[0]['lr'])
-            sims.append(F.cosine_similarity(image_clip, pred).mean().item())
+            sims.append(F.cosine_similarity(emb, emb_).mean().item())
             
-        diffusion_prior.eval()
+        brain_net.eval()
         for val_i, (val_voxel, val_image) in enumerate(val_dl):    
             with torch.no_grad(): 
                 val_image = val_image.to(device)
@@ -327,10 +247,12 @@ if __name__ == '__main__':
 
                 image_clip = clip_extractor.embed_image(val_image).float()
 
-                val_loss, val_pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
+                val_loss, val_pred = brain_net(text_embed=clip_embed, image_embed=image_clip)
+                check_loss(val_loss)
 
                 val_losses.append(val_loss.item())
                 val_sims.append(F.cosine_similarity(image_clip, val_pred).mean().item())
+                
                 
         if ckpt_saving:
             # save best model
@@ -365,35 +287,6 @@ if __name__ == '__main__':
             "metrics/train/loss_off_aug": np.mean(loss_off_aug),
         }
 
-        # sample some images
-        if n_samples_save > 0:
-        #if epoch == num_epochs - 1:
-
-            # training
-            grids = utils.sample_images(
-                clip_extractor, brain_net, sd_pipe, diffusion_prior,
-                voxel0[:n_samples_save], image0[:n_samples_save], seed=42,
-            )
-            logs['media/train/samples'] = [wandb.Image(grid) for grid in grids]
-
-            # validation
-            grids = utils.sample_images(
-                clip_extractor, brain_net, sd_pipe, diffusion_prior,
-                val_voxel0[:n_samples_save], val_image0[:n_samples_save], seed=42,
-            )
-            logs['media/val/samples'] = [wandb.Image(grid) for grid in grids]
-
-        # save augmented image pairs
-        if n_aug_save > 0 and image_aug is not None:
-            assert image[0].shape == image_aug[0].shape, 'batch dim does not match'
-            import ipdb; ipdb.set_trace()
-            image = nn.functional.interpolate(image[:n_aug_save], (256,256), mode="area", antialias=False)
-            image_aug = nn.functional.interpolate(image_aug[:n_aug_save], (256,256), mode="area", antialias=False)
-            grid = utils.torch_to_Image(
-                make_grid(torch.cat((image, image_aug)), nrow=n_aug_save, padding=10)
-            )
-            logs['media/train/augmented-pairs'] = wandb.Image(grid)
-            
         if wandb_log:
             wandb.log(logs)
             
