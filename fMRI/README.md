@@ -6,6 +6,7 @@
 
 Currently we are trying to replicate this preprint: https://arxiv.org/abs/2210.01769
 
+## Installation
 
 To create a conda environment that will run the notebooks:
 ```bash
@@ -16,3 +17,12 @@ conda env update -f environment.yaml
 pip install git+https://github.com/openai/CLIP.git
 ```
 The `setup.sh` script list the conda and pip commands to create this environment.
+
+## Train DiffusionPrior
+
+```bash
+python train_prior.py
+```
+
+There are some training runs on wandb: https://wandb.ai/jimgoo/laion-fmri
+

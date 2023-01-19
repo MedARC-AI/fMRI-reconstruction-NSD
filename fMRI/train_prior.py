@@ -20,6 +20,8 @@ import utils
 from models import Clipper, BrainNetwork, BrainDiffusionPrior, BrainSD
 
 if __name__ == '__main__':
+    # -----------------------------------------------------------------------------
+    # params for this model
     model_name = "prior"
     modality = "image" # ("image", "text")
     clip_variant = "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
@@ -36,6 +38,15 @@ if __name__ == '__main__':
     image_embed_scale = None
     # image_embed_scale = 1.0
     condition_on_text_encodings = False
+    clip_aug_mode = 'x' #  ('x', 'y', 'n')
+    clip_aug_prob = 0.3
+    # how many samples from train and val to save
+    n_samples_save = 8
+    # how many pairs of (orig, augmented) images to save
+    n_aug_save = 16
+    # -----------------------------------------------------------------------------
+    # params for all models
+    outdir = os.path.expanduser(f'~/data/neuro/models/{model_name}')
     seed = 0
     batch_size = 128
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
@@ -52,13 +63,6 @@ if __name__ == '__main__':
     first_batch = False
     ckpt_saving = True
     ckpt_interval = None
-    clip_aug_mode = 'x'
-    clip_aug_prob = 0.3
-    # how many samples from train and val to save
-    n_samples_save = 8
-    # how many pairs of (orig, augmented) images to save
-    n_aug_save = 16
-    outdir = os.path.expanduser(f'~/data/neuro/models/{model_name}')
 
     # -----------------------------------------------------------------------------
     config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -73,9 +77,10 @@ if __name__ == '__main__':
 
     assert clip_variant in ("RN50", "ViT-L/14", "ViT-B/32")
     assert clip_aug_mode in ('x', 'y', 'n')
+    assert n_aug_save <= batch_size
     
     if modality == "text":
-        image_var = "trail"
+        image_var = "trial"
     elif modality == "image":
         image_var = "images"
     else:
@@ -87,8 +92,11 @@ if __name__ == '__main__':
     if device == 'cuda':
         torch.cuda.set_device(local_rank)
 
+    # write config
     # TODO: only on master process
-    os.makedirs(outdir, exist_ok=True)
+    os.makedirs(outdir, exist_ok=True)    
+    with open(os.path.join(outdir, 'config.json'), 'w') as f:
+        json.dump(config, f, indent=2)
 
     # load SD image variation pipeline
     sd_pipe = BrainSD.from_pretrained(
@@ -237,11 +245,11 @@ if __name__ == '__main__':
         diffusion_prior.train()
         
         loss_on_aug, loss_off_aug = [], []
+        image_aug = None
 
         for train_i, (voxel, image) in enumerate(train_dl):
             optimizer.zero_grad()
             image = image.to(device)
-            image_aug = None
 
             if clip_aug_mode == 'x':
                 # the target y is fixed
@@ -269,8 +277,6 @@ if __name__ == '__main__':
 
                     loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
                     loss_on_aug.append(loss.item())
-                    # if len(aug_pairs) < n_aug_save:
-                    #     aug_pairs.append((image, image_aug))
                 else:
                     clip_embed = brain_net(voxel.to(device).float())
                     loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
@@ -288,14 +294,14 @@ if __name__ == '__main__':
                         num_inference_steps=50,
                         guidance_scale=7.5,
                         num_images_per_prompt=1,
+                        width=256,
+                        height=256,
                     )
                     # get the CLIP embedding for the variation and use it for y
                     image_clip = clip_extractor.embed_image(image_aug).float()
 
                     loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
                     loss_on_aug.append(loss.item())
-                    # if len(aug_pairs) < n_aug_save:
-                    #     aug_pairs.append((image, image_aug))
                 else:
                     image_clip = clip_extractor.embed_image(image).float()
                     loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
@@ -355,44 +361,52 @@ if __name__ == '__main__':
         progress_bar.set_postfix(**logs)
 
         logs = {
-            "metrics/train/loss": np.mean(losses[-(train_i+1):]),
-            "metrics/val/loss": np.mean(val_losses[-(val_i+1):]),
-            "metrics/train/lr": lrs[-1],
-            "metrics/train/cosine_sim": np.mean(sims[-(train_i+1):]),
-            "metrics/val/cosine_sim": np.mean(val_sims[-(val_i+1):]),
-            "metrics/train/num_steps": len(losses),
-            "metrics/train/loss_on_aug": np.mean(loss_on_aug),
-            "metrics/train/loss_off_aug": np.mean(loss_off_aug),
+            "train/loss": np.mean(losses[-(train_i+1):]),
+            "val/loss": np.mean(val_losses[-(val_i+1):]),
+            "train/lr": lrs[-1],
+            "train/cosine_sim": np.mean(sims[-(train_i+1):]),
+            "val/cosine_sim": np.mean(val_sims[-(val_i+1):]),
+            "train/num_steps": len(losses),
+            "train/loss_on_aug": np.mean(loss_on_aug),
+            "train/loss_off_aug": np.mean(loss_off_aug),
         }
 
         # sample some images
         if n_samples_save > 0:
         #if epoch == num_epochs - 1:
-
             # training
             grids = utils.sample_images(
                 clip_extractor, brain_net, sd_pipe, diffusion_prior,
                 voxel0[:n_samples_save], image0[:n_samples_save], seed=42,
             )
-            logs['media/train/samples'] = [wandb.Image(grid) for grid in grids]
+            for i, grid in enumerate(grids):
+                grid.save(os.path.join(outdir, f'samples-train-{i:03d}.png'))
+            if wandb_log:
+                logs['train/samples'] = [wandb.Image(grid) for grid in grids]
 
             # validation
             grids = utils.sample_images(
                 clip_extractor, brain_net, sd_pipe, diffusion_prior,
                 val_voxel0[:n_samples_save], val_image0[:n_samples_save], seed=42,
             )
-            logs['media/val/samples'] = [wandb.Image(grid) for grid in grids]
+            for i, grid in enumerate(grids):
+                grid.save(os.path.join(outdir, f'samples-val-{i:03d}.png'))
+            if wandb_log:
+                logs['val/samples'] = [wandb.Image(grid) for grid in grids]
 
         # save augmented image pairs
         if n_aug_save > 0 and image_aug is not None:
             assert image[0].shape == image_aug[0].shape, 'batch dim does not match'
-            import ipdb; ipdb.set_trace()
-            image = nn.functional.interpolate(image[:n_aug_save], (256,256), mode="area", antialias=False)
-            image_aug = nn.functional.interpolate(image_aug[:n_aug_save], (256,256), mode="area", antialias=False)
+            # two rows: original, augmented
             grid = utils.torch_to_Image(
-                make_grid(torch.cat((image, image_aug)), nrow=n_aug_save, padding=10)
+                make_grid(torch.cat((
+                    nn.functional.interpolate(image[:n_aug_save], (256,256), mode="area", antialias=False),
+                    nn.functional.interpolate(image_aug[:n_aug_save], (256,256), mode="area", antialias=False)
+                )), nrow=image[:n_aug_save].shape[0], padding=10)
             )
-            logs['media/train/augmented-pairs'] = wandb.Image(grid)
+            grid.save(os.path.join(outdir, f'augmented-pairs.png'))
+            if wandb_log:
+                logs['train/augmented-pairs'] = wandb.Image(grid)
             
         if wandb_log:
             wandb.log(logs)

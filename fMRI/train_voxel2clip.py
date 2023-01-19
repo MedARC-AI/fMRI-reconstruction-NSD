@@ -236,22 +236,22 @@ if __name__ == '__main__':
             lrs.append(optimizer.param_groups[0]['lr'])
             sims.append(F.cosine_similarity(emb, emb_).mean().item())
             
-        brain_net.eval()
-        for val_i, (val_voxel, val_image) in enumerate(val_dl):    
-            with torch.no_grad(): 
-                val_image = val_image.to(device)
+        # brain_net.eval()
+        # for val_i, (val_voxel, val_image) in enumerate(val_dl):    
+        #     with torch.no_grad(): 
+        #         val_image = val_image.to(device)
 
-                clip_embed = brain_net(val_voxel.to(device).float())
-                #clip_embed = nn.functional.normalize(clip_embed,dim=-1)
-                # clip_embed = clip_extractor.embed_curated_annotations(subj01_annots[voxel])
+        #         clip_embed = brain_net(val_voxel.to(device).float())
+        #         #clip_embed = nn.functional.normalize(clip_embed,dim=-1)
+        #         # clip_embed = clip_extractor.embed_curated_annotations(subj01_annots[voxel])
 
-                image_clip = clip_extractor.embed_image(val_image).float()
+        #         image_clip = clip_extractor.embed_image(val_image).float()
 
-                val_loss, val_pred = brain_net(text_embed=clip_embed, image_embed=image_clip)
-                check_loss(val_loss)
+        #         val_loss, val_pred = brain_net(text_embed=clip_embed, image_embed=image_clip)
+        #         check_loss(val_loss)
 
-                val_losses.append(val_loss.item())
-                val_sims.append(F.cosine_similarity(image_clip, val_pred).mean().item())
+        #         val_losses.append(val_loss.item())
+        #         val_sims.append(F.cosine_similarity(image_clip, val_pred).mean().item())
                 
                 
         if ckpt_saving:
@@ -277,14 +277,14 @@ if __name__ == '__main__':
         progress_bar.set_postfix(**logs)
 
         logs = {
-            "metrics/train/loss": np.mean(losses[-(train_i+1):]),
-            "metrics/val/loss": np.mean(val_losses[-(val_i+1):]),
-            "metrics/train/lr": lrs[-1],
-            "metrics/train/cosine_sim": np.mean(sims[-(train_i+1):]),
-            "metrics/val/cosine_sim": np.mean(val_sims[-(val_i+1):]),
-            "metrics/train/num_steps": len(losses),
-            "metrics/train/loss_on_aug": np.mean(loss_on_aug),
-            "metrics/train/loss_off_aug": np.mean(loss_off_aug),
+            "train/loss": np.mean(losses[-(train_i+1):]),
+            "val/loss": np.mean(val_losses[-(val_i+1):]),
+            "train/lr": lrs[-1],
+            "train/cosine_sim": np.mean(sims[-(train_i+1):]),
+            "val/cosine_sim": np.mean(val_sims[-(val_i+1):]),
+            "train/num_steps": len(losses),
+            "train/loss_on_aug": np.mean(loss_on_aug),
+            "train/loss_off_aug": np.mean(loss_off_aug),
         }
 
         if wandb_log:
