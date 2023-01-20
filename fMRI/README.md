@@ -10,13 +10,10 @@ Currently we are trying to replicate this preprint: https://arxiv.org/abs/2210.0
 
 To create a conda environment that will run the notebooks:
 ```bash
-conda create -n medical-v1 python=3.10
+conda env create -f environment.yaml
 conda activate medical-v1
-conda env update -f environment.yaml
-# this one must be run individually since it uses git
-pip install git+https://github.com/openai/CLIP.git
 ```
-The `setup.sh` script lists the conda and pip commands to create this environment.
+The `setup.sh` script lists the conda and pip commands to create this environment manually.
 
 ## Train DiffusionPrior
 

@@ -212,6 +212,7 @@ def get_dataloaders(
     train_url=None,
     val_url=None,
 ):
+    print("Getting dataloaders...")
     train_url_hf, val_url_hf = get_huggingface_urls()
     if train_url is None:
         train_url = train_url_hf
@@ -220,20 +221,20 @@ def get_dataloaders(
         
     print("train_url", train_url)
     print("val_url", val_url)
-
-    print("batch_size",batch_size)
+    print("batch_size", batch_size)
     if num_devices is None:
         num_devices = torch.cuda.device_count()
-    print("num_devices",num_devices)
+    print("num_devices", num_devices)
     if num_workers is None:
         num_workers = num_devices
-    print("num_workers",num_workers)
+    print("num_workers", num_workers)
+    
     num_samples = 24983 # see metadata.json in webdataset_split folder
     global_batch_size = batch_size * num_devices
-    print("global_batch_size",global_batch_size)
+    print("global_batch_size", global_batch_size)
     num_batches = math.floor(num_samples / global_batch_size)
     num_worker_batches = math.floor(num_batches / num_workers)
-    print("num_worker_batches",num_worker_batches)
+    print("num_worker_batches", num_worker_batches)
 
     train_data = wds.DataPipeline([wds.ResampledShards(train_url),
                         wds.tarfile_to_samples(),
@@ -244,14 +245,11 @@ def get_dataloaders(
                         wds.to_tuple("voxels", image_var),
                         wds.batched(batch_size, partial=True),
                     ]).with_epoch(num_worker_batches)
+    
     train_dl = wds.WebLoader(train_data, num_workers=num_workers,
                             batch_size=None, shuffle=False, persistent_workers=True)
-    # train_data = wds.DataPipeline([
-    #     wds.ResampledShards("train/train_subj01_{0..49}.tar"),
-    #     ...
-    # ]).with_epoch(num_worker_batches)
 
-    # Validation #
+    # Validation
     num_samples = 492
     num_batches = math.ceil(num_samples / global_batch_size)
     num_worker_batches = math.ceil(num_batches / num_workers)
@@ -265,6 +263,7 @@ def get_dataloaders(
                         wds.to_tuple("voxels", image_var),
                         wds.batched(batch_size, partial=True),
                     ]).with_epoch(num_worker_batches)
+    
     val_dl = wds.WebLoader(val_data, num_workers=num_workers,
                         batch_size=None, shuffle=False, persistent_workers=True)
 

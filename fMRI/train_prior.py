@@ -49,7 +49,6 @@ if __name__ == '__main__':
     pretrained = False
     # -----------------------------------------------------------------------------
     # params for all models
-    outdir = os.path.expanduser(f'~/data/neuro/models/{model_name}')
     seed = 0
     batch_size = 128
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
@@ -66,6 +65,7 @@ if __name__ == '__main__':
     first_batch = False
     ckpt_saving = True
     ckpt_interval = None
+    outdir = os.path.expanduser(f'~/data/neuro/models/{model_name}/{wandb_run_name}')
 
     # -----------------------------------------------------------------------------
     config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -97,6 +97,7 @@ if __name__ == '__main__':
 
     # write config
     # TODO: only on master process
+    outdir = os.path.expanduser(outdir)
     os.makedirs(outdir, exist_ok=True)    
     with open(os.path.join(outdir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=2)
@@ -183,7 +184,7 @@ if __name__ == '__main__':
                 'train_losses': losses,
                 'val_losses': val_losses,
                 'lrs': lrs,
-                'sims': sims,
+                'train_sims': sims,
                 'val_sims': val_sims,
                 }, ckpt_path)
             
@@ -281,7 +282,7 @@ if __name__ == '__main__':
             image = image.to(device)
 
             if clip_aug_mode == 'x':
-                # the target y is fixed
+                # the target y is fixed, and we will change the input x
                 image_clip = clip_extractor.embed_image(image).float()
 
                 if random.random() < clip_aug_prob:
@@ -312,14 +313,17 @@ if __name__ == '__main__':
                     loss_off_aug.append(loss.item())
 
             elif clip_aug_mode == 'y':
-                # the input x is fixed
+                # the input x is fixed, and we will change the target y
                 clip_embed = brain_net(voxel.to(device).float())
+                image_clip = clip_extractor.embed_image(image).float()
 
                 if random.random() < clip_aug_prob:
+                    _, clip_pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
+
                     # get an image variation
                     image_aug = sd_pipe(
                         # duplicate the embedding to serve classifier free guidance
-                        image_embeddings=torch.cat([torch.zeros_like(clip_embed), clip_embed]).unsqueeze(1),
+                        image_embeddings=torch.cat([torch.zeros_like(clip_pred), clip_pred]).unsqueeze(1),
                         num_inference_steps=50,
                         guidance_scale=7.5,
                         num_images_per_prompt=1,
@@ -327,18 +331,14 @@ if __name__ == '__main__':
                         height=256,
                     )
                     # get the CLIP embedding for the variation and use it for y
-                    image_clip = clip_extractor.embed_image(image_aug).float()
+                    clip_aug = clip_extractor.embed_image(image_aug).float()
 
-                    loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
+                    loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=clip_aug)
                     loss_on_aug.append(loss.item())
                 else:
-                    image_clip = clip_extractor.embed_image(image).float()
                     loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
                     loss_off_aug.append(loss.item())
             else:
-                # the input x is fixed
-                clip_embed = brain_net(voxel.to(device).float())
-                # the target y is fixed
                 image_clip = clip_extractor.embed_image(image).float()
                 loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
 
@@ -401,8 +401,7 @@ if __name__ == '__main__':
         }
 
         # sample some images
-        if n_samples_save > 0:
-        #if epoch == num_epochs - 1:
+        if n_samples_save > 0: # and epoch == num_epochs - 1:
             # training
             grids = utils.sample_images(
                 clip_extractor, brain_net, sd_pipe, diffusion_prior,
