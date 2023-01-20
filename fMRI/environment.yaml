@@ -230,8 +230,7 @@ dependencies:
   - pip:
     - accelerate==0.15.0
     - braceexpand==0.1.7
-    # install this one manually with `pip install git+https://github.com/openai/CLIP.git`
-    # - clip==1.0
+    - -e git+https://github.com/openai/CLIP.git@main#egg=clip
     - clip-anytorch==2.5.0
     - coca-pytorch==0.0.7
     - dalle2-pytorch==1.12.0
