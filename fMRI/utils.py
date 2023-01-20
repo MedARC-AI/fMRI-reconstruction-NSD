@@ -201,7 +201,7 @@ def get_huggingface_urls(commit='9947586218b6b7c8cab804009ddca5045249a38d'):
     """
     base_url = "https://huggingface.co/datasets/pscotti/naturalscenesdataset/resolve/"
     train_url = base_url + commit + "/webdataset/train/train_subj01_{0..49}.tar"
-    val_url = base_url + commit + "/webdataset/val/val_subj01_0.tar",
+    val_url = base_url + commit + "/webdataset/val/val_subj01_0.tar"
     return train_url, val_url
 
 def get_dataloaders(

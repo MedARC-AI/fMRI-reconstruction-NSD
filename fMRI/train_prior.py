@@ -46,6 +46,7 @@ if __name__ == '__main__':
     n_aug_save = 16
     remote_data = False
     data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
+    pretrained = False
     # -----------------------------------------------------------------------------
     # params for all models
     outdir = os.path.expanduser(f'~/data/neuro/models/{model_name}')
@@ -190,23 +191,36 @@ if __name__ == '__main__':
                 # this tells the other gpus wait for the first gpu to finish saving the model
                 dist.barrier()
 
-    # setup prior network
-    prior_network = DiffusionPriorNetwork(
-        dim=dim,
-        depth=depth,
-        dim_head=dim_head,
-        heads=heads
-    ).to(device)
+    if not pretrained:
+        # setup prior network
+        prior_network = DiffusionPriorNetwork(
+            dim=dim,
+            depth=depth,
+            dim_head=dim_head,
+            heads=heads
+        ).to(device)
 
-    # custom version that can fix seeds
-    diffusion_prior = BrainDiffusionPrior(
-        net=prior_network,
-        image_embed_dim=dim,
-        condition_on_text_encodings=condition_on_text_encodings,
-        timesteps=timesteps,
-        cond_drop_prob=cond_drop_prob,
-        image_embed_scale=image_embed_scale,
-    ).to(device)
+        # custom version that can fix seeds
+        diffusion_prior = BrainDiffusionPrior(
+            net=prior_network,
+            image_embed_dim=dim,
+            condition_on_text_encodings=condition_on_text_encodings,
+            timesteps=timesteps,
+            cond_drop_prob=cond_drop_prob,
+            image_embed_scale=image_embed_scale,
+        ).to(device)
+    else:
+        print("WARNING: passed dim, depth, dim_head, and heads will be ignored")
+        assert timesteps == 1000
+        diffusion_prior = BrainDiffusionPrior.from_pretrained(
+            dict(),
+            dict(
+                condition_on_text_encodings=condition_on_text_encodings,
+                timesteps=timesteps,
+                # cond_drop_prob=cond_drop_prob,
+                # image_embed_scale=image_embed_scale,
+            ),
+        )
 
     utils.count_params(diffusion_prior)
 
@@ -249,7 +263,7 @@ if __name__ == '__main__':
 
     if first_batch:
         # fake DataLoaders with just the first batches
-        bs = 5
+        bs = batch_size
         train_dl = [(voxel0[:bs], image0[:bs])]
         val_dl = [(val_voxel0[:bs], val_image0[:bs])]
 
