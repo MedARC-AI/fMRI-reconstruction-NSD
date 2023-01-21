@@ -196,17 +196,18 @@ def get_dataloaders(
     train_url=None,
     val_url=None,
     cache_dir="/tmp/wds-cache",
+    n_cache_recs=0,
 ):
     print("Getting dataloaders...")
     train_url_hf, val_url_hf = get_huggingface_urls()
+    # default to huggingface urls if not specified
     if train_url is None:
         train_url = train_url_hf
     if val_url is None:
         val_url = val_url_hf
-        
     print("train_url", train_url)
     print("val_url", val_url)
-    print("batch_size", batch_size)
+
     if num_devices is None:
         num_devices = torch.cuda.device_count()
     print("num_devices", num_devices)
@@ -216,11 +217,12 @@ def get_dataloaders(
     
     num_samples = 24983 # see metadata.json in webdataset_split folder
     global_batch_size = batch_size * num_devices
-    print("global_batch_size", global_batch_size)
     num_batches = math.floor(num_samples / global_batch_size)
     num_worker_batches = math.floor(num_batches / num_workers)
+    print("batch_size", batch_size)
+    print("global_batch_size", global_batch_size)
     print("num_worker_batches", num_worker_batches)
-
+    
     # train_data = wds.DataPipeline([wds.ResampledShards(train_url),
     #                     wds.tarfile_to_samples(),
     #                     wds.shuffle(500,initial=500),
@@ -245,6 +247,9 @@ def get_dataloaders(
         .to_tuple("voxels", image_var)\
         .batched(batch_size, partial=True)\
         .with_epoch(num_worker_batches)
+
+    if n_cache_recs > 0:
+        train_data = train_data.compose(wds.DBCache, os.path.join(cache_dir, "cache-train.db"),  n_cache_recs)
     
     train_dl = wds.WebLoader(train_data, num_workers=num_workers,
                             batch_size=None, shuffle=False, persistent_workers=True)
@@ -274,83 +279,10 @@ def get_dataloaders(
     val_dl = wds.WebLoader(val_data, num_workers=num_workers,
                         batch_size=None, shuffle=False, persistent_workers=True)
 
+    if n_cache_recs > 0:
+        val_data = val_data.compose(wds.DBCache, os.path.join(cache_dir, "cache-val.db"),  n_cache_recs)
+
     return train_dl, val_dl
-
-# def load_sd_pipeline():
-
-#     from diffusers import StableDiffusionImageVariationPipeline
-#     # from diffusers import AutoencoderKL, PNDMScheduler, UNet2DConditionModel
-#     # from transformers import CLIPVisionModelWithProjection, CLIPFeatureExtractor
-
-#     model_name = "lambdalabs/sd-image-variations-diffusers"
-
-#     sd_pipe = StableDiffusionImageVariationPipeline.from_pretrained(
-#         model_name, 
-#         revision="v2.0",
-#         safety_checker=None,
-#         requires_safety_checker=False,
-
-#     ).to(device)
-#     assert sd_pipe.image_encoder.training == False, 'not in eval mode'
-    
-#     unet = sd_pipe.unet
-#     vae = sd_pipe.vae
-#     # noise_scheduler = sd_pipe.scheduler
-
-#     # unet = UNet2DConditionModel.from_pretrained(model_name, subfolder="unet").to(device)
-#     # vae = AutoencoderKL.from_pretrained(model_name, subfolder="vae").to(device)
-#     # noise_scheduler = PNDMScheduler.from_pretrained(model_name, subfolder="scheduler")
-
-#     unet.eval() # dont want to train model
-#     unet.requires_grad_(False) # dont need to calculate gradients
-
-#     vae.eval() # dont want to train model
-#     vae.requires_grad_(False) # dont need to calculate gradients
-
-#     tform = transforms.Compose([
-#         #transforms.ToTensor(), ## don't need this since we've already got tensors
-#         transforms.Resize(
-#             (224, 224),
-#             interpolation=transforms.InterpolationMode.BICUBIC,
-#             antialias=False,
-#             ),
-#         transforms.Normalize(
-#             [0.48145466, 0.4578275, 0.40821073],
-#             [0.26862954, 0.26130258, 0.27577711]),
-#     ])
-
-#     return sd_pipe, tform
-
-# @torch.no_grad()
-# def denoising_loop(
-#     unet, noise_scheduler, encoder_hidden_states, 
-#     num_inference_steps=50,
-#     num_per_sample=4,
-#     guidance_scale=7.5,
-#     latents=None,
-# ):
-#     # Prepare timesteps
-#     noise_scheduler.set_timesteps(num_inference_steps, device=device)
-
-#     # generate latents if none are provided
-#     if latents is None:
-#         latents = torch.randn([num_per_sample, 4, 64, 64], device=device)
-    
-#     # Denoising loop (original clip)
-#     for i, t in enumerate(noise_scheduler.timesteps):
-#         # expand the latents if we are doing classifier free guidance
-#         latent_model_input = torch.cat([latents] * 2)
-#         latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
-
-#         # predict the noise residual
-#         noise_pred = unet(latent_model_input, t, encoder_hidden_states=encoder_hidden_states).sample
-#         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-#         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-#         # compute the previous noisy sample x_t -> x_t-1
-#         latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
-
-#     return latents
 
 @torch.no_grad()
 def sample_images(
