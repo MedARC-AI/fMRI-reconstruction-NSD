@@ -28,12 +28,12 @@ if __name__ == '__main__':
     clamp_embs = False # clamp embeddings to (-1.5, 1.5)
     # BrainNet checkpoint
     ckpt_path = f'checkpoints/clip_image_vitL_2stage_mixco_lotemp_125ep_subj01_best.pth'
+    # timesteps = 1000
+    timesteps = 100
     dim = 768
     depth = 6
     dim_head = 64
     heads = 12 # heads * dim_head = 12 * 64 = 768
-    # timesteps = 1000
-    timesteps = 100
     cond_drop_prob = 0.2
     image_embed_scale = None
     # image_embed_scale = 1.0
@@ -42,6 +42,7 @@ if __name__ == '__main__':
     clip_aug_prob = 0.3
     # how many samples from train and val to save
     n_samples_save = 8
+    save_samples_at_end = False
     # how many pairs of (orig, augmented) images to save
     n_aug_save = 16
     remote_data = False
@@ -167,31 +168,6 @@ if __name__ == '__main__':
     brain_net.eval()
     brain_net.requires_grad_(False)
 
-    def save_ckpt(tag):
-        ckpt_path = os.path.join(outdir, f'ckpt-{tag}.pth')
-        print(f'saving {ckpt_path}')
-        if (using_ddp==False) or (using_ddp==True and local_rank==0):
-            state_dict = brain_net.state_dict()
-            if using_ddp: # if using DDP, convert DDP state_dict to non-DDP before saving
-                for key in list(state_dict.keys()):
-                    if 'module.' in key:
-                        state_dict[key.replace('module.', '')] = state_dict[key]
-                        del state_dict[key]   
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': diffusion_prior.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_losses': losses,
-                'val_losses': val_losses,
-                'lrs': lrs,
-                'train_sims': sims,
-                'val_sims': val_sims,
-                }, ckpt_path)
-            
-            if using_ddp:
-                # this tells the other gpus wait for the first gpu to finish saving the model
-                dist.barrier()
-
     if not pretrained:
         # setup prior network
         prior_network = DiffusionPriorNetwork(
@@ -211,7 +187,8 @@ if __name__ == '__main__':
             image_embed_scale=image_embed_scale,
         ).to(device)
     else:
-        print("WARNING: passed dim, depth, dim_head, and heads will be ignored")
+        print("WARNING: ignoring passed values for dim, depth, dim_head, heads, "
+              "cond_drop_prob, image_embed_scale")
         assert timesteps == 1000
         diffusion_prior = BrainDiffusionPrior.from_pretrained(
             dict(),
@@ -241,7 +218,33 @@ if __name__ == '__main__':
     epoch = 0
     losses, val_losses, lrs = [], [], []
     sims, val_sims = [], []
+    sims_base, val_sims_base = [], []
     best_val_loss = 1e9
+
+    def save_ckpt(tag):
+        ckpt_path = os.path.join(outdir, f'ckpt-{tag}.pth')
+        print(f'saving {ckpt_path}')
+        if (using_ddp==False) or (using_ddp==True and local_rank==0):
+            state_dict = brain_net.state_dict()
+            if using_ddp: # if using DDP, convert DDP state_dict to non-DDP before saving
+                for key in list(state_dict.keys()):
+                    if 'module.' in key:
+                        state_dict[key.replace('module.', '')] = state_dict[key]
+                        del state_dict[key]   
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': diffusion_prior.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_losses': losses,
+                'val_losses': val_losses,
+                'lrs': lrs,
+                'train_sims': sims,
+                'val_sims': val_sims,
+                }, ckpt_path)
+            
+            if using_ddp:
+                # this tells the other gpus wait for the first gpu to finish saving the model
+                dist.barrier()
 
     # resume from checkpoint:
     # prior_checkpoint = torch.load(ckpt_path, map_location=device)
@@ -280,43 +283,29 @@ if __name__ == '__main__':
         for train_i, (voxel, image) in enumerate(train_dl):
             optimizer.zero_grad()
             image = image.to(device)
+            clip_embed = brain_net(voxel.to(device).float())
+            image_clip = clip_extractor.embed_image(image).float()
 
             if clip_aug_mode == 'x':
                 # the target y is fixed, and we will change the input x
-                image_clip = clip_extractor.embed_image(image).float()
-
                 if random.random() < clip_aug_prob:
                     # get an image variation
                     image_aug = sd_pipe(
                         image=image,
-                        num_inference_steps=50,
-                        guidance_scale=7.5,
-                        num_images_per_prompt=1,
                         width=256,
                         height=256,
                     )
                     # get the CLIP embedding for the variation and use it for x
-                    clip_embed = clip_extractor.embed_image(image_aug).float()
+                    clip_aug = clip_extractor.embed_image(image_aug).float()
 
-                    # utils.torch_to_Image(image[0]).save('test-orig.png')
-                    # utils.torch_to_Image(image_aug[0]).save('test-aug.png')
-                    # import ipdb; ipdb.set_trace()
-                    # utils.torch_to_Image(
-                    #     make_grid(torch.cat((image, image_aug)), nrow=image.shape[0], padding=10)
-                    # ).save('test-aug.png')
-
-                    loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
+                    loss, pred = diffusion_prior(text_embed=clip_aug, image_embed=image_clip)
                     loss_on_aug.append(loss.item())
                 else:
-                    clip_embed = brain_net(voxel.to(device).float())
                     loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
                     loss_off_aug.append(loss.item())
 
             elif clip_aug_mode == 'y':
                 # the input x is fixed, and we will change the target y
-                clip_embed = brain_net(voxel.to(device).float())
-                image_clip = clip_extractor.embed_image(image).float()
-
                 if random.random() < clip_aug_prob:
                     _, clip_pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
 
@@ -324,9 +313,6 @@ if __name__ == '__main__':
                     image_aug = sd_pipe(
                         # duplicate the embedding to serve classifier free guidance
                         image_embeddings=torch.cat([torch.zeros_like(clip_pred), clip_pred]).unsqueeze(1),
-                        num_inference_steps=50,
-                        guidance_scale=7.5,
-                        num_images_per_prompt=1,
                         width=256,
                         height=256,
                     )
@@ -339,7 +325,6 @@ if __name__ == '__main__':
                     loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
                     loss_off_aug.append(loss.item())
             else:
-                image_clip = clip_extractor.embed_image(image).float()
                 loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
 
             loss.backward()
@@ -350,6 +335,7 @@ if __name__ == '__main__':
             losses.append(loss.item())
             lrs.append(optimizer.param_groups[0]['lr'])
             sims.append(F.cosine_similarity(image_clip, pred).mean().item())
+            sims_base.append(F.cosine_similarity(image_clip, clip_embed).mean().item())
             
         diffusion_prior.eval()
         for val_i, (val_voxel, val_image) in enumerate(val_dl):    
@@ -366,6 +352,7 @@ if __name__ == '__main__':
 
                 val_losses.append(val_loss.item())
                 val_sims.append(F.cosine_similarity(image_clip, val_pred).mean().item())
+                val_sims_base.append(F.cosine_similarity(image_clip, clip_embed).mean().item())
                 
         if ckpt_saving:
             # save best model
@@ -395,13 +382,15 @@ if __name__ == '__main__':
             "train/lr": lrs[-1],
             "train/cosine_sim": np.mean(sims[-(train_i+1):]),
             "val/cosine_sim": np.mean(val_sims[-(val_i+1):]),
+            "train/cosine_sim_base": np.mean(sims_base[-(train_i+1):]),
+            "val/cosine_sim_base": np.mean(val_sims_base[-(val_i+1):]),
             "train/num_steps": len(losses),
             "train/loss_on_aug": np.mean(loss_on_aug),
             "train/loss_off_aug": np.mean(loss_off_aug),
         }
 
         # sample some images
-        if n_samples_save > 0: # and epoch == num_epochs - 1:
+        if (not save_samples_at_end and n_samples_save > 0) or (save_samples_at_end and epoch == num_epochs - 1):
             # training
             grids = utils.sample_images(
                 clip_extractor, brain_net, sd_pipe, diffusion_prior,

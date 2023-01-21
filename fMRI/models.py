@@ -11,7 +11,6 @@ from dalle2_pytorch.dalle2_pytorch import l2norm, default
 from tqdm.auto import tqdm
 import random
 import json
-import requests
 from dalle2_pytorch.train_configs import DiffusionPriorNetworkConfig
 
 # for pipeline
@@ -247,9 +246,8 @@ class BrainDiffusionPrior(DiffusionPrior):
 
     @staticmethod
     def from_pretrained(net_kwargs={}, prior_kwargs={}):
-        # config_url = "https://huggingface.co/nousr/conditioned-prior/raw/main/vit-l-14/aesthetic/prior_config.json"
+        # "https://huggingface.co/nousr/conditioned-prior/raw/main/vit-l-14/aesthetic/prior_config.json"
         config_url = "checkpoints/prior_config.json"
-        # config = json.load(requests.get(config_url).text)
         config = json.load(open(config_url))
         
         config['prior']['net']['max_text_len'] = 256
@@ -266,14 +264,15 @@ class BrainDiffusionPrior(DiffusionPrior):
         diffusion_prior_network = net_config.create()
         diffusion_prior = BrainDiffusionPrior(net=diffusion_prior_network, clip=None, **kwargs).to(device)
         
-        # ckpt_url = 'https://huggingface.co/nousr/conditioned-prior/resolve/main/vit-l-14/aesthetic/best.pth'
+        # 'https://huggingface.co/nousr/conditioned-prior/resolve/main/vit-l-14/aesthetic/best.pth'
         ckpt_url = 'checkpoints/best.pth'
         ckpt = torch.load(ckpt_url, map_location=device)
 
-        # Note these keys will be missing:
-        # Missing key(s) in state_dict: "net.null_text_encodings", "net.null_text_embeds", "net.null_image_embed"
+        # Note these keys will be missing (maybe due to an update to the code since training):
+        # "net.null_text_encodings", "net.null_text_embeds", "net.null_image_embed"
+        # I don't think these get used if `cond_drop_prob = 0` though (which is the default here)
         keys = diffusion_prior.load_state_dict(ckpt, strict=False)
-        print(keys.missing_keys)
+        print("missing keys in ckpt", keys.missing_keys)
         
         return diffusion_prior
 

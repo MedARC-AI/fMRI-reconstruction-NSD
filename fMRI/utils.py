@@ -142,22 +142,6 @@ def plot_brainnet_ckpt(ckpt_path):
     lrs=checkpoint['lrs']
     plot_brainnet(train_losses, train_fwd_topk, train_bwd_topk, val_losses, val_fwd_topk, val_bwd_topk, lrs)
 
-# def plot_prior(losses, val_losses, lrs):
-#     # rolling over epoch
-#     # losses_ep = pd.Series(losses).rolling(int(np.ceil(24983/batch_size))).mean().values
-#     # val_losses_ep = pd.Series(val_losses).rolling(int(np.ceil(492/batch_size))).mean().values
-#     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(10, 4))
-#     ax1.set_title(f"Training Loss\n(final={losses[-1]:.3f})")
-#     ax1.plot(losses)
-#     # ax1.plot(losses_ep)
-#     ax2.set_title(f"Val Loss\n(final={val_losses[-1]:.3f})")
-#     ax2.plot(val_losses)
-#     # ax2.plot(val_losses_ep)
-#     ax3.set_title(f"Learning Rate")
-#     ax3.plot(lrs)
-#     fig.tight_layout()
-#     plt.show()
-
 def plot_prior(losses, val_losses, lrs, sims, val_sims):
     # rolling over epoch
     # losses_ep = pd.Series(losses).rolling(int(np.ceil(24983/batch_size))).mean().values
@@ -211,6 +195,7 @@ def get_dataloaders(
     num_workers=None,
     train_url=None,
     val_url=None,
+    cache_dir="/tmp/wds-cache",
 ):
     print("Getting dataloaders...")
     train_url_hf, val_url_hf = get_huggingface_urls()
@@ -236,15 +221,30 @@ def get_dataloaders(
     num_worker_batches = math.floor(num_batches / num_workers)
     print("num_worker_batches", num_worker_batches)
 
-    train_data = wds.DataPipeline([wds.ResampledShards(train_url),
-                        wds.tarfile_to_samples(),
-                        wds.shuffle(500,initial=500),
-                        wds.decode("torch"),
-                        wds.rename(images="jpg;png", voxels="nsdgeneral.npy", 
-                                    trial="trial.npy"),
-                        wds.to_tuple("voxels", image_var),
-                        wds.batched(batch_size, partial=True),
-                    ]).with_epoch(num_worker_batches)
+    # train_data = wds.DataPipeline([wds.ResampledShards(train_url),
+    #                     wds.tarfile_to_samples(),
+    #                     wds.shuffle(500,initial=500),
+    #                     wds.decode("torch"),
+    #                     wds.rename(images="jpg;png", voxels="nsdgeneral.npy", 
+    #                                 trial="trial.npy"),
+    #                     wds.to_tuple("voxels", image_var),
+    #                     wds.batched(batch_size, partial=True),
+    #                 ]).with_epoch(num_worker_batches)
+
+    if 'http' not in train_url:
+        # don't use cache if train_url is for local path
+        cache_dir = None
+    print("cache_dir", cache_dir)
+    if cache_dir is not None and not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+
+    train_data = wds.WebDataset(train_url, resampled=True, cache_dir=cache_dir)\
+        .shuffle(500, initial=500)\
+        .decode("torch")\
+        .rename(images="jpg;png", voxels="nsdgeneral.npy", trial="trial.npy")\
+        .to_tuple("voxels", image_var)\
+        .batched(batch_size, partial=True)\
+        .with_epoch(num_worker_batches)
     
     train_dl = wds.WebLoader(train_data, num_workers=num_workers,
                             batch_size=None, shuffle=False, persistent_workers=True)
@@ -255,14 +255,21 @@ def get_dataloaders(
     num_worker_batches = math.ceil(num_batches / num_workers)
     print("validation: num_worker_batches",num_worker_batches)
 
-    val_data = wds.DataPipeline([wds.SimpleShardList(val_url),
-                        wds.tarfile_to_samples(),
-                        wds.decode("torch"),
-                        wds.rename(images="jpg;png", voxels="nsdgeneral.npy", 
-                                    trial="trial.npy"),
-                        wds.to_tuple("voxels", image_var),
-                        wds.batched(batch_size, partial=True),
-                    ]).with_epoch(num_worker_batches)
+    # val_data = wds.DataPipeline([wds.SimpleShardList(val_url),
+    #                     wds.tarfile_to_samples(),
+    #                     wds.decode("torch"),
+    #                     wds.rename(images="jpg;png", voxels="nsdgeneral.npy", 
+    #                                 trial="trial.npy"),
+    #                     wds.to_tuple("voxels", image_var),
+    #                     wds.batched(batch_size, partial=True),
+    #                 ]).with_epoch(num_worker_batches)
+
+    val_data = wds.WebDataset(val_url, cache_dir=cache_dir)\
+        .decode("torch")\
+        .rename(images="jpg;png", voxels="nsdgeneral.npy", trial="trial.npy")\
+        .to_tuple("voxels", image_var)\
+        .batched(batch_size, partial=True)\
+        .with_epoch(num_worker_batches)
     
     val_dl = wds.WebLoader(val_data, num_workers=num_workers,
                         batch_size=None, shuffle=False, persistent_workers=True)
@@ -466,6 +473,4 @@ def sample_images(
 
     # grid = make_grid(imgs_all, nrow=2+4, padding=10).detach()
     # grid = torch_to_Image(grid)
-    # grid.save('test3.png')
-    # import ipdb; ipdb.set_trace()
     return grids
