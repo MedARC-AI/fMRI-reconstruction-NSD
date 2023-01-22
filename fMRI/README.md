@@ -13,9 +13,14 @@ To create a conda environment that will run the notebooks:
 conda env create -f environment.yaml
 conda activate medical-v1
 ```
-The `setup.sh` script lists the conda and pip commands to create this environment manually.
+The `setup.sh` script lists the conda and pip commands to create this environment manually. To download the checkpoints and other data:
+```bash
+./download.sh
+```
 
 ## Train DiffusionPrior
+
+Train the prior model (see the file for all the command line arguments):
 
 ```bash
 python train_prior.py

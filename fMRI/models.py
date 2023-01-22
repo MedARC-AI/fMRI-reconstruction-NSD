@@ -82,7 +82,7 @@ class Clipper(torch.nn.Module):
 
 class BrainNetwork(nn.Module):
     # 133M
-    def __init__(self, out_dim, in_dim=15724, h=4096):
+    def __init__(self, out_dim, in_dim=15724, h=4096, n_blocks=4):
         super().__init__()
         self.lin0 = nn.Sequential(
             nn.Linear(in_dim, h),
@@ -97,10 +97,11 @@ class BrainNetwork(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.BatchNorm1d(h),
                 nn.Dropout(0.15)
-            ) for _ in range(4)
-        ])  
+            ) for _ in range(n_blocks)
+        ])
         
-        self.lin1 = nn.Linear(4096,out_dim)
+        self.lin1 = nn.Linear(h, out_dim)
+        self.n_blocks = n_blocks
         
     def forward(self, x):
         '''
@@ -108,13 +109,13 @@ class BrainNetwork(nn.Module):
             bs, 32, h -> bs, 32h
             b2, 32h -> bs, 768
         '''
-        x = self.lin0(x)  # bs, 4096
+        x = self.lin0(x)  # bs, h
         residual = x
-        for res_block in range(4):
+        for res_block in range(self.n_blocks):
             x = self.mlp[res_block](x)
             x += residual
             residual = x
-        x = x.reshape(len(x),-1)
+        x = x.reshape(len(x), -1)
         x = self.lin1(x)
         return x
     
@@ -160,7 +161,6 @@ class BrainNetworkLarge(nn.Module):
         x = self.lin1(x)
         return x
 
-
 class BrainDiffusionPrior(DiffusionPrior):
     """ 
     Differences from original:
@@ -168,8 +168,9 @@ class BrainDiffusionPrior(DiffusionPrior):
     - Return predictions when computing loss
     """
     def __init__(self, *args, **kwargs):
+        voxel2clip = kwargs.pop('voxel2clip', None)
         super().__init__(*args, **kwargs)
-        self.voxel2clip = BrainNetwork(768).to(device)
+        self.voxel2clip = voxel2clip
 
     @torch.no_grad()
     def p_sample(self, x, t, text_cond = None, self_cond = None, clip_denoised = True, cond_scale = 1.,
@@ -254,12 +255,13 @@ class BrainDiffusionPrior(DiffusionPrior):
         *args,
         **kwargs
     ):
-        assert exists(text) ^ exists(text_embed), 'either text or text embedding must be supplied'
+        assert exists(text) ^ exists(text_embed) ^ exists(voxel), 'either text, text embedding, or voxel must be supplied'
         assert exists(image) ^ exists(image_embed), 'either image or image embedding must be supplied'
         assert not (self.condition_on_text_encodings and (not exists(text_encodings) and not exists(text))), 'text encodings must be present if you specified you wish to condition on it on initialization'
 
         if exists(voxel):
-           #  assert not exists(text_embed), 'cannot pass in both text and voxels'
+            assert exists(self.voxel2clip), 'voxel2clip must be trained if you wish to pass in voxels'
+            # assert not exists(text_embed), 'cannot pass in both text and voxels'
             text_embed = self.voxel2clip(voxel)
 
         if exists(image):
@@ -288,7 +290,7 @@ class BrainDiffusionPrior(DiffusionPrior):
         # calculate forward loss
 
         return self.p_losses(image_embed, times, text_cond = text_cond, *args, **kwargs)
-
+   
     @staticmethod
     def from_pretrained(net_kwargs={}, prior_kwargs={}):
         # "https://huggingface.co/nousr/conditioned-prior/raw/main/vit-l-14/aesthetic/prior_config.json"
