@@ -7,7 +7,7 @@ import clip
 
 # for prior
 from dalle2_pytorch import DiffusionPrior
-from dalle2_pytorch.dalle2_pytorch import l2norm, default
+from dalle2_pytorch.dalle2_pytorch import l2norm, default, exists
 from tqdm.auto import tqdm
 import random
 import json
@@ -82,7 +82,7 @@ class Clipper(torch.nn.Module):
 
 class BrainNetwork(nn.Module):
     # 133M
-    def __init__(self, out_dim, in_dim=15724, h=4096):
+    def __init__(self, out_dim, in_dim=15724, h=4096, n_blocks=4):
         super().__init__()
         self.lin0 = nn.Sequential(
             nn.Linear(in_dim, h),
@@ -97,10 +97,11 @@ class BrainNetwork(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.BatchNorm1d(h),
                 nn.Dropout(0.15)
-            ) for _ in range(4)
-        ])  
+            ) for _ in range(n_blocks)
+        ])
         
-        self.lin1 = nn.Linear(4096,out_dim)
+        self.lin1 = nn.Linear(h, out_dim)
+        self.n_blocks = n_blocks
         
     def forward(self, x):
         '''
@@ -108,13 +109,13 @@ class BrainNetwork(nn.Module):
             bs, 32, h -> bs, 32h
             b2, 32h -> bs, 768
         '''
-        x = self.lin0(x)  # bs, 4096
+        x = self.lin0(x)  # bs, h
         residual = x
-        for res_block in range(4):
+        for res_block in range(self.n_blocks):
             x = self.mlp[res_block](x)
             x += residual
             residual = x
-        x = x.reshape(len(x),-1)
+        x = x.reshape(len(x), -1)
         x = self.lin1(x)
         return x
     
@@ -160,7 +161,6 @@ class BrainNetworkLarge(nn.Module):
         x = self.lin1(x)
         return x
 
-
 class BrainDiffusionPrior(DiffusionPrior):
     """ 
     Differences from original:
@@ -168,7 +168,9 @@ class BrainDiffusionPrior(DiffusionPrior):
     - Return predictions when computing loss
     """
     def __init__(self, *args, **kwargs):
+        voxel2clip = kwargs.pop('voxel2clip', None)
         super().__init__(*args, **kwargs)
+        self.voxel2clip = voxel2clip
 
     @torch.no_grad()
     def p_sample(self, x, t, text_cond = None, self_cond = None, clip_denoised = True, cond_scale = 1.,
@@ -178,7 +180,6 @@ class BrainDiffusionPrior(DiffusionPrior):
         if generator is None:
             noise = torch.randn_like(x)
         else:
-            # print('using generator 2')
             #noise = torch.randn_like(x)
             noise = torch.randn(x.size(), device=x.device, dtype=x.dtype, generator=generator)
         # no noise when t == 0
@@ -193,7 +194,6 @@ class BrainDiffusionPrior(DiffusionPrior):
         if generator is None:
             image_embed = torch.randn(shape, device = device)
         else:
-            # print('using generator 1')
             image_embed = torch.randn(shape, device = device, generator=generator)
         x_start = None # for self-conditioning
 
@@ -244,6 +244,53 @@ class BrainDiffusionPrior(DiffusionPrior):
         loss = self.noise_scheduler.loss_fn(pred, target)
         return loss, pred
 
+    def forward(
+        self,
+        text = None,
+        image = None,
+        voxel = None,
+        text_embed = None,      # allow for training on preprocessed CLIP text and image embeddings
+        image_embed = None,
+        text_encodings = None,  # as well as CLIP text encodings
+        *args,
+        **kwargs
+    ):
+        assert exists(text) ^ exists(text_embed) ^ exists(voxel), 'either text, text embedding, or voxel must be supplied'
+        assert exists(image) ^ exists(image_embed), 'either image or image embedding must be supplied'
+        assert not (self.condition_on_text_encodings and (not exists(text_encodings) and not exists(text))), 'text encodings must be present if you specified you wish to condition on it on initialization'
+
+        if exists(voxel):
+            assert exists(self.voxel2clip), 'voxel2clip must be trained if you wish to pass in voxels'
+            # assert not exists(text_embed), 'cannot pass in both text and voxels'
+            text_embed = self.voxel2clip(voxel)
+
+        if exists(image):
+            image_embed, _ = self.clip.embed_image(image)
+
+        # calculate text conditionings, based on what is passed in
+
+        if exists(text):
+            text_embed, text_encodings = self.clip.embed_text(text)
+
+        text_cond = dict(text_embed = text_embed)
+
+        if self.condition_on_text_encodings:
+            assert exists(text_encodings), 'text encodings must be present for diffusion prior if specified'
+            text_cond = {**text_cond, 'text_encodings': text_encodings}
+
+        # timestep conditioning from ddpm
+
+        batch, device = image_embed.shape[0], image_embed.device
+        times = self.noise_scheduler.sample_random_times(batch)
+
+        # scale image embed (Katherine)
+
+        image_embed *= self.image_embed_scale
+
+        # calculate forward loss
+
+        return self.p_losses(image_embed, times, text_cond = text_cond, *args, **kwargs)
+   
     @staticmethod
     def from_pretrained(net_kwargs={}, prior_kwargs={}):
         # "https://huggingface.co/nousr/conditioned-prior/raw/main/vit-l-14/aesthetic/prior_config.json"
@@ -254,9 +301,9 @@ class BrainDiffusionPrior(DiffusionPrior):
         config['prior']['net'].update(net_kwargs)
         print('net_config', config['prior']['net'])
         net_config = DiffusionPriorNetworkConfig(**config['prior']['net'])
-        
+
         kwargs = config['prior']
-        has_clip = kwargs.pop('clip') is not None
+        kwargs.pop('clip')
         kwargs.pop('net')
         kwargs.update(prior_kwargs)
         print('prior_config', kwargs)
@@ -275,7 +322,6 @@ class BrainDiffusionPrior(DiffusionPrior):
         print("missing keys in ckpt", keys.missing_keys)
         
         return diffusion_prior
-
 
 class BrainSD(StableDiffusionImageVariationPipeline):
     """ 
