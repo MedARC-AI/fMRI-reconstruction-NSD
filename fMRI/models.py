@@ -289,7 +289,9 @@ class BrainDiffusionPrior(DiffusionPrior):
 
         # calculate forward loss
 
-        return self.p_losses(image_embed, times, text_cond = text_cond, *args, **kwargs)
+        loss, pred = self.p_losses(image_embed, times, text_cond = text_cond, *args, **kwargs)
+
+        return loss, pred, text_embed
    
     @staticmethod
     def from_pretrained(net_kwargs={}, prior_kwargs={}):

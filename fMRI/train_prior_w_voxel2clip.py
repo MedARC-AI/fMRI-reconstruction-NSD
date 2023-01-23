@@ -1,3 +1,6 @@
+"""
+Train one single network that includes the voxel2clip mapper and the diffusion prior.
+"""
 import os
 import sys
 import json
@@ -18,17 +21,14 @@ import ddp_config
 import utils
 from models import Clipper, BrainNetwork, BrainDiffusionPrior, BrainSD
 
-
 # -----------------------------------------------------------------------------
 # params for this model
 model_name = "prior-w-voxel2clip"
 modality = "image" # ("image", "text")
 clip_variant = "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
 clamp_embs = False # clamp embeddings to (-1.5, 1.5)
-# BrainNet checkpoint
-# ckpt_path = f'checkpoints/clip_image_vitL_2stage_mixco_lotemp_125ep_subj01_best.pth'
-timesteps = 1000
-# -- these are overwritten by the pretrained prior checkpoint `--pretrained=True`
+timesteps = 1000 # for diffusion prior
+# -- these are ignored when using the pretrained prior `--pretrained=True`
 dim = 768
 depth = 6
 dim_head = 64
@@ -38,22 +38,18 @@ image_embed_scale = None
 # image_embed_scale = 1.0
 condition_on_text_encodings = False
 # --
-# how many samples from train and val to save
-n_samples_save = 8
-save_at_end = False
-# how many pairs of (orig, augmented) images to save
-n_aug_save = 16
-remote_data = False
-data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
+n_samples_save = 8 # how many samples from train and val to save
+n_aug_save = 16 # how many pairs of (orig, augmented) images to save
+remote_data = False # pull data from huggingface if True
+data_commit = '9947586218b6b7c8cab804009ddca5045249a38d' # only applies when remote_data=True
 pretrained = False
 cache_dir = "/tmp/wds-cache"
 n_cache_recs = 0
-alpha = 0.01
 # -----------------------------------------------------------------------------
 # params for all models
 seed = 0
 batch_size = 64
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 num_devices = torch.cuda.device_count()
 num_workers = num_devices
 num_epochs = 60
@@ -67,9 +63,11 @@ wandb_notes = ""
 first_batch = False
 ckpt_saving = True
 ckpt_interval = None
+save_at_end = False
 outdir = os.path.expanduser(f'~/data/neuro/models/{model_name}/test')
 
 # -----------------------------------------------------------------------------
+# read in any command line args or config file values and override the above params
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
@@ -208,14 +206,6 @@ elif lr_scheduler == 'cycle':
         last_epoch=-1, pct_start=2/num_epochs
     )
 
-epoch = 0
-losses, val_losses, lrs = [], [], []
-sims, val_sims = [], []
-sims_base, val_sims_base = [], []
-best_val_loss = 1e9
-
-nce = InfoNCE()
-
 def save_ckpt(tag):
     ckpt_path = os.path.join(outdir, f'ckpt-{tag}.pth')
     print(f'saving {ckpt_path}')
@@ -233,10 +223,7 @@ def save_ckpt(tag):
             'train_losses': losses,
             'val_losses': val_losses,
             'lrs': lrs,
-            'train_sims': sims,
-            'val_sims': val_sims,
             }, ckpt_path)
-
         
         # if wandb_log:
         #     wandb.save(ckpt_path)
@@ -244,6 +231,14 @@ def save_ckpt(tag):
         if using_ddp:
             # this tells the other gpus wait for the first gpu to finish saving the model
             dist.barrier()
+
+epoch = 0
+losses, val_losses, lrs = [], [], []
+best_val_loss = 1e9
+nce = InfoNCE()
+
+# weight for prior's loss
+alphas = np.linspace(0.01, 0.05, num_epochs, endpoint=True)
 
 # resume from checkpoint:
 # prior_checkpoint = torch.load(ckpt_path, map_location=device)
@@ -275,18 +270,23 @@ progress_bar = tqdm(range(epoch, num_epochs), desc='train loop')
 
 for epoch in progress_bar:
     diffusion_prior.train()
-    
-    loss_on_aug, loss_off_aug = [], []
-    image_aug = None
-    
+
+    sims = 0.
+    sims_base = 0.
+    val_sims = 0.
+    val_sims_base = 0.
     fwd_percent_correct = 0.
     bwd_percent_correct = 0.
     val_fwd_percent_correct = 0.
     val_bwd_percent_correct = 0.
     loss_nce_sum = 0.
-    val_loss_nce_sum = 0.
     loss_prior_sum = 0.
+    val_loss_nce_sum = 0.
     val_loss_prior_sum = 0.
+
+    image_aug = None
+
+    alpha = alphas[epoch]
 
     for train_i, (voxel, image) in enumerate(train_dl):
         optimizer.zero_grad()
@@ -295,10 +295,8 @@ for epoch in progress_bar:
         voxel = voxel.to(device).float()
 
         with torch.cuda.amp.autocast():
-            clip_voxels = diffusion_prior.voxel2clip(voxel)
             clip_image = clip_extractor.embed_image(image).float()
-
-            loss, pred = diffusion_prior(image_embed=clip_image, voxel=voxel)
+            loss, pred, clip_voxels = diffusion_prior(image_embed=clip_image, voxel=voxel)
 
             loss_nce = nce(
                 nn.functional.normalize(clip_voxels, dim=-1), 
@@ -307,13 +305,13 @@ for epoch in progress_bar:
             loss_nce_sum += loss_nce.item()
             loss_prior_sum += loss.item()
 
-            # so .01*300 (~3) for the prior + .99*nce (~10) gives more weight to the nce
+            # so with alpha=0.01 at epoch 0, we have .01*300 (3) for the prior + .99*3 (~3)
             loss = alpha * loss + (1-alpha) * loss_nce
 
             losses.append(loss.item())
             lrs.append(optimizer.param_groups[0]['lr'])
-            sims.append(F.cosine_similarity(clip_image, pred).mean().item())
-            sims_base.append(F.cosine_similarity(clip_image, clip_voxels).mean().item())
+            sims += F.cosine_similarity(clip_image, pred).mean().item()
+            sims_base += F.cosine_similarity(clip_image, clip_voxels).mean().item()
             labels = torch.arange(len(clip_voxels)).to(device)
             fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_image, clip_voxels), labels, k=1)
             bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels, clip_image), labels, k=1)
@@ -324,16 +322,14 @@ for epoch in progress_bar:
             lr_scheduler.step()
         
     diffusion_prior.eval()
-    for val_i, (val_voxel, val_image) in enumerate(val_dl):    
+    for val_i, (voxel, image) in enumerate(val_dl):    
         with torch.no_grad():
-            val_image = val_image.to(device).float()
-            val_voxel = val_voxel.to(device).float()
+            image = image.to(device).float()
+            voxel = voxel.to(device).float()
 
             with torch.cuda.amp.autocast():
-                clip_voxels = diffusion_prior.voxel2clip(val_voxel)
-                clip_image = clip_extractor.embed_image(val_image).float()
-
-                val_loss, val_pred = diffusion_prior(image_embed=clip_image, voxel=val_voxel)
+                clip_image = clip_extractor.embed_image(image).float()
+                loss, pred, clip_voxels = diffusion_prior(image_embed=clip_image, voxel=voxel)
 
                 loss_nce = nce(
                     nn.functional.normalize(clip_voxels, dim=-1), 
@@ -342,11 +338,11 @@ for epoch in progress_bar:
                 val_loss_nce_sum += loss_nce.item()
                 val_loss_prior_sum += loss.item()
 
-                val_loss = alpha * val_loss + (1-alpha) * loss_nce
+                val_loss = alpha * loss + (1-alpha) * loss_nce
 
                 val_losses.append(val_loss.item())
-                val_sims.append(F.cosine_similarity(clip_image, val_pred).mean().item())
-                val_sims_base.append(F.cosine_similarity(clip_image, clip_voxels).mean().item())
+                val_sims += F.cosine_similarity(clip_image, pred).mean().item()
+                val_sims_base += F.cosine_similarity(clip_image, clip_voxels).mean().item()
                 labels = torch.arange(len(clip_voxels)).to(device)
                 val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_image, clip_voxels), labels, k=1)
                 val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels, clip_image), labels, k=1)
@@ -377,21 +373,20 @@ for epoch in progress_bar:
         "train/loss": np.mean(losses[-(train_i+1):]),
         "val/loss": np.mean(val_losses[-(val_i+1):]),
         "train/lr": lrs[-1],
-        "train/cosine_sim": np.mean(sims[-(train_i+1):]),
-        "val/cosine_sim": np.mean(val_sims[-(val_i+1):]),
-        "train/cosine_sim_base": np.mean(sims_base[-(train_i+1):]),
-        "val/cosine_sim_base": np.mean(val_sims_base[-(val_i+1):]),
         "train/num_steps": len(losses),
-        "train/loss_on_aug": np.mean(loss_on_aug),
-        "train/loss_off_aug": np.mean(loss_off_aug),
+        "train/cosine_sim": sims / (train_i + 1),
+        "val/cosine_sim": val_sims / (val_i + 1),
+        "train/cosine_sim_base": sims_base / (train_i + 1),
+        "val/cosine_sim_base": val_sims_base / (val_i + 1),
         "train/fwd_pct_correct": fwd_percent_correct / (train_i + 1),
-        "train/bwd_pct_correct": fwd_percent_correct / (train_i + 1),
+        "train/bwd_pct_correct": bwd_percent_correct / (train_i + 1),
         "val/val_fwd_pct_correct": val_fwd_percent_correct / (val_i + 1),
         "val/val_bwd_pct_correct": val_bwd_percent_correct / (val_i + 1),
         "train/loss_nce": loss_nce_sum / (train_i + 1),
         "train/loss_prior": loss_prior_sum / (train_i + 1),
         "val/loss_nce": val_loss_nce_sum / (val_i + 1),
         "val/loss_prior": val_loss_prior_sum / (val_i + 1),
+        "train/alpha": alpha,
     }
 
     # sample some images
