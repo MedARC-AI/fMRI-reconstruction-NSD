@@ -364,8 +364,8 @@ for epoch in progress_bar:
         train_loss=np.mean(losses[-(train_i+1):]),
         val_loss=np.mean(val_losses[-(val_i+1):]),
         lr=lrs[-1],
-        train_sim=np.mean(sims[-(train_i+1):]),
-        val_sim=np.mean(val_sims[-(val_i+1):]),
+        train_sim=sims / (train_i + 1),
+        val_sim=val_sims / (val_i + 1),
     )
     progress_bar.set_postfix(**logs)
 
