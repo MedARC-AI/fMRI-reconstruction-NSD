@@ -165,7 +165,9 @@ class BrainDiffusionPrior(DiffusionPrior):
     """ 
     Differences from original:
     - Allow for passing of generators to torch random functions
+    - Option to include the voxel2clip model and pass voxels into forward method
     - Return predictions when computing loss
+    - Load pretrained model from @nousr trained on LAION aesthetics
     """
     def __init__(self, *args, **kwargs):
         voxel2clip = kwargs.pop('voxel2clip', None)
@@ -261,7 +263,7 @@ class BrainDiffusionPrior(DiffusionPrior):
 
         if exists(voxel):
             assert exists(self.voxel2clip), 'voxel2clip must be trained if you wish to pass in voxels'
-            # assert not exists(text_embed), 'cannot pass in both text and voxels'
+            assert not exists(text_embed), 'cannot pass in both text and voxels'
             text_embed = self.voxel2clip(voxel)
 
         if exists(image):
@@ -330,7 +332,8 @@ class BrainSD(StableDiffusionImageVariationPipeline):
     Differences from original:
     - Keep generated images on GPU and return tensors
     - No NSFW checker
-    - Can pass in image or image_embedding
+    - Can pass in image or image_embedding to generate a variation
+    NOTE: requires latest version of diffusers to avoid the latent dims not being correct.
     """
 
     def decode_latents(self, latents):
@@ -401,9 +404,6 @@ class BrainSD(StableDiffusionImageVariationPipeline):
         else:
             batch_size = image_embeddings.shape[0] // 2
 
-        # print(image_embeddings.shape)
-        # import pdb; pdb.set_trace()
-
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
@@ -467,7 +467,8 @@ class BrainSD(StableDiffusionImageVariationPipeline):
 
         return image
 
-## begin open-clip
+# -----------------------------------------------------------------------------
+# begin open-clip
 
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
