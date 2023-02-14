@@ -20,6 +20,7 @@ from dalle2_pytorch import DiffusionPriorNetwork #, DiffusionPrior
 import ddp_config
 import utils
 from models import Clipper, BrainNetwork, BrainDiffusionPrior, BrainSD
+from model3d import NewVoxel3dConvEncoder
 
 # -----------------------------------------------------------------------------
 # params for this model
@@ -28,6 +29,7 @@ modality = "image" # ("image", "text")
 clip_variant = "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
 clamp_embs = False # clamp embeddings to (-1.5, 1.5)
 timesteps = 1000 # for diffusion prior
+alpha_schedule = "constant" # ("constant", "linear") - for weighting the loss
 # -- these are ignored when using the pretrained prior `--pretrained=True`
 dim = 768
 depth = 6
@@ -37,12 +39,13 @@ cond_drop_prob = 0.2
 image_embed_scale = None
 # image_embed_scale = 1.0
 condition_on_text_encodings = False
-# --
+voxel_dims = 1 # (1, 3)
+# -- params for data
 n_samples_save = 8 # how many samples from train and val to save
-n_aug_save = 16 # how many pairs of (orig, augmented) images to save
+n_aug_save = 0 # how many pairs of (orig, augmented) images to save
 remote_data = False # pull data from huggingface if True
 data_commit = '9947586218b6b7c8cab804009ddca5045249a38d' # only applies when remote_data=True
-pretrained = False
+pretrained = True
 cache_dir = "/tmp/wds-cache"
 n_cache_recs = 0
 # -----------------------------------------------------------------------------
@@ -135,6 +138,13 @@ else:
     train_url = "/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/train/train_subj01_{0..49}.tar"
     val_url = "/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/val/val_subj01_0.tar"
 
+if voxel_dims == 1:
+    voxels_key = 'nsdgeneral.npy'
+elif voxel_dims == 3:
+    voxels_key = 'wholebrain_3d.npy'
+else:
+    raise Exception(f"voxel_dims must be 1 or 3, not {voxel_dims}")
+
 train_dl, val_dl = utils.get_dataloaders(
     batch_size, image_var, 
     num_workers=num_workers,
@@ -142,6 +152,7 @@ train_dl, val_dl = utils.get_dataloaders(
     val_url=val_url,
     cache_dir=cache_dir,
     n_cache_recs=n_cache_recs,
+    voxels_key=voxels_key,
 )
 
 # get first batches
@@ -151,9 +162,23 @@ for val_i, (val_voxel0, val_image0) in enumerate(val_dl):
     break
 
 print('Creating voxel2clip mapper...')
-voxel2clip = BrainNetwork(768)
-# voxel2clip = BrainNetwork(768, h=2048)
-utils.count_params(voxel2clip)
+out_dim = 768
+
+if voxel_dims == 1:
+    voxel2clip = BrainNetwork(out_dim)
+    # voxel2clip = BrainNetwork(out_dim, h=2048)
+elif voxel_dims == 3:
+    voxel2clip = NewVoxel3dConvEncoder(
+        dims=[42, 46, 61],  # Pass anything, these values are not used
+        attention_width=64,
+        output_dim=out_dim,
+        average_output=False,
+        # act_layer=act_layer
+    )
+try:
+    utils.count_params(voxel2clip)
+except:
+    print('Cannot count params for voxel2clip (probably because it has Lazy layers)')
 
 print('Creating diffusion prior...')
 if not pretrained:
@@ -191,7 +216,11 @@ else:
             voxel2clip=voxel2clip,
         ),
     )
-utils.count_params(diffusion_prior)
+
+try:
+    utils.count_params(diffusion_prior)
+except:
+    print('Cannot count params for diffusion_prior (probably because it has Lazy layers)')
 
 optimizer = torch.optim.AdamW(diffusion_prior.parameters(), lr=initial_lr)
 if lr_scheduler == 'fixed':
@@ -238,7 +267,12 @@ best_val_loss = 1e9
 nce = InfoNCE()
 
 # weight for prior's loss
-alphas = np.linspace(0.01, 0.05, num_epochs, endpoint=True)
+if alpha_schedule == 'constant':
+    alphas = np.ones(num_epochs) * 0.01
+elif alpha_schedule == 'linear':
+    alphas = np.linspace(0.01, 0.05, num_epochs, endpoint=True)
+else:
+    raise ValueError(f'unknown alpha_schedule: {alpha_schedule}')
 
 # resume from checkpoint:
 # prior_checkpoint = torch.load(ckpt_path, map_location=device)
@@ -264,6 +298,10 @@ if first_batch:
     bs = batch_size
     train_dl = [(voxel0[:bs], image0[:bs])]
     val_dl = [(val_voxel0[:bs], val_image0[:bs])]
+
+def check_loss(loss):
+    if loss.isnan().any():
+        raise ValueError('NaN loss')
 
 # feed text and images into diffusion prior network
 progress_bar = tqdm(range(epoch, num_epochs), desc='train loop')
@@ -307,6 +345,10 @@ for epoch in progress_bar:
 
             # so with alpha=0.01 at epoch 0, we have .01*300 (3) for the prior + .99*3 (~3)
             loss = alpha * loss + (1-alpha) * loss_nce
+            try:
+                check_loss(loss)
+            except:
+                import ipdb; ipdb.set_trace()
 
             losses.append(loss.item())
             lrs.append(optimizer.param_groups[0]['lr'])
@@ -320,6 +362,15 @@ for epoch in progress_bar:
         optimizer.step()
         if lr_scheduler is not None:
             lr_scheduler.step()
+
+        logs = OrderedDict(
+            train_loss=np.mean(losses[-(train_i+1):]),
+            val_loss=np.nan,
+            lr=lrs[-1],
+            train_sim=sims / (train_i + 1),
+            val_sim=np.nan,
+        )
+        progress_bar.set_postfix(**logs)
         
     diffusion_prior.eval()
     for val_i, (voxel, image) in enumerate(val_dl):    
@@ -339,6 +390,10 @@ for epoch in progress_bar:
                 val_loss_prior_sum += loss.item()
 
                 val_loss = alpha * loss + (1-alpha) * loss_nce
+                try:
+                    check_loss(val_loss)
+                except:
+                    import ipdb; ipdb.set_trace()
 
                 val_losses.append(val_loss.item())
                 val_sims += F.cosine_similarity(clip_image, pred).mean().item()
@@ -346,6 +401,15 @@ for epoch in progress_bar:
                 labels = torch.arange(len(clip_voxels)).to(device)
                 val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_image, clip_voxels), labels, k=1)
                 val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels, clip_image), labels, k=1)
+    
+        logs = OrderedDict(
+            train_loss=np.mean(losses[-(train_i+1):]),
+            val_loss=np.mean(val_losses[-(val_i+1):]),
+            lr=lrs[-1],
+            train_sim=sims / (train_i + 1),
+            val_sim=val_sims / (val_i + 1),
+        )
+        progress_bar.set_postfix(**logs)
             
     if (not save_at_end and ckpt_saving) or (save_at_end and epoch == num_epochs - 1):
         # save best model
@@ -359,15 +423,6 @@ for epoch in progress_bar:
         # Save model checkpoint every `ckpt_interval`` epochs or on the last epoch
         if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
             save_ckpt(f'epoch{epoch:03d}')
-
-    logs = OrderedDict(
-        train_loss=np.mean(losses[-(train_i+1):]),
-        val_loss=np.mean(val_losses[-(val_i+1):]),
-        lr=lrs[-1],
-        train_sim=sims / (train_i + 1),
-        val_sim=val_sims / (val_i + 1),
-    )
-    progress_bar.set_postfix(**logs)
 
     logs = {
         "train/loss": np.mean(losses[-(train_i+1):]),

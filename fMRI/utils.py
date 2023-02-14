@@ -29,7 +29,9 @@ def seed_everything(seed=0):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
+    ## needs to be False to use conv3D
+    print('Note: not using cudnn.deterministic b/c it breaks conv3D')
+    #torch.backends.cudnn.deterministic = True
 
 def np_to_Image(x):
     if x.ndim==4:
@@ -197,6 +199,7 @@ def get_dataloaders(
     val_url=None,
     cache_dir="/tmp/wds-cache",
     n_cache_recs=0,
+    voxels_key="nsdgeneral.npy",
 ):
     print("Getting dataloaders...")
     train_url_hf, val_url_hf = get_huggingface_urls()
@@ -243,7 +246,7 @@ def get_dataloaders(
     train_data = wds.WebDataset(train_url, resampled=True, cache_dir=cache_dir)\
         .shuffle(500, initial=500)\
         .decode("torch")\
-        .rename(images="jpg;png", voxels="nsdgeneral.npy", trial="trial.npy")\
+        .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
         .to_tuple("voxels", image_var)\
         .batched(batch_size, partial=True)\
         .with_epoch(num_worker_batches)
@@ -271,7 +274,7 @@ def get_dataloaders(
 
     val_data = wds.WebDataset(val_url, cache_dir=cache_dir)\
         .decode("torch")\
-        .rename(images="jpg;png", voxels="nsdgeneral.npy", trial="trial.npy")\
+        .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
         .to_tuple("voxels", image_var)\
         .batched(batch_size, partial=True)\
         .with_epoch(num_worker_batches)
