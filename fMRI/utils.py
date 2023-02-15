@@ -22,16 +22,18 @@ img_augment = transforms.Compose([
                 transforms.RandomGrayscale(p=.2),
             ])
 
-def seed_everything(seed=0):
+def seed_everything(seed=0, cudnn_deterministic=True):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    ## needs to be False to use conv3D
-    print('Note: not using cudnn.deterministic b/c it breaks conv3D')
-    #torch.backends.cudnn.deterministic = True
+    if cudnn_deterministic:
+        torch.backends.cudnn.deterministic = True
+    else:
+        ## needs to be False to use conv3D
+        print('Note: not using cudnn.deterministic')
 
 def np_to_Image(x):
     if x.ndim==4:
@@ -366,10 +368,11 @@ def sample_images(
         # duplicate the embedding to serve classifier free guidance
         clip_emb = torch.cat([torch.zeros_like(clip_emb), clip_emb]).unsqueeze(1).to(device).float()        
 
+        # TODO: passing sizes doesn't seem to work, so we're using None for now
         # width, height = 256, 256
         width, height = None, None
 
-        with torch.inference_mode():
+        with torch.inference_mode(), torch.autocast("cuda"):
             img_clip = sd_pipe(
                 image_embeddings=clip_emb,
                 num_inference_steps=num_inference_steps,
@@ -392,20 +395,15 @@ def sample_images(
                 generator=g_cuda,
             )
 
-        # TODO: resize for now since passing this size to SD pipeline doesn't work yet
+        # TODO: resizing for now since passing sizes doesn't work
         size = (256, 256)
         img_clip = nn.functional.interpolate(img_clip, size, mode="area", antialias=False)
         imgs_brain = nn.functional.interpolate(imgs_brain, size, mode="area", antialias=False)
-        # if idx == 0:
-        #     imgs_all = torch.cat((img_orig.to(device), img_clip, imgs_brain), 0)
-        # else:
-        #     imgs_all = torch.cat((imgs_all, img_orig.to(device), img_clip, imgs_brain), 0)
+
         imgs_all = torch.cat((img_orig.to(device), img_clip, imgs_brain), 0)
         grid = torch_to_Image(
             make_grid(imgs_all, nrow=2+4, padding=10).detach()
         )
         grids.append(grid)
 
-    # grid = make_grid(imgs_all, nrow=2+4, padding=10).detach()
-    # grid = torch_to_Image(grid)
     return grids

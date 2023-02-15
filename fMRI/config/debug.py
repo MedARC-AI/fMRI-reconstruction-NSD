@@ -1,10 +1,5 @@
-batch_size = 64
-# clip_aug_prob = 0.05
-clip_aug_prob = 0.0
-clip_aug_mode = 'y'
 first_batch = True
-wandb_log = False
-n_samples_save = 2
+save_at_end = True
 ckpt_saving = False
-outdir = "~/data/neuro/models/prior/test"
-num_epochs = 200
+num_epochs = 500
+wandb_log = False

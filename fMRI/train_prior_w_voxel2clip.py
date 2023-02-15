@@ -61,8 +61,8 @@ initial_lr = 1e-3 #3e-5
 max_lr = 3e-4
 wandb_log = False
 wandb_project = 'laion-fmri'
-wandb_run_name = f'{model_name}-{str(time.time())}'
-wandb_notes = ""
+wandb_run_name = '' #f'{model_name}-{str(time.time())}'
+wandb_notes = ''
 first_batch = False
 ckpt_saving = True
 ckpt_interval = None
@@ -79,7 +79,8 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 print('config:')
 print(json.dumps(config, indent=2))
 
-utils.seed_everything(seed)
+# need non-deterministic CuDNN for conv3D to work
+utils.seed_everything(seed, cudnn_deterministic=False)
 
 assert clip_variant in ("RN50", "ViT-L/14", "ViT-B/32")
 assert n_aug_save <= batch_size
@@ -97,84 +98,32 @@ using_ddp, local_rank = ddp_config.ddp_test()
 if device == 'cuda':
     torch.cuda.set_device(local_rank)
 
-# write config
-# TODO: only on master process
+# write config (TODO: only on rank 0)
 outdir = os.path.expanduser(outdir)
 os.makedirs(outdir, exist_ok=True)    
 with open(os.path.join(outdir, 'config.json'), 'w') as f:
     json.dump(config, f, indent=2)
 
-# load SD image variation pipeline
-print('Loading image variation pipeline...')
-sd_pipe = BrainSD.from_pretrained(
-    "lambdalabs/sd-image-variations-diffusers", 
-    revision="v2.0",
-    safety_checker=None,
-    requires_safety_checker=False,
-).to(device)
-
-assert sd_pipe.image_encoder.training == False
-sd_pipe.unet.eval()
-sd_pipe.unet.requires_grad_(False)
-sd_pipe.vae.eval()
-sd_pipe.vae.requires_grad_(False)
-
-# load clipper - don't L2 norm the extracted CLIP embeddings since we want the prior 
-# to learn un-normed embeddings for usage with the SD image variation pipeline
+print('Creating Clipper...')
+# Don't L2 norm the extracted CLIP embeddings since we want the prior 
+# to learn un-normed embeddings for usage with the SD image variation pipeline.
 clip_extractor = Clipper(clip_variant, clamp_embs=clamp_embs, norm_embs=False)
 
-# # load COCO annotations curated in the same way as the mind_reader (Lin Sprague Singh) preprint
-# f = h5py.File('/scratch/gpfs/KNORMAN/nsdgeneral_hdf5/COCO_73k_subj_indices.hdf5', 'r')
-# subj01_order = f['subj01'][:]
-# f.close()
-# annots = np.load('/scratch/gpfs/KNORMAN/nsdgeneral_hdf5/COCO_73k_annots_curated.npy',allow_pickle=True)
-# subj01_annots = annots[subj01_order]
-
-if remote_data:
-    # pull from huggingface datasets
-    train_url, val_url = utils.get_huggingface_urls(data_commit)
-else:
-    # local paths
-    train_url = "/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/train/train_subj01_{0..49}.tar"
-    val_url = "/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/val/val_subj01_0.tar"
-
-if voxel_dims == 1:
-    voxels_key = 'nsdgeneral.npy'
-elif voxel_dims == 3:
-    voxels_key = 'wholebrain_3d.npy'
-else:
-    raise Exception(f"voxel_dims must be 1 or 3, not {voxel_dims}")
-
-train_dl, val_dl = utils.get_dataloaders(
-    batch_size, image_var, 
-    num_workers=num_workers,
-    train_url=train_url,
-    val_url=val_url,
-    cache_dir=cache_dir,
-    n_cache_recs=n_cache_recs,
-    voxels_key=voxels_key,
-)
-
-# get first batches
-for train_i, (voxel0, image0) in enumerate(train_dl):
-    break
-for val_i, (val_voxel0, val_image0) in enumerate(val_dl):
-    break
-
-print('Creating voxel2clip mapper...')
+print('Creating voxel2clip...')
 out_dim = 768
-
 if voxel_dims == 1:
     voxel2clip = BrainNetwork(out_dim)
-    # voxel2clip = BrainNetwork(out_dim, h=2048)
+    # 134M params
 elif voxel_dims == 3:
     voxel2clip = NewVoxel3dConvEncoder(
-        dims=[42, 46, 61],  # Pass anything, these values are not used
+        #dims=[42, 46, 61],  # Pass anything, these values are not used
+        dims=[83, 104, 81],
         attention_width=64,
         output_dim=out_dim,
         average_output=False,
         # act_layer=act_layer
     )
+    # 58M params
 try:
     utils.count_params(voxel2clip)
 except:
@@ -182,7 +131,7 @@ except:
 
 print('Creating diffusion prior...')
 if not pretrained:
-    # setup prior network
+    # setup prior network from DALLE2-pytorch
     prior_network = DiffusionPriorNetwork(
         dim=dim,
         depth=depth,
@@ -190,7 +139,7 @@ if not pretrained:
         heads=heads
     ).to(device)
 
-    # custom version that can fix seeds
+    # custom version of DiffusionPrior from DALLE2-pytorch
     diffusion_prior = BrainDiffusionPrior(
         net=prior_network,
         image_embed_dim=dim,
@@ -221,6 +170,64 @@ try:
     utils.count_params(diffusion_prior)
 except:
     print('Cannot count params for diffusion_prior (probably because it has Lazy layers)')
+
+if 0:
+    print('Creating SD image variation pipeline...')
+    sd_pipe = BrainSD.from_pretrained(
+        "lambdalabs/sd-image-variations-diffusers", 
+        revision="v2.0",
+        safety_checker=None,
+        requires_safety_checker=False,
+        torch_dtype=torch.float16, # fp16 is fine if we're not training this
+    ).to(device)
+
+    # freeze everything, we're just using this for inference
+    sd_pipe.unet.eval()
+    sd_pipe.unet.requires_grad_(False)
+
+    sd_pipe.vae.eval()
+    sd_pipe.vae.requires_grad_(False)
+
+    sd_pipe.image_encoder.eval()
+    sd_pipe.image_encoder.requires_grad_(False)
+    assert sd_pipe.image_encoder.training == False
+else:
+    sd_pipe = None
+
+# sd_pipe.set_progress_bar_config(disable=True)
+
+# # load COCO annotations curated in the same way as the mind_reader (Lin Sprague Singh) preprint
+# f = h5py.File('/scratch/gpfs/KNORMAN/nsdgeneral_hdf5/COCO_73k_subj_indices.hdf5', 'r')
+# subj01_order = f['subj01'][:]
+# f.close()
+# annots = np.load('/scratch/gpfs/KNORMAN/nsdgeneral_hdf5/COCO_73k_annots_curated.npy',allow_pickle=True)
+# subj01_annots = annots[subj01_order]
+
+if remote_data:
+    # pull data directly from huggingface
+    train_url, val_url = utils.get_huggingface_urls(data_commit)
+else:
+    # local paths
+    train_url = "/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/train/train_subj01_{0..49}.tar"
+    val_url = "/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/val/val_subj01_0.tar"
+
+# which to use for the voxels
+if voxel_dims == 1:
+    voxels_key = 'nsdgeneral.npy'
+elif voxel_dims == 3:
+    voxels_key = 'wholebrain_3d.npy'
+else:
+    raise Exception(f"voxel_dims must be 1 or 3, not {voxel_dims}")
+
+train_dl, val_dl = utils.get_dataloaders(
+    batch_size, image_var, 
+    num_workers=num_workers,
+    train_url=train_url,
+    val_url=val_url,
+    cache_dir=cache_dir,
+    n_cache_recs=n_cache_recs,
+    voxels_key=voxels_key,
+)
 
 optimizer = torch.optim.AdamW(diffusion_prior.parameters(), lr=initial_lr)
 if lr_scheduler == 'fixed':
@@ -293,6 +300,12 @@ if wandb_log:
         notes=wandb_notes,
     )
 
+# get first batches
+for train_i, (voxel0, image0) in enumerate(train_dl):
+    break
+for val_i, (val_voxel0, val_image0) in enumerate(val_dl):
+    break
+
 if first_batch:
     # fake DataLoaders with just the first batches
     bs = batch_size
@@ -340,6 +353,11 @@ for epoch in progress_bar:
                 nn.functional.normalize(clip_voxels, dim=-1), 
                 nn.functional.normalize(clip_image, dim=-1),
             )
+            try:
+                check_loss(loss_nce)
+            except:
+                import ipdb; ipdb.set_trace()
+
             loss_nce_sum += loss_nce.item()
             loss_prior_sum += loss.item()
 
@@ -360,6 +378,7 @@ for epoch in progress_bar:
 
         loss.backward()
         optimizer.step()
+        
         if lr_scheduler is not None:
             lr_scheduler.step()
 
@@ -445,26 +464,27 @@ for epoch in progress_bar:
     }
 
     # sample some images
-    if (not save_at_end and n_samples_save > 0) or (save_at_end and epoch == num_epochs - 1):
-        # training
-        grids = utils.sample_images(
-            clip_extractor, diffusion_prior.voxel2clip, sd_pipe, diffusion_prior,
-            voxel0[:n_samples_save], image0[:n_samples_save], seed=42,
-        )
-        for i, grid in enumerate(grids):
-            grid.save(os.path.join(outdir, f'samples-train-{i:03d}.png'))
-        if wandb_log:
-            logs['train/samples'] = [wandb.Image(grid) for grid in grids]
+    if sd_pipe is not None:
+        if (not save_at_end and n_samples_save > 0) or (save_at_end and epoch == num_epochs - 1):
+            # training
+            grids = utils.sample_images(
+                clip_extractor, diffusion_prior.voxel2clip, sd_pipe, diffusion_prior,
+                voxel0[:n_samples_save], image0[:n_samples_save], seed=42,
+            )
+            for i, grid in enumerate(grids):
+                grid.save(os.path.join(outdir, f'samples-train-{i:03d}.png'))
+            if wandb_log:
+                logs['train/samples'] = [wandb.Image(grid) for grid in grids]
 
-        # validation
-        grids = utils.sample_images(
-            clip_extractor, diffusion_prior.voxel2clip, sd_pipe, diffusion_prior,
-            val_voxel0[:n_samples_save], val_image0[:n_samples_save], seed=42,
-        )
-        for i, grid in enumerate(grids):
-            grid.save(os.path.join(outdir, f'samples-val-{i:03d}.png'))
-        if wandb_log:
-            logs['val/samples'] = [wandb.Image(grid) for grid in grids]
+            # validation
+            grids = utils.sample_images(
+                clip_extractor, diffusion_prior.voxel2clip, sd_pipe, diffusion_prior,
+                val_voxel0[:n_samples_save], val_image0[:n_samples_save], seed=42,
+            )
+            for i, grid in enumerate(grids):
+                grid.save(os.path.join(outdir, f'samples-val-{i:03d}.png'))
+            if wandb_log:
+                logs['val/samples'] = [wandb.Image(grid) for grid in grids]
 
     # save augmented image pairs
     if n_aug_save > 0 and image_aug is not None:
