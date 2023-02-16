@@ -4,18 +4,15 @@ Train one single network that includes the voxel2clip mapper and the diffusion p
 import os
 import sys
 import json
-import random
-import time
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torchvision.utils import make_grid
 from info_nce import InfoNCE
 from tqdm import tqdm
 from collections import OrderedDict
-from dalle2_pytorch import DiffusionPriorNetwork #, DiffusionPrior
+from dalle2_pytorch import DiffusionPriorNetwork
 
 import ddp_config
 import utils
@@ -30,22 +27,24 @@ clip_variant = "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
 clamp_embs = False # clamp embeddings to (-1.5, 1.5)
 timesteps = 1000 # for diffusion prior
 alpha_schedule = "constant" # ("constant", "linear") - for weighting the loss
-# -- these are ignored when using the pretrained prior `--pretrained=True`
+# -- for voxel2clip model
+voxel2clip_kwargs = dict(
+    out_dim=768,
+)
+# -- for diffusion prior - these are ignored when pretrained=True
+pretrained = True # use pretrained prior
 dim = 768
 depth = 6
 dim_head = 64
 heads = 12 # heads * dim_head = 12 * 64 = 768
 cond_drop_prob = 0.2
 image_embed_scale = None
-# image_embed_scale = 1.0
 condition_on_text_encodings = False
 voxel_dims = 1 # (1, 3)
+n_samples_save = 8 # how many SD samples from train and val to save
 # -- params for data
-n_samples_save = 8 # how many samples from train and val to save
-n_aug_save = 0 # how many pairs of (orig, augmented) images to save
 remote_data = False # pull data from huggingface if True
 data_commit = '9947586218b6b7c8cab804009ddca5045249a38d' # only applies when remote_data=True
-pretrained = True
 cache_dir = "/tmp/wds-cache"
 n_cache_recs = 0
 # -----------------------------------------------------------------------------
@@ -61,7 +60,7 @@ initial_lr = 1e-3 #3e-5
 max_lr = 3e-4
 wandb_log = False
 wandb_project = 'laion-fmri'
-wandb_run_name = '' #f'{model_name}-{str(time.time())}'
+wandb_run_name = ''
 wandb_notes = ''
 first_batch = False
 ckpt_saving = True
@@ -71,7 +70,8 @@ outdir = os.path.expanduser(f'~/data/neuro/models/{model_name}/test')
 
 # -----------------------------------------------------------------------------
 # read in any command line args or config file values and override the above params
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+config_keys = [k for k,v in globals().items() if not k.startswith('_') \
+               and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
@@ -81,9 +81,6 @@ print(json.dumps(config, indent=2))
 
 # need non-deterministic CuDNN for conv3D to work
 utils.seed_everything(seed, cudnn_deterministic=False)
-
-assert clip_variant in ("RN50", "ViT-L/14", "ViT-B/32")
-assert n_aug_save <= batch_size
 
 if modality == "text":
     image_var = "trial"
@@ -110,20 +107,18 @@ print('Creating Clipper...')
 clip_extractor = Clipper(clip_variant, clamp_embs=clamp_embs, norm_embs=False)
 
 print('Creating voxel2clip...')
-out_dim = 768
+
 if voxel_dims == 1:
-    voxel2clip = BrainNetwork(out_dim)
+    voxel2clip = BrainNetwork(**voxel2clip_kwargs)
     # 134M params
 elif voxel_dims == 3:
-    voxel2clip = NewVoxel3dConvEncoder(
-        #dims=[42, 46, 61],  # Pass anything, these values are not used
-        dims=[83, 104, 81],
-        attention_width=64,
-        output_dim=out_dim,
-        average_output=False,
-        # act_layer=act_layer
-    )
-    # 58M params
+    voxel2clip = NewVoxel3dConvEncoder(**voxel2clip_kwargs)
+    # 58M params for original version
+    # 5M params for smaller version
+    # Projection input features: 5120
+    # param counts:
+    # 5,584,448 total
+    # 5,584,448 trainable
 try:
     utils.count_params(voxel2clip)
 except:
@@ -131,7 +126,7 @@ except:
 
 print('Creating diffusion prior...')
 if not pretrained:
-    # setup prior network from DALLE2-pytorch
+    # same as DALLE2-pytorch
     prior_network = DiffusionPriorNetwork(
         dim=dim,
         depth=depth,
@@ -171,7 +166,7 @@ try:
 except:
     print('Cannot count params for diffusion_prior (probably because it has Lazy layers)')
 
-if 0:
+if 1:
     print('Creating SD image variation pipeline...')
     sd_pipe = BrainSD.from_pretrained(
         "lambdalabs/sd-image-variations-diffusers", 
@@ -273,22 +268,13 @@ losses, val_losses, lrs = [], [], []
 best_val_loss = 1e9
 nce = InfoNCE()
 
-# weight for prior's loss
+# weight for prior's MSE loss term
 if alpha_schedule == 'constant':
     alphas = np.ones(num_epochs) * 0.01
 elif alpha_schedule == 'linear':
     alphas = np.linspace(0.01, 0.05, num_epochs, endpoint=True)
 else:
     raise ValueError(f'unknown alpha_schedule: {alpha_schedule}')
-
-# resume from checkpoint:
-# prior_checkpoint = torch.load(ckpt_path, map_location=device)
-# diffusion_prior.load_state_dict(prior_checkpoint['model_state_dict'])
-# optimizer.load_state_dict(prior_checkpoint['optimizer_state_dict'])
-# lr = prior_checkpoint['lr']
-# epoch = prior_checkpoint['epoch']+1
-# losses = prior_checkpoint['train_losses']
-# optimizer.param_groups[0]['lr'] = lr
 
 if wandb_log:
     import wandb
@@ -300,7 +286,7 @@ if wandb_log:
         notes=wandb_notes,
     )
 
-# get first batches
+# get first batches (used for generating samples with SD)
 for train_i, (voxel0, image0) in enumerate(train_dl):
     break
 for val_i, (val_voxel0, val_image0) in enumerate(val_dl):
@@ -335,8 +321,6 @@ for epoch in progress_bar:
     val_loss_nce_sum = 0.
     val_loss_prior_sum = 0.
 
-    image_aug = None
-
     alpha = alphas[epoch]
 
     for train_i, (voxel, image) in enumerate(train_dl):
@@ -348,33 +332,35 @@ for epoch in progress_bar:
         with torch.cuda.amp.autocast():
             clip_image = clip_extractor.embed_image(image).float()
             loss, pred, clip_voxels = diffusion_prior(image_embed=clip_image, voxel=voxel)
+            check_loss(loss)
 
             loss_nce = nce(
                 nn.functional.normalize(clip_voxels, dim=-1), 
                 nn.functional.normalize(clip_image, dim=-1),
             )
-            try:
-                check_loss(loss_nce)
-            except:
-                import ipdb; ipdb.set_trace()
+            check_loss(loss_nce)
 
             loss_nce_sum += loss_nce.item()
             loss_prior_sum += loss.item()
 
-            # so with alpha=0.01 at epoch 0, we have .01*300 (3) for the prior + .99*3 (~3)
+            # MSE and NCE are weighted equally at the beginning,
+            # with alpha=0.01 we'll have something like .01*300 + .99*3 = 3 + 3
             loss = alpha * loss + (1-alpha) * loss_nce
-            try:
-                check_loss(loss)
-            except:
-                import ipdb; ipdb.set_trace()
 
             losses.append(loss.item())
             lrs.append(optimizer.param_groups[0]['lr'])
+            # similarity after prior diffusion
             sims += F.cosine_similarity(clip_image, pred).mean().item()
+            # baseline similarity before prior diffusion
             sims_base += F.cosine_similarity(clip_image, clip_voxels).mean().item()
+            # forward and backward top 1 accuracy
             labels = torch.arange(len(clip_voxels)).to(device)
-            fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_image, clip_voxels), labels, k=1)
-            bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels, clip_image), labels, k=1)
+            fwd_percent_correct += utils.topk(
+                utils.batchwise_cosine_similarity(clip_image, clip_voxels), labels, k=1
+            )
+            bwd_percent_correct += utils.topk(
+                utils.batchwise_cosine_similarity(clip_voxels, clip_image), labels, k=1
+            )
 
         loss.backward()
         optimizer.step()
@@ -390,6 +376,9 @@ for epoch in progress_bar:
             val_sim=np.nan,
         )
         progress_bar.set_postfix(**logs)
+
+        # if train_i > 4:
+        #     break
         
     diffusion_prior.eval()
     for val_i, (voxel, image) in enumerate(val_dl):    
@@ -409,17 +398,17 @@ for epoch in progress_bar:
                 val_loss_prior_sum += loss.item()
 
                 val_loss = alpha * loss + (1-alpha) * loss_nce
-                try:
-                    check_loss(val_loss)
-                except:
-                    import ipdb; ipdb.set_trace()
 
                 val_losses.append(val_loss.item())
                 val_sims += F.cosine_similarity(clip_image, pred).mean().item()
                 val_sims_base += F.cosine_similarity(clip_image, clip_voxels).mean().item()
                 labels = torch.arange(len(clip_voxels)).to(device)
-                val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_image, clip_voxels), labels, k=1)
-                val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels, clip_image), labels, k=1)
+                val_fwd_percent_correct += utils.topk(
+                    utils.batchwise_cosine_similarity(clip_image, clip_voxels), labels, k=1
+                )
+                val_bwd_percent_correct += utils.topk(
+                    utils.batchwise_cosine_similarity(clip_voxels, clip_image), labels, k=1
+                )
     
         logs = OrderedDict(
             train_loss=np.mean(losses[-(train_i+1):]),
@@ -429,6 +418,9 @@ for epoch in progress_bar:
             val_sim=val_sims / (val_i + 1),
         )
         progress_bar.set_postfix(**logs)
+        
+        # if val_i > 4:
+        #     break
             
     if (not save_at_end and ckpt_saving) or (save_at_end and epoch == num_epochs - 1):
         # save best model
@@ -485,20 +477,6 @@ for epoch in progress_bar:
                 grid.save(os.path.join(outdir, f'samples-val-{i:03d}.png'))
             if wandb_log:
                 logs['val/samples'] = [wandb.Image(grid) for grid in grids]
-
-    # save augmented image pairs
-    if n_aug_save > 0 and image_aug is not None:
-        assert image[0].shape == image_aug[0].shape, 'batch dim does not match'
-        # two rows: original, augmented
-        grid = utils.torch_to_Image(
-            make_grid(torch.cat((
-                nn.functional.interpolate(image[:n_aug_save], (256,256), mode="area", antialias=False),
-                nn.functional.interpolate(image_aug[:n_aug_save], (256,256), mode="area", antialias=False)
-            )), nrow=image[:n_aug_save].shape[0], padding=10)
-        )
-        grid.save(os.path.join(outdir, f'augmented-pairs.png'))
-        if wandb_log:
-            logs['train/samples-aug'] = wandb.Image(grid)
         
     if wandb_log:
         wandb.log(logs)

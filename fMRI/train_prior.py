@@ -61,12 +61,12 @@ if __name__ == '__main__':
     max_lr = 3e-4
     wandb_log = True
     wandb_project = 'laion-fmri'
-    wandb_run_name = f'{model_name}-{str(time.time())}'
-    wandb_notes = ""
+    wandb_run_name = ''
+    wandb_notes = ''
     first_batch = False
     ckpt_saving = True
     ckpt_interval = None
-    outdir = os.path.expanduser(f'~/data/neuro/models/{model_name}/{wandb_run_name}')
+    outdir = os.path.expanduser(f'~/data/neuro/models/{model_name}/test')
 
     # -----------------------------------------------------------------------------
     config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -79,7 +79,6 @@ if __name__ == '__main__':
 
     utils.seed_everything(seed)
 
-    assert clip_variant in ("RN50", "ViT-L/14", "ViT-B/32")
     assert clip_aug_mode in ('x', 'y', 'n')
     assert n_aug_save <= batch_size
     

@@ -69,35 +69,55 @@ class Transformer(nn.Module):
         return x
     
 class NewVoxel3dConvEncoder(nn.Module):
-    def __init__(self, dims: List[int], attention_width: int, output_dim: int, 
-        c_in: int = 1, average_output: bool = False, act_layer: Callable = nn.GELU
+    def __init__(self, dims: List[int], attention_width: int, out_dim: int, 
+        c_in: int = 1, average_output: bool = False, act_layer: Callable = nn.GELU,
+        channels: Optional[List[int]] = None, strides: Optional[List[int]] = None,
+        padding: Optional[List[int]] = None, dilation: Optional[List[int]] = None,
+        kernel: Optional[List[int]] = None
     ):
         super().__init__()
         
         # Average the output of the transformer instead of using a flattened linear layer
-        self.average_output = average_output  
+        self.average_output = average_output
         
-        self.channels = [64, 128, 256, 256, 256, attention_width]
-        self.strides = [1, 1, 1, 2, 2, 2]
-        self.padding = [1, 1, 1, 0, 1, 0]
-        self.dialation = [1, 1, 1, 1, 1, 1]
-        self.kernel = [3, 3, 3, 3, 3, 3]
+        if channels is None:
+            channels = [64, 128, 256, 256, 256, attention_width]
+        if strides is None:
+            strides = [1, 1, 1, 2, 2, 2]
+        if padding is None:
+            padding = [1, 1, 1, 0, 1, 0]
+        if dilation is None:
+            dilation = [1, 1, 1, 1, 1, 1]
+        if kernel is None:
+            kernel = [3, 3, 3, 3, 3, 3]
+
+        self.channels = channels
+        self.strides = strides
+        self.padding = padding
+        self.dilation = dilation
+        self.kernel = kernel
 
         # self.channels = [64, 128, 256, 256, 256, attention_width]
         # self.strides = [1, 1, 1, 2, 2, 2]
         # self.padding = [1, 1, 1, 0, 1, 0]
-        # self.dialation = [1, 1, 1, 1, 1, 1]
+        # self.dilation = [1, 1, 1, 1, 1, 1]
         # self.kernel = [3, 3, 3, 3, 3, 3]
 
-        assert len(self.channels) == len(self.strides) == len(self.padding) == len(self.dialation) == len(self.kernel), \
-            f"Lengths of channels, strides, padding, dialation, and kernel must be the same. " \
-            f"Got {len(self.channels)}, {len(self.strides)}, {len(self.padding)}, {len(self.dialation)}, {len(self.kernel)}"
+        # self.channels = [64, 128, 256, attention_width]
+        # self.strides = [1, 2, 3, 3]
+        # self.padding = [0, 0, 0, 0]
+        # self.dilation = [1, 1, 1, 1]
+        # self.kernel = [3, 3, 3, 3]
+
+        assert len(self.channels) == len(self.strides) == len(self.padding) == len(self.dilation) == len(self.kernel), \
+            f"Lengths of channels, strides, padding, dilation, and kernel must be the same. " \
+            f"Got {len(self.channels)}, {len(self.strides)}, {len(self.padding)}, {len(self.dilation)}, {len(self.kernel)}"
 
         channels = [c_in] + self.channels
 
         self.conv_blocks = nn.ModuleList([
-            self._get_conv_layer(channels[i], channels[i + 1], kernel_size=self.kernel[i], 
-                stride=self.strides[i], padding=self.padding[i], dilation=self.dialation[i], act_layer=act_layer
+            self._get_conv_layer(channels[i], channels[i + 1], self.kernel[i], self.strides[i], 
+                                 self.padding[i], self.dilation[i], act_layer
             )
             for i in range(len(self.channels))
         ])
@@ -105,10 +125,10 @@ class NewVoxel3dConvEncoder(nn.Module):
         print(f"Input shape: {dims}")
         for n in range(len(self.channels)):
             stride = self.strides[n]
-            dialation = self.dialation[n]
+            dilation = self.dilation[n]
             padding = self.padding[n]
             kernel = self.kernel[n]
-            dims = [int((d + 2*padding - dialation*(kernel - 1) - 1)/(stride) + 1) for d in dims]
+            dims = [int((d + 2*padding - dilation*(kernel - 1) - 1)/(stride) + 1) for d in dims]
             print(f"Conv {n} output shape: {dims}")
         
         print(f"Transformer sequence length: {np.prod(dims)}. Transformer width: {attention_width}")
@@ -120,18 +140,18 @@ class NewVoxel3dConvEncoder(nn.Module):
         print(f"Projection input features: {attention_width * dims[0] * dims[1] * dims[2]}")
         
         if self.average_output:
-            self.proj = nn.Parameter(attention_width**-0.5 * torch.randn(attention_width, output_dim))
+            self.proj = nn.Parameter(attention_width**-0.5 * torch.randn(attention_width, out_dim))
         else:
             # 69120
-            self.proj = nn.Linear(attention_width * dims[0] * dims[1] * dims[2], output_dim)
-            # self.proj = nn.LazyLinear(output_dim)
+            self.proj = nn.Linear(attention_width * dims[0] * dims[1] * dims[2], out_dim)
+            # self.proj = nn.LazyLinear(out_dim)
 
     def _get_conv_layer(self, c_in, c_out, kernel_size, stride, padding, dilation, act_layer):
         return nn.Sequential(
-            nn.Conv3d(c_in, c_out, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation),
-            # nn.Dropout3d(0.1),
+            nn.Conv3d(c_in, c_out, kernel_size, stride=stride, padding=padding, dilation=dilation),
             nn.BatchNorm3d(c_out),
             act_layer(),
+            nn.Dropout3d(p=0.2),
             # nn.MaxPool3d(kernel_size=2, stride=2)
         )
 
@@ -162,7 +182,7 @@ if __name__ == "__main__":
     model = NewVoxel3dConvEncoder(
                 dims=[42, 46, 61], # voxel_config['config_3d_conv']["dims"],
                 attention_width=64,
-                output_dim=768,
+                out_dim=768,
                 average_output=False,
                 # act_layer=act_layer
             )

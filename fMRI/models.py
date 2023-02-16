@@ -23,6 +23,8 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 class Clipper(torch.nn.Module):
     def __init__(self, clip_variant, clamp_embs=False, norm_embs=False, train_transforms=None):
         super().__init__()
+        assert clip_variant in ("RN50", "ViT-L/14", "ViT-B/32"), \
+            "clip_variant must be one of RN50, ViT-L/14, ViT-B/32"
         print(clip_variant, device)
         clip_model, _ = clip.load(clip_variant, device=device)
         clip_model.eval() # dont want to train model
@@ -79,7 +81,7 @@ class Clipper(torch.nn.Module):
 
 class BrainNetwork(nn.Module):
     # 133M
-    def __init__(self, out_dim, in_dim=15724, h=4096, n_blocks=4):
+    def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4):
         super().__init__()
         self.lin0 = nn.Sequential(
             nn.Linear(in_dim, h),

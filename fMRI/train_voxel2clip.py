@@ -1,8 +1,6 @@
 import os
 import sys
 import json
-import random
-import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,7 +19,6 @@ from models import Clipper, BrainNetwork, NewVoxel3dConvEncoder
 
 if __name__ == '__main__':
     model_name = "voxel2clip"
-    outdir = os.path.expanduser(f'~/data/neuro/{model_name}')
     modality = "image" # ("image", "text")
     clip_variant = "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
     norm_embs = True # l2 normalize embeddings
@@ -40,11 +37,12 @@ if __name__ == '__main__':
     max_lr = 3e-4
     wandb_log = True
     wandb_project = 'laion-fmri'
-    wandb_run_name = f'{model_name}-{str(time.time())}'
-    wandb_notes = ""
+    wandb_run_name = ''
+    wandb_notes = ''
     first_batch = False
     ckpt_saving = True
     ckpt_interval = None
+    outdir = os.path.expanduser(f'~/data/neuro/models/{model_name}/test')
 
     # -----------------------------------------------------------------------------
     config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
