@@ -32,6 +32,35 @@ def ddp_test():
         print("NOT using distributed parallel processing!")
     return using_ddp, local_rank
 
+def set_ddp():
+    import torch.distributed as dist
+    env_dict = {
+        key: os.environ[key]
+        for key in ("MASTER_ADDR", "MASTER_PORT", "RANK",
+                    "LOCAL_RANK", "WORLD_SIZE")
+    }
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    n = torch.cuda.device_count()
+    device_ids = list(
+        range(local_rank * n, (local_rank + 1) * n)
+    )
+
+    if local_rank == 0:
+        print(f"[{os.getpid()}] Initializing process group with: {env_dict}")
+    dist.init_process_group(backend="nccl")
+    print(
+        f"[{os.getpid()}] world_size = {dist.get_world_size()}, "
+        + f"rank = {dist.get_rank()}, backend={dist.get_backend()}"
+    )
+
+    print(
+        f"[{os.getpid()}] rank = {dist.get_rank()} ({rank}), "
+        + f"world_size = {dist.get_world_size()}, n = {n}, device_ids = {device_ids}"
+    )
+    device = torch.device("cuda", local_rank)
+    return True, local_rank, device
+
 # Slurm reference for DDP:
 ## !/bin/bash
 # SBATCH --job-name=clipvox      #create a short name for your job

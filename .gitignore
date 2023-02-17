@@ -2,3 +2,5 @@
 **/*.ipynb_checkpoints
 **/checkpoints
 **/.DS_Store
+**/wandb
+**/train_logs

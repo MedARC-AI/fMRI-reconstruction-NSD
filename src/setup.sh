@@ -1,7 +1,11 @@
+#!/bin/bash
+#
 # Commands to setup a new conda environment and install all the necessary packages
 # See the environment.yaml file for a conda freeze after running this.
 
 set -e
+
+conda install -y mamba -n base -c conda-forge
 
 ## create env first
 # mamba create -n medical-v1 python=3.10 -y
