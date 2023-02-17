@@ -8,12 +8,12 @@ import os
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-img_augment = transforms.Compose([
-                transforms.RandomCrop(size=(140,140)),
-                transforms.RandomHorizontalFlip(p=.5),
-                transforms.ColorJitter(.4,.4,.2,.1),
-                transforms.RandomGrayscale(p=.2),
-            ])
+# img_augment = transforms.Compose([
+#                 transforms.RandomCrop(size=(140,140)),
+#                 transforms.RandomHorizontalFlip(p=.5),
+#                 transforms.ColorJitter(.4,.4,.2,.1),
+#                 transforms.RandomGrayscale(p=.2),
+#             ])
 
 def seed_everything(seed=0):
     random.seed(seed)
@@ -98,3 +98,25 @@ def dcl(preds, targs, temp=0.1):
     neg_mask = torch.eye(preds.size(0), device=preds.device).repeat(1, 2)
     negative_loss = torch.logsumexp(neg_similarity + neg_mask, dim=1, keepdim=False)
     return (positive_loss + negative_loss).mean()
+
+def mixco(voxels, beta=0.15, s_thresh=0.5):
+    perm = torch.randperm(voxels.shape[0]).to(voxels.device)
+    voxels_shuffle = voxels[perm]
+    betas = torch.distributions.Beta(beta, beta).sample([voxels.shape[0]]).to(voxels.device)
+    select = (torch.rand(voxels.shape[0]) <= s_thresh).to(voxels.device)
+    betas_shape = [-1] + [1]*(len(voxels.shape)-1)
+    voxels[select] = voxels[select] * betas[select].reshape(*betas_shape) + \
+        voxels_shuffle[select] * (1 - betas[select]).reshape(*betas_shape)
+    betas[~select] = 1
+    return voxels, perm, betas, select
+
+def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None):
+    brain_clip = (preds @ targs.T)/temp
+    if perm is not None and betas is not None and select is not None:
+        probs = torch.diag(betas)
+        probs[torch.arange(preds.shape[0]).to(preds.device), perm] = 1 - betas
+
+        loss = -(brain_clip.log_softmax(-1) * probs).sum(-1).mean()
+        return loss
+    else:
+        return F.cross_entropy(brain_clip, torch.arange(brain_clip.shape[0]).to(brain_clip.device))
