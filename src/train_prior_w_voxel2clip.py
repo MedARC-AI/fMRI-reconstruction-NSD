@@ -3,7 +3,7 @@
 
 # This notebook takes brain voxels and maps them to CLIP-space via a contrastive learning to CLIP space + diffusion prior approach.
 
-# In[1]:
+# In[ ]:
 
 
 # # convert this notebook to .py such that you can then run it via slurm with "sbatch main.slurm"
@@ -14,7 +14,7 @@
 
 # # Import packages & functions
 
-# In[2]:
+# In[3]:
 
 
 import os
@@ -45,7 +45,7 @@ from model3d import NewVoxel3dConvEncoder
 
 # # Configurations
 
-# In[24]:
+# In[6]:
 
 
 model_name = "prior-w-voxel2clip"
@@ -75,7 +75,15 @@ if not os.path.exists(outdir):
     os.makedirs(outdir)
 use_mp = False
 remote_data = False
-display_inline = True # display image grids in addition to saving them
+
+# if running command line, read in args or config file values and override above params
+try:
+    config_keys = [k for k,v in globals().items() if not k.startswith('_') \
+                   and isinstance(v, (int, float, bool, str))]
+    exec(open('configurator.py').read()) # overrides from command line or config file
+    config = {k: globals()[k] for k in config_keys} # will be useful for logging
+except:
+    pass
 
 num_devices = torch.cuda.device_count()
 if num_devices==0: num_devices = 1
@@ -447,8 +455,6 @@ for epoch in progress_bar:
                             clip_extractor, diffusion_prior.voxel2clip, sd_pipe, diffusion_prior,
                             voxel0[:n_samples_save], image0[:n_samples_save], seed=42,
                         )
-                        if display_inline: 
-                            display(grids[0])
                         for i, grid in enumerate(grids):
                             grid.save(os.path.join(outdir, f'samples-train-{i:03d}.png'))
                         if wandb_log:
@@ -459,8 +465,6 @@ for epoch in progress_bar:
                             clip_extractor, diffusion_prior.voxel2clip, sd_pipe, diffusion_prior,
                             val_voxel0[:n_samples_save], val_image0[:n_samples_save], seed=42,
                         )
-                        if display_inline: 
-                            display(grids[0])
                         for i, grid in enumerate(grids):
                             grid.save(os.path.join(outdir, f'samples-val-{i:03d}.png'))
                         if wandb_log:
