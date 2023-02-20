@@ -380,7 +380,7 @@ class BrainSD(StableDiffusionImageVariationPipeline):
         if image_embeddings is None:
             assert image is not None, "If image_embeddings is None, image must not be None"
     
-            # resize and normalize the way that's reccomended
+            # resize and normalize the way that's recommended
             tform = transforms.Compose([
                 #transforms.ToTensor(), ## don't need this since we've already got tensors
                 transforms.Resize(

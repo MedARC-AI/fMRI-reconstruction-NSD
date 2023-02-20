@@ -69,7 +69,7 @@ class Transformer(nn.Module):
         return x
     
 class NewVoxel3dConvEncoder(nn.Module):
-    def __init__(self, dims: List[int], attention_width: int, out_dim: int, 
+    def __init__(self, dims: List[int] = [81, 104, 83], attention_width: int = 64, out_dim: int = 768, 
         c_in: int = 1, average_output: bool = False, act_layer: Callable = nn.GELU,
         channels: Optional[List[int]] = None, strides: Optional[List[int]] = None,
         padding: Optional[List[int]] = None, dilation: Optional[List[int]] = None,
@@ -143,8 +143,9 @@ class NewVoxel3dConvEncoder(nn.Module):
             self.proj = nn.Parameter(attention_width**-0.5 * torch.randn(attention_width, out_dim))
         else:
             # 69120
-            # self.proj = nn.Linear(attention_width * dims[0] * dims[1] * dims[2], out_dim)
-            self.proj = nn.LazyLinear(out_dim)
+            self.proj = nn.Linear(attention_width * dims[0] * dims[1] * dims[2], out_dim)
+            # cant use lazy with ddp :/
+            # self.proj = nn.LazyLinear(out_dim)
 
     def _get_conv_layer(self, c_in, c_out, kernel_size, stride, padding, dilation, act_layer):
         return nn.Sequential(

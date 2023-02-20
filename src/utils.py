@@ -12,6 +12,7 @@ import math
 import webdataset as wds
 import tempfile
 from torchvision.utils import make_grid
+from models import Clipper
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -231,16 +232,16 @@ def get_huggingface_urls(commit='9947586218b6b7c8cab804009ddca5045249a38d'):
     val_url = base_url + commit + "/webdataset/val/val_subj01_0.tar"
     return train_url, val_url
 
-def split_by_node_train(urls):
+def split_by_node(urls):
     node_id, node_count = torch.distributed.get_rank(), torch.distributed.get_world_size()
     return urls[node_id::node_count]
 
-def split_by_node_val(urls):
-    node_id, node_count = torch.distributed.get_rank(), torch.distributed.get_world_size()
-    if node_id == 0:
-        return urls
-    else:
-        return []
+# def split_by_node_val(urls):
+#     node_id, node_count = torch.distributed.get_rank(), torch.distributed.get_world_size()
+#     if node_id == 0:
+#         return urls
+#     else:
+#         return []
 
 def my_split_by_worker(urls):
     wi = torch.utils.data.get_worker_info()
@@ -248,10 +249,15 @@ def my_split_by_worker(urls):
         return urls
     else:
         return urls[wi.id::wi.num_workers]
+    
+def check_loss(loss):
+    if loss.isnan().any():
+        raise ValueError('NaN loss')
 
 def get_dataloaders(
     batch_size,
     image_var,
+    num_samples=24983,
     num_devices=None,
     num_workers=None,
     train_url=None,
@@ -277,7 +283,6 @@ def get_dataloaders(
         num_workers = num_devices
     print("num_workers", num_workers)
     
-    num_samples = 24983 # see metadata.json in webdataset_split folder
     global_batch_size = batch_size * num_devices
     num_batches = math.floor(num_samples / global_batch_size)
     num_worker_batches = math.floor(num_batches / num_workers)
@@ -302,7 +307,7 @@ def get_dataloaders(
     if cache_dir is not None and not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
 
-    train_data = wds.WebDataset(train_url, resampled=True, cache_dir=cache_dir, nodesplitter=split_by_node_train)\
+    train_data = wds.WebDataset(train_url, resampled=True, cache_dir=cache_dir, nodesplitter=split_by_node)\
         .shuffle(500, initial=500)\
         .decode("torch")\
         .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
@@ -332,7 +337,7 @@ def get_dataloaders(
     #                     wds.batched(batch_size, partial=True),
     #                 ]).with_epoch(num_worker_batches)
 
-    val_data = wds.WebDataset(val_url, cache_dir=cache_dir, nodesplitter=split_by_node_val)\
+    val_data = wds.WebDataset(val_url, resampled=True, cache_dir=cache_dir, nodesplitter=split_by_node)\
         .decode("torch")\
         .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
         .to_tuple("voxels", image_var)\
