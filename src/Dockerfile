@@ -24,6 +24,6 @@ RUN conda install -y mamba -n base -c conda-forge
 RUN mamba env update -f /environment.yaml
 RUN mamba clean --all -f -y
 
-ADD entrypoint.sh /
-RUN chmod +x /entrypoint.sh
-CMD ["/entrypoint.sh"]
+# ADD entrypoint.sh /
+# RUN chmod +x /entrypoint.sh
+# CMD ["/entrypoint.sh"]

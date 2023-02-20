@@ -1,9 +1,8 @@
-To create a conda environment that will run the notebooks:
+# fMRI-reconstruction-NSD
+
+To create a conda environment that will run the notebooks and training scripts:
 ```bash
-conda create -n medical-v1 python=3.10
+conda env create -f src/environment.yaml
 conda activate medical-v1
-conda env update -f environment.yaml
-# this one must be run individually since it uses git
-pip install git+https://github.com/openai/CLIP.git
 ```
-The `setup.sh` script list the conda and pip commands to create this environment.
+The [setup.sh](./src/setup.sh) script list the conda and pip commands to create this environment. There's also a [Dockerfile](./src/Dockerfile) and docker image that was created with `make build push` on DockerHub at `jimgoo6/laion-fmri`.
