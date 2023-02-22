@@ -309,14 +309,14 @@ class BrainDiffusionPrior(DiffusionPrior):
         
         config['prior']['net']['max_text_len'] = 256
         config['prior']['net'].update(net_kwargs)
-        print('net_config', config['prior']['net'])
+        # print('net_config', config['prior']['net'])
         net_config = DiffusionPriorNetworkConfig(**config['prior']['net'])
 
         kwargs = config['prior']
         kwargs.pop('clip')
         kwargs.pop('net')
         kwargs.update(prior_kwargs)
-        print('prior_config', kwargs)
+        # print('prior_config', kwargs)
 
         diffusion_prior_network = net_config.create()
         diffusion_prior = BrainDiffusionPrior(net=diffusion_prior_network, clip=None, **kwargs).to(torch.device('cpu'))
@@ -329,7 +329,7 @@ class BrainDiffusionPrior(DiffusionPrior):
         # "net.null_text_encodings", "net.null_text_embeds", "net.null_image_embed"
         # I don't think these get used if `cond_drop_prob = 0` though (which is the default here)
         keys = diffusion_prior.load_state_dict(ckpt, strict=False)
-        print("missing keys in prior checkpoint (probably ok)", keys.missing_keys)
+        # print("missing keys in prior checkpoint (probably ok)", keys.missing_keys)
         
         return diffusion_prior
 

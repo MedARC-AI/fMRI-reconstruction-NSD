@@ -4,3 +4,4 @@
 **/.DS_Store
 **/wandb
 **/train_logs
+**/slurm-*.out

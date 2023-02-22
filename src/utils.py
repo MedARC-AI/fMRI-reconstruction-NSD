@@ -13,6 +13,7 @@ import webdataset as wds
 import tempfile
 from torchvision.utils import make_grid
 from models import Clipper
+import json
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -257,11 +258,11 @@ def check_loss(loss):
 def get_dataloaders(
     batch_size,
     image_var,
-    num_samples=24983,
     num_devices=None,
     num_workers=None,
     train_url=None,
     val_url=None,
+    meta_url=None,
     cache_dir="/tmp/wds-cache",
     n_cache_recs=0,
     voxels_key="nsdgeneral.npy",
@@ -273,22 +274,35 @@ def get_dataloaders(
         train_url = train_url_hf
     if val_url is None:
         val_url = val_url_hf
-    print("train_url", train_url)
-    print("val_url", val_url)
 
     if num_devices is None:
         num_devices = torch.cuda.device_count()
-    print("num_devices", num_devices)
+    
     if num_workers is None:
         num_workers = num_devices
-    print("num_workers", num_workers)
+    
+    if meta_url is None:
+        # for commits up to 9947586218b6b7c8cab804009ddca5045249a38d
+        num_train = 24983
+        num_val = 492
+    else:
+        metadata = json.load(open(meta_url))
+        num_train = metadata['totals']['train']
+        num_val = metadata['totals']['val']
     
     global_batch_size = batch_size * num_devices
-    num_batches = math.floor(num_samples / global_batch_size)
+    num_batches = math.floor(num_train / global_batch_size)
     num_worker_batches = math.floor(num_batches / num_workers)
+
+    print("train_url", train_url)
+    print("val_url", val_url)
+    print("num_devices", num_devices)
+    print("num_workers", num_workers)
     print("batch_size", batch_size)
     print("global_batch_size", global_batch_size)
     print("num_worker_batches", num_worker_batches)
+    print('num_train', num_train)
+    print('num_val', num_val)
     
     # train_data = wds.DataPipeline([wds.ResampledShards(train_url),
     #                     wds.tarfile_to_samples(),
@@ -307,11 +321,12 @@ def get_dataloaders(
     if cache_dir is not None and not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
 
-    train_data = wds.WebDataset(train_url, resampled=True, cache_dir=cache_dir, nodesplitter=split_by_node)\
+    # can pass to .shuffle `rng=random.Random(42)` to maybe get deterministic shuffling
+    train_data = wds.WebDataset(train_url, resampled=True, cache_dir=cache_dir, nodesplitter=wds.split_by_node)\
         .shuffle(500, initial=500)\
         .decode("torch")\
         .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
-        .to_tuple("voxels", image_var)\
+        .to_tuple("voxels", image_var, "__key__")\
         .batched(batch_size, partial=True)\
         .with_epoch(num_worker_batches)
 
@@ -323,10 +338,13 @@ def get_dataloaders(
     # train_dl.ddp_equalize(24983 // batch_size)
     
     # Validation
-    num_samples = 492
-    num_batches = math.ceil(num_samples / global_batch_size)
+    # use only one GPU
+    global_batch_size = batch_size
+    num_workers = 1
+
+    num_batches = math.ceil(num_val / global_batch_size)
     num_worker_batches = math.ceil(num_batches / num_workers)
-    print("validation: num_worker_batches",num_worker_batches)
+    print("validation: num_worker_batches", num_worker_batches)
 
     # val_data = wds.DataPipeline([wds.SimpleShardList(val_url),
     #                     wds.tarfile_to_samples(),
@@ -337,10 +355,10 @@ def get_dataloaders(
     #                     wds.batched(batch_size, partial=True),
     #                 ]).with_epoch(num_worker_batches)
 
-    val_data = wds.WebDataset(val_url, resampled=True, cache_dir=cache_dir, nodesplitter=split_by_node)\
+    val_data = wds.WebDataset(val_url, resampled=True, cache_dir=cache_dir, nodesplitter=wds.split_by_node)\
         .decode("torch")\
         .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
-        .to_tuple("voxels", image_var)\
+        .to_tuple("voxels", image_var, "__key__")\
         .batched(batch_size, partial=True)\
         .with_epoch(num_worker_batches)
     
@@ -350,7 +368,7 @@ def get_dataloaders(
     if n_cache_recs > 0:
         val_data = val_data.compose(wds.DBCache, os.path.join(cache_dir, "cache-val.db"),  n_cache_recs)
 
-    return train_dl, val_dl
+    return train_dl, val_dl, num_train, num_val
 
 @torch.no_grad()
 def sample_images(
@@ -363,7 +381,7 @@ def sample_images(
     seed=None,
     verbose=False,
 ):
-    
+
     plt.close('all')
     
     assert voxel.shape[0] == img_input.shape[0], 'batch dim must be the same for voxels and images'
