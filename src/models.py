@@ -208,7 +208,7 @@ class BrainDiffusionPrior(DiffusionPrior):
         if self.init_image_embed_l2norm:
             image_embed = l2norm(image_embed) * self.image_embed_scale
 
-        for i in tqdm(reversed(range(0, self.noise_scheduler.num_timesteps)), desc='sampling loop time step', total=self.noise_scheduler.num_timesteps):
+        for i in tqdm(reversed(range(0, self.noise_scheduler.num_timesteps)), desc='sampling loop time step', total=self.noise_scheduler.num_timesteps, disable=True):
             times = torch.full((batch,), i, device = device, dtype = torch.long)
 
             self_cond = x_start if self.net.self_cond else None

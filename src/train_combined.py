@@ -199,7 +199,8 @@ if n_samples_save > 0:
     sd_pipe.image_encoder.requires_grad_(False)
     assert sd_pipe.image_encoder.training == False
 
-# sd_pipe.set_progress_bar_config(disable=True)
+    # disable progress bar
+    sd_pipe.set_progress_bar_config(disable=True)
 
 # # load COCO annotations curated in the same way as the mind_reader (Lin Sprague Singh) preprint
 # f = h5py.File('/scratch/gpfs/KNORMAN/nsdgeneral_hdf5/COCO_73k_subj_indices.hdf5', 'r')
@@ -346,7 +347,7 @@ for epoch in progress_bar:
         voxel = voxel.to(device).float()
         keys.update(key)
 
-        with torch.cuda.amp.autocast():
+        with torch.cuda.amp.autocast(dtype=torch.float32):
             clip_image = clip_extractor.embed_image(image).float()
             loss, pred, clip_voxels = diffusion_prior(image_embed=clip_image, voxel=voxel)
             utils.check_loss(loss)
@@ -399,14 +400,17 @@ for epoch in progress_bar:
                 voxel = voxel.to(device).float()
                 keys.update(key)
     
-                with torch.cuda.amp.autocast():
+                with torch.cuda.amp.autocast(dtype=torch.float32):
                     clip_image = clip_extractor.embed_image(image).float()
                     loss, pred, clip_voxels = diffusion_prior.module(image_embed=clip_image, voxel=voxel)
+                    utils.check_loss(loss)
 
                     loss_nce = nce(
                         nn.functional.normalize(clip_voxels, dim=-1), 
                         nn.functional.normalize(clip_image, dim=-1),
                     )
+                    utils.check_loss(loss_nce)
+
                     val_loss_nce_sum += loss_nce.item()
                     val_loss_prior_sum += loss.item()
 
@@ -476,7 +480,8 @@ for epoch in progress_bar:
         # sample some images
         if n_samples_save > 0:
             if (not save_at_end) or (save_at_end and epoch == num_epochs - 1):
-                # # training
+                # training
+                print("Sampling training images...")
                 grids = utils.sample_images(
                     clip_extractor, 
                     diffusion_prior.voxel2clip if not distributed else diffusion_prior.module.voxel2clip, 
@@ -492,6 +497,7 @@ for epoch in progress_bar:
                     logs['train/samples'] = [wandb.Image(grid, caption=key0[i]) for i, grid in enumerate(grids)]
 
                 # validation
+                print("Sampling validation images...")
                 grids = utils.sample_images(
                     clip_extractor, 
                     diffusion_prior.voxel2clip if not distributed else diffusion_prior.module.voxel2clip, 

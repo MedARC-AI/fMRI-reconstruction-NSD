@@ -25,7 +25,8 @@ conda activate medical-v1
 # srun python train_prior_w_voxel2clip.py \
 # &> /fsx/jimgoo/models/log.txt
 
-# srun python train_prior_w_voxel2clip_orig.py \
+## run the 3D model
+# srun python train_combined.py \
 # config/3D_combo.py \
 # --wandb_log=True \
 # --outdir=../train_logs/models/prior-w-voxel2clip/3D_combo \
@@ -37,10 +38,19 @@ conda activate medical-v1
 # --num_epochs=2 \
 # &> /fsx/jimgoo/models/log.txt
 
-srun python train_prior_w_voxel2clip_orig.py \
+## reproduce the good 1D model
+# srun python train_combined.py \
+# config/1D_combo.py \
+# --wandb_log=True \
+# --outdir=../train_logs/models/prior-w-voxel2clip/1D_combo \
+# --n_samples_save=4 \
+# --lr_scheduler='fixed' \
+# &> /fsx/jimgoo/models/log.txt
+
+## reproduce the CycleLR error
+srun python train_combined.py \
 config/1D_combo.py \
 --wandb_log=True \
---outdir=../train_logs/models/prior-w-voxel2clip/1D_combo \
+--outdir=../train_logs/models/prior-w-voxel2clip/1D_combo-cycleLR \
 --n_samples_save=4 \
---lr_scheduler='fixed' \
-&> /fsx/jimgoo/models/log.txt
+&> /fsx/jimgoo/models/log2.txt
