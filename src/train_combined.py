@@ -212,6 +212,7 @@ if n_samples_save > 0:
 if remote_data:
     # pull data directly from huggingface
     train_url, val_url = utils.get_huggingface_urls(data_commit)
+    meta_url = None
 else:
     # local paths
     # train_url = "/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/train/train_subj01_{0..49}.tar"

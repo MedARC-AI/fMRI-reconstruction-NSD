@@ -2,9 +2,9 @@
 #SBATCH --account=medarc
 #SBATCH --partition=g40423
 #SBATCH --nodes=1             # node count
-#SBATCH --ntasks-per-node=4   # with DDP, must equal num of gpus
+#SBATCH --ntasks-per-node=1   # with DDP, must equal num of gpus
 #SBATCH --cpus-per-task=4     # rule-of-thumb is 4 times number of gpus
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:1
 #SBATCH --mem-per-gpu=40G
 #SBATCH --time=10:00:00       # total run time limit (HH:MM:SS)
 #SBATCH --comment=medarc
@@ -53,4 +53,6 @@ config/1D_combo.py \
 --wandb_log=True \
 --outdir=../train_logs/models/prior-w-voxel2clip/1D_combo-cycleLR \
 --n_samples_save=4 \
+--remote_data=True \
+--cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
 &> /fsx/jimgoo/models/log2.txt
