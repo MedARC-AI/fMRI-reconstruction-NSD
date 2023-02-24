@@ -75,6 +75,7 @@ if not os.path.exists(outdir):
     os.makedirs(outdir)
 use_mp = False
 remote_data = False
+data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
 
 # if running command line, read in args or config file values and override above params
 try:
