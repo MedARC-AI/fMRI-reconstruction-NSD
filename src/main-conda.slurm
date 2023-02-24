@@ -2,9 +2,9 @@
 #SBATCH --account=medarc
 #SBATCH --partition=g40423
 #SBATCH --nodes=1             # node count
-#SBATCH --ntasks-per-node=1   # with DDP, must equal num of gpus
+#SBATCH --ntasks-per-node=8   # with DDP, must equal num of gpus
 #SBATCH --cpus-per-task=4     # rule-of-thumb is 4 times number of gpus
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:8
 #SBATCH --mem-per-gpu=40G
 #SBATCH --time=10:00:00       # total run time limit (HH:MM:SS)
 #SBATCH --comment=medarc
@@ -31,28 +31,23 @@ conda activate medical-v1
 # --wandb_log=True \
 # --outdir=../train_logs/models/prior-w-voxel2clip/3D_combo \
 # --batch_size=32 \
+# --n_samples_save=16 \
+# --remote_data=True \
+# --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
+# --ckpt_saving=False \
 # --first_batch=True \
 # --save_at_end=True \
-# --ckpt_saving=False \
-# --n_samples_save=8 \
-# --num_epochs=2 \
-# &> /fsx/jimgoo/models/log.txt
+# &> /fsx/jimgoo/logs/log.txt
 
 ## reproduce the good 1D model
-# srun python train_combined.py \
-# config/1D_combo.py \
-# --wandb_log=True \
-# --outdir=../train_logs/models/prior-w-voxel2clip/1D_combo \
-# --n_samples_save=4 \
-# --lr_scheduler='fixed' \
-# &> /fsx/jimgoo/models/log.txt
-
-## reproduce the CycleLR error
 srun python train_combined.py \
 config/1D_combo.py \
 --wandb_log=True \
---outdir=../train_logs/models/prior-w-voxel2clip/1D_combo-cycleLR \
---n_samples_save=4 \
+--outdir=../train_logs/models/prior-w-voxel2clip/1D_combo-cycleLR-FID \
+--n_samples_save=8 \
 --remote_data=True \
 --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
-&> /fsx/jimgoo/models/log2.txt
+--ckpt_saving=True \
+--first_batch=False \
+--sample_interval=10 \
+&> /fsx/jimgoo/logs/log.txt
