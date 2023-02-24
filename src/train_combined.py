@@ -51,10 +51,12 @@ image_embed_scale = None
 condition_on_text_encodings = False
 voxel_dims = 1 # (1, 3)
 n_samples_save = 8 # how many SD samples from train and val to save
+sample_interval = 1 # after how many epochs to save samples
 # -- params for data
 remote_data = False # pull data from huggingface if True
 data_commit = '9947586218b6b7c8cab804009ddca5045249a38d' # only applies when remote_data=True
 cache_dir = "/tmp/wds-cache"
+# cache_dir = '/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d'
 n_cache_recs = 0
 # -----------------------------------------------------------------------------
 # params for all models
@@ -181,7 +183,8 @@ except:
 if n_samples_save > 0:
     print('Creating SD image variation pipeline...')
     sd_pipe = BrainSD.from_pretrained(
-        "lambdalabs/sd-image-variations-diffusers", 
+        #"lambdalabs/sd-image-variations-diffusers", 
+        "/admin/home-jimgoo/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc/",
         revision="v2.0",
         safety_checker=None,
         requires_safety_checker=False,
@@ -249,17 +252,18 @@ elif lr_scheduler == 'cycle':
     lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, 
         max_lr=max_lr,
-        total_steps=num_epochs*((num_train//batch_size)//num_devices), 
+        total_steps=num_epochs*((num_train//batch_size)//num_devices),
         final_div_factor=1000,
         last_epoch=-1, pct_start=2/num_epochs
     )
 
 def save_ckpt(tag):
-    ckpt_path = os.path.join(outdir, f'ckpt-{tag}.pth')
-    print(f'saving {ckpt_path}')
     if is_master:
+        ckpt_path = os.path.join(outdir, f'ckpt-{tag}.pth')
+        print(f'saving {ckpt_path}', flush=True)
         state_dict = diffusion_prior.state_dict()
-        if distributed: # if using DDP, convert DDP state_dict to non-DDP before saving
+        if distributed:
+            # if using DDP, convert DDP state_dict to non-DDP before saving
             for key in list(state_dict.keys()):
                 if 'module.' in key:
                     state_dict[key.replace('module.', '')] = state_dict[key]
@@ -317,7 +321,7 @@ if first_batch:
     val_dl = [(val_voxel0[:bs], val_image0[:bs], val_key0[:bs])]
 
 # feed text and images into diffusion prior network
-progress_bar = tqdm(range(epoch, num_epochs), desc='train loop')
+progress_bar = tqdm(range(epoch, num_epochs), desc='train loop', disable=(distributed and local_rank != 0))
 
 for epoch in progress_bar:
 
@@ -403,7 +407,8 @@ for epoch in progress_bar:
     
                 with torch.cuda.amp.autocast(dtype=torch.float32):
                     clip_image = clip_extractor.embed_image(image).float()
-                    loss, pred, clip_voxels = diffusion_prior.module(image_embed=clip_image, voxel=voxel)
+                    loss, pred, clip_voxels = diffusion_prior(image_embed=clip_image, voxel=voxel) \
+                        if not distributed else diffusion_prior.module(image_embed=clip_image, voxel=voxel)
                     utils.check_loss(loss)
 
                     loss_nce = nce(
@@ -440,23 +445,27 @@ for epoch in progress_bar:
         )
         progress_bar.set_postfix(**logs)
 
-        print('val_keys', keys, flush=True)
         print('len(val_keys)', len(keys), flush=True)
-        # make sure we got all of the validation samples
-        # assert len(keys) == num_val, (len(keys), num_val)
-                
-        if (not save_at_end and ckpt_saving) or (save_at_end and epoch == num_epochs - 1):
+        if not first_batch:
+            # make sure we got all of the validation samples when we're not using just the first batch
+            assert len(keys) == num_val, (len(keys), num_val)
+        # if epoch == 0:
+        #     print('val_keys', keys, flush=True)
+        
+        if ckpt_saving:
             # save best model
             val_loss = np.mean(val_losses[-(val_i+1):])
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 save_ckpt('best')
             else:
-                print(f'not best - val_loss: {val_loss:.3f}, best_val_loss: {best_val_loss:.3f}')
+                print(f'not best - val_loss: {val_loss:.3f}, best_val_loss: {best_val_loss:.3f}', flush=True)
 
-            # Save model checkpoint every `ckpt_interval`` epochs or on the last epoch
+            # Save model checkpoint every `ckpt_interval` epochs or on the last epoch
             if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
                 save_ckpt(f'epoch{epoch:03d}')
+        else:
+            print('Not saving checkpoints', flush=True)
 
         logs = {
             "train/loss": np.mean(losses[-(train_i+1):]),
@@ -478,12 +487,15 @@ for epoch in progress_bar:
             "train/alpha": alpha,
         }
 
+        print('logs before sampling', logs, flush=True)
+
         # sample some images
-        if n_samples_save > 0:
+        if n_samples_save > 0 and (epoch + 1) % sample_interval == 0:
+            print('n_samples_save', n_samples_save, flush=True)
             if (not save_at_end) or (save_at_end and epoch == num_epochs - 1):
                 # training
-                print("Sampling training images...")
-                grids = utils.sample_images(
+                print("Sampling training images...", flush=True)
+                grids, train_fid = utils.sample_images(
                     clip_extractor, 
                     diffusion_prior.voxel2clip if not distributed else diffusion_prior.module.voxel2clip, 
                     sd_pipe, 
@@ -496,25 +508,31 @@ for epoch in progress_bar:
                     grid.save(os.path.join(outdir, f'samples-train-{key0[i]}.png'))
                 if wandb_log:
                     logs['train/samples'] = [wandb.Image(grid, caption=key0[i]) for i, grid in enumerate(grids)]
+                print('Computing train fid', flush=True)
+                logs['train/FID'] = train_fid.compute().item()
 
                 # validation
-                print("Sampling validation images...")
-                grids = utils.sample_images(
+                print("Sampling validation images...", flush=True)
+                grids, val_fid = utils.sample_images(
                     clip_extractor, 
                     diffusion_prior.voxel2clip if not distributed else diffusion_prior.module.voxel2clip, 
                     sd_pipe, 
                     diffusion_prior if not distributed else diffusion_prior.module,
-                    val_voxel0[:n_samples_save * 4], 
-                    val_image0[:n_samples_save * 4],
+                    val_voxel0[:n_samples_save], 
+                    val_image0[:n_samples_save],
                     seed=42,
                 )
                 for i, grid in enumerate(grids):
                     grid.save(os.path.join(outdir, f'samples-val-{val_key0[i]}.png'))
                 if wandb_log:
                     logs['val/samples'] = [wandb.Image(grid, caption=val_key0[i]) for i, grid in enumerate(grids)]
+                print('Computing val fid', flush=True)
+                logs['val/FID'] = val_fid.compute().item()
         
         if wandb_log:
             wandb.log(logs)
+        
+        print('logs for epoch', epoch, logs, flush=True)
 
     if distributed:
         dist.barrier()
