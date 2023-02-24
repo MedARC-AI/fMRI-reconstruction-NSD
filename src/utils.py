@@ -14,6 +14,7 @@ import tempfile
 from torchvision.utils import make_grid
 from models import Clipper
 import json
+from torchmetrics.image.fid import FrechetInceptionDistance
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -379,10 +380,23 @@ def sample_images(
     num_per_sample=4,
     prior_timesteps=None,
     seed=None,
-    verbose=False,
+    verbose=True,
+    device='cuda',
 ):
 
-    plt.close('all')
+    def null_sync(t, *args, **kwargs):
+        return [t]
+
+    def convert_imgs_for_fid(imgs):
+        # Convert from [0, 1] to [0, 255] and from torch.float to torch.uint8
+        return imgs.mul(255).add(0.5).clamp(0, 255).type(torch.uint8)
+
+    fid = FrechetInceptionDistance(feature=64, dist_sync_fn=null_sync).to(device)
+
+    # inside FID it will resize to 300x300 from 256x256
+    # [n, 3, 256, 256]
+    # print('img_input.shape', img_input.shape)
+    fid.update(convert_imgs_for_fid(img_input.to(device)), real=True)
     
     assert voxel.shape[0] == img_input.shape[0], 'batch dim must be the same for voxels and images'
     n_examples = voxel.shape[0]
@@ -406,6 +420,8 @@ def sample_images(
     grids = []
 
     for idx in range(n_examples):
+        print('sampling for image', idx+1, 'of', n_examples, flush=True)
+
         img_orig = img_input[[idx]]
         image = clip_extractor.resize_image(img_orig)
         
@@ -432,15 +448,8 @@ def sample_images(
         if verbose:
             cos_sim = nn.functional.cosine_similarity(image_embeddings, clip_emb, dim=1).item()
             mse = nn.functional.mse_loss(image_embeddings, clip_emb).item()
-            
-            print(f"cosine sim: {cos_sim:.3f}, MSE: {mse:.5f}")
-            print(f"norms - orig: {norm_orig:.3f}, pre_prior: {norm_pre_prior:.3f}, post_prior: {norm_post_prior:.3f}")
-
-            plt.plot(clip_emb.detach().cpu().numpy().flatten(),label='CLIP-image emb.')
-            plt.plot(image_embeddings.detach().cpu().numpy().flatten(),label='CLIP-voxel emb.')
-            plt.title(f"cosine sim: {cos_sim:.3f}, MSE: {mse:.5f}")
-            plt.legend()
-            plt.show()
+            print(f"cosine sim: {cos_sim:.3f}, MSE: {mse:.5f}, norm_orig: {norm_orig:.3f}, "
+                  f"norm_pre_prior: {norm_pre_prior:.3f}, norm_post_prior: {norm_post_prior:.3f}", flush=True)
 
         # duplicate the embedding to serve classifier free guidance
         image_embeddings = image_embeddings.repeat(num_per_sample, 1)
@@ -453,7 +462,8 @@ def sample_images(
         # width, height = 256, 256
         width, height = None, None
 
-        with torch.inference_mode(), torch.autocast("cuda"):
+        with torch.inference_mode(), torch.autocast(device):
+            # [1, 3, 512, 512]
             img_clip = sd_pipe(
                 image_embeddings=clip_emb,
                 num_inference_steps=num_inference_steps,
@@ -465,6 +475,7 @@ def sample_images(
                 generator=g_cuda,
             )
 
+            # [4, 3, 512, 512]
             imgs_brain = sd_pipe(
                 image_embeddings=image_embeddings,
                 num_inference_steps=num_inference_steps,
@@ -476,15 +487,23 @@ def sample_images(
                 generator=g_cuda,
             )
 
-        # TODO: resizing for now since passing sizes doesn't work
+            # print('img_clip.shape', img_clip.shape)
+            # print('imgs_brain.shape', imgs_brain.shape)
+
+        # inside FID it will resize to 300x300 from 512x512
+        print('Done sampling images, updating FID', flush=True)
+        fid.update(convert_imgs_for_fid(imgs_brain.to(device)), real=False)
+        print('Done updating FID', flush=True)
+        
+        # resizing for now since passing target sizes into sd_pipe doesn't work
         size = (256, 256)
         img_clip = nn.functional.interpolate(img_clip, size, mode="area", antialias=False)
         imgs_brain = nn.functional.interpolate(imgs_brain, size, mode="area", antialias=False)
-
+        
         imgs_all = torch.cat((img_orig.to(device), img_clip, imgs_brain), 0)
         grid = torch_to_Image(
             make_grid(imgs_all, nrow=2+4, padding=10).detach()
         )
         grids.append(grid)
 
-    return grids
+    return grids, fid
