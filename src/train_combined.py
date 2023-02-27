@@ -37,6 +37,7 @@ clamp_embs = False # clamp embeddings to (-1.5, 1.5)
 timesteps = 1000 # for diffusion prior
 alpha_schedule = "constant" # ("constant", "linear") - for weighting the loss
 # -- for voxel2clip model
+voxel2clip_arch = 'brainnet' # ('brainnet', '3dconv')
 voxel2clip_kwargs = dict(
     out_dim=768,
 )
@@ -58,12 +59,11 @@ data_commit = '9947586218b6b7c8cab804009ddca5045249a38d' # only applies when rem
 cache_dir = "/tmp/wds-cache"
 # cache_dir = '/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d'
 n_cache_recs = 0
+use_mixco = False # use mixco on the voxels
 # -----------------------------------------------------------------------------
 # params for all models
 seed = 0
 batch_size = 64
-num_devices = torch.cuda.device_count()
-num_workers = num_devices
 num_epochs = 60
 lr_scheduler = 'cycle'
 initial_lr = 1e-3 #3e-5
@@ -82,7 +82,7 @@ outdir = f'../train_logs/{model_name}/test'
 # -----------------------------------------------------------------------------
 # read in any command line args or config file values and override the above params
 config_keys = [k for k,v in globals().items() if not k.startswith('_') \
-               and isinstance(v, (int, float, bool, str))]
+               and isinstance(v, (int, float, bool, str, dict))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
@@ -100,10 +100,13 @@ else:
 
 assert n_samples_save <= batch_size * 4
 
+if n_samples_save > 0:
+    assert n_samples_save >= 2, 'FID will fail if n_samples_save < 2'
+
 # need non-deterministic CuDNN for conv3D to work
 utils.seed_everything(seed + local_rank, cudnn_deterministic=False)
 
-# write config (TODO: only on rank 0)
+# write config
 outdir = os.path.expanduser(outdir)
 if is_master:
     os.makedirs(outdir, exist_ok=True)
@@ -116,10 +119,10 @@ print('Creating Clipper...')
 clip_extractor = Clipper(clip_variant, clamp_embs=clamp_embs, norm_embs=False, device=device)
 
 print('Creating voxel2clip...')
-if voxel_dims == 1:
+if voxel2clip_arch == 'brainnet':
     voxel2clip = BrainNetwork(**voxel2clip_kwargs)
     # 134M params
-elif voxel_dims == 3:
+elif voxel2clip_arch == '3dconv':
     voxel2clip = NewVoxel3dConvEncoder(**voxel2clip_kwargs)
     # 58M params for original version
     # 5M params for smaller version
@@ -127,10 +130,8 @@ elif voxel_dims == 3:
     # param counts:
     # 5,584,448 total
     # 5,584,448 trainable
-try:
-    utils.count_params(voxel2clip)
-except:
-    print('Cannot count params for voxel2clip (probably because it has Lazy layers)')
+print(voxel2clip)
+utils.count_params(voxel2clip)
 
 print('Creating diffusion prior...')
 if not pretrained:
@@ -175,10 +176,7 @@ if distributed:
 else:
     diffusion_prior = diffusion_prior.to(device)
 
-try:
-    utils.count_params(diffusion_prior)
-except:
-    print('Cannot count params for diffusion_prior (probably because it has Lazy layers)')
+utils.count_params(diffusion_prior)
 
 if n_samples_save > 0:
     print('Creating SD image variation pipeline...')
@@ -215,7 +213,7 @@ if n_samples_save > 0:
 if remote_data:
     # pull data directly from huggingface
     train_url, val_url = utils.get_huggingface_urls(data_commit)
-    meta_url = None
+    meta_url = None # use original counts
 else:
     # local paths
     # train_url = "/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/train/train_subj01_{0..49}.tar"
@@ -233,6 +231,9 @@ elif voxel_dims == 3:
     voxels_key = 'wholebrain_3d.npy'
 else:
     raise Exception(f"voxel_dims must be 1 or 3, not {voxel_dims}")
+
+num_devices = torch.cuda.device_count()
+num_workers = num_devices
 
 train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
     batch_size, image_var,
@@ -287,7 +288,12 @@ def save_ckpt(tag):
 epoch = 0
 losses, val_losses, lrs = [], [], []
 best_val_loss = 1e9
-nce = InfoNCE()
+
+if use_mixco:
+    contrast_loss = utils.mixco_nce
+else:
+    contrast_loss = InfoNCE()
+print('contrast_loss', contrast_loss)
 
 # weight for prior's MSE loss term
 if alpha_schedule == 'constant':
@@ -354,13 +360,24 @@ for epoch in progress_bar:
 
         with torch.cuda.amp.autocast(dtype=torch.float32):
             clip_image = clip_extractor.embed_image(image).float()
+            
+            if use_mixco:
+                voxel, perm, betas, select = utils.mixco(voxel)
+
             loss, pred, clip_voxels = diffusion_prior(image_embed=clip_image, voxel=voxel)
             utils.check_loss(loss)
 
-            loss_nce = nce(
-                nn.functional.normalize(clip_voxels, dim=-1), 
-                nn.functional.normalize(clip_image, dim=-1),
-            )
+            if use_mixco:
+                loss_nce = contrast_loss(
+                    nn.functional.normalize(clip_voxels, dim=-1), 
+                    nn.functional.normalize(clip_image, dim=-1),
+                    perm=perm, betas=betas, select=select,
+                )
+            else:
+                loss_nce = contrast_loss(
+                    nn.functional.normalize(clip_voxels, dim=-1), 
+                    nn.functional.normalize(clip_image, dim=-1),
+                )
             utils.check_loss(loss_nce)
 
             loss_nce_sum += loss_nce.item()
@@ -411,7 +428,7 @@ for epoch in progress_bar:
                         if not distributed else diffusion_prior.module(image_embed=clip_image, voxel=voxel)
                     utils.check_loss(loss)
 
-                    loss_nce = nce(
+                    loss_nce = contrast_loss(
                         nn.functional.normalize(clip_voxels, dim=-1), 
                         nn.functional.normalize(clip_image, dim=-1),
                     )

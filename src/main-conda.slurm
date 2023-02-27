@@ -39,15 +39,70 @@ conda activate medical-v1
 # --save_at_end=True \
 # &> /fsx/jimgoo/logs/log.txt
 
-## reproduce the good 1D model
+# ## reproduce the good 1D model
+# srun python train_combined.py \
+# config/1D_combo.py \
+# --wandb_log=True \
+# --outdir=../train_logs/models/prior-w-voxel2clip/1D_combo \
+# --n_samples_save=8 \
+# --remote_data=True \
+# --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
+# --ckpt_saving=True \
+# --first_batch=False \
+# --sample_interval=10 \
+# &> /fsx/jimgoo/logs/log.txt
+
+# srun python train_combined.py \
+# config/1D_combo.py \
+# --batch_size=64 \
+# --wandb_log=True \
+# --outdir=../train_logs/models/prior-w-voxel2clip/1D_combo \
+# --n_samples_save=2 \
+# --remote_data=True \
+# --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
+# --ckpt_saving=True \
+# --first_batch=True \
+# --sample_interval=1 \
+# &> /fsx/jimgoo/logs/log.txt
+
+# srun python train_combined.py \
+# config/1D_combo.py \
+# --batch_size=16 \
+# --wandb_log=True \
+# --outdir=../train_logs/models/prior-w-voxel2clip/1D_combo \
+# --n_samples_save=8 \
+# --remote_data=True \
+# --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
+# --ckpt_saving=True \
+# --first_batch=False \
+# --sample_interval=10 \
+# --use_mixco=True \
+# &> /fsx/jimgoo/logs/log-1D.txt
+
+# srun python train_combined.py \
+# config/3D_combo.py \
+# --batch_size=16 \
+# --wandb_log=True \
+# --outdir=../train_logs/models/prior-w-voxel2clip/3D_combo \
+# --n_samples_save=8 \
+# --remote_data=True \
+# --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
+# --ckpt_saving=True \
+# --first_batch=False \
+# --sample_interval=10 \
+# --use_mixco=True \
+# &> /fsx/jimgoo/logs/log-3D.txt
+
 srun python train_combined.py \
 config/1D_combo.py \
+--batch_size=32 \
 --wandb_log=True \
---outdir=../train_logs/models/prior-w-voxel2clip/1D_combo-cycleLR-FID \
+--outdir=../train_logs/models/prior-w-voxel2clip/1D_combo \
 --n_samples_save=8 \
 --remote_data=True \
 --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
 --ckpt_saving=True \
 --first_batch=False \
---sample_interval=10 \
-&> /fsx/jimgoo/logs/log.txt
+--sample_interval=20 \
+--use_mixco=True \
+&> /fsx/jimgoo/logs/log-1D.txt

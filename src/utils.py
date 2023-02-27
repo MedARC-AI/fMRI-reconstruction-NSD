@@ -136,6 +136,7 @@ def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distri
         probs[torch.arange(preds.shape[0]).to(preds.device), perm] = 1 - betas
 
         loss = -(brain_clip.log_softmax(-1) * probs).sum(-1).mean()
+        print('mixco loss: ', loss.item())
         return loss
     else:
         return F.cross_entropy(brain_clip, torch.arange(brain_clip.shape[0]).to(brain_clip.device))
@@ -324,7 +325,7 @@ def get_dataloaders(
 
     # can pass to .shuffle `rng=random.Random(42)` to maybe get deterministic shuffling
     train_data = wds.WebDataset(train_url, resampled=True, cache_dir=cache_dir, nodesplitter=wds.split_by_node)\
-        .shuffle(500, initial=500)\
+        .shuffle(500, initial=500, rng=random.Random(42))\
         .decode("torch")\
         .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
         .to_tuple("voxels", image_var, "__key__")\

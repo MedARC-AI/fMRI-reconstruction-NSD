@@ -115,6 +115,12 @@ class BrainNetwork(nn.Module):
             bs, 32, h -> bs, 32h
             b2, 32h -> bs, 768
         '''
+        if x.ndim == 4:
+            # case when we passed 3D data of shape [N, 81, 104, 83]
+            assert x.shape[1] == 81 and x.shape[2] == 104 and x.shape[3] == 83
+            # [N, 699192]
+            x = x.reshape(x.shape[0], -1)
+
         x = self.lin0(x)  # bs, h
         residual = x
         for res_block in range(self.n_blocks):
