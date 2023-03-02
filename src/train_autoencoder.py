@@ -3,6 +3,7 @@
 import os
 import sys
 import json
+import traceback
 import numpy as np
 import torch
 import torch.nn as nn
@@ -178,14 +179,18 @@ def save_ckpt(tag):
                 if 'module.' in key:
                     state_dict[key.replace('module.', '')] = state_dict[key]
                     del state_dict[key]
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': state_dict,
-            'optimizer_state_dict': optimizer.state_dict(),
-            'train_losses': losses,
-            'val_losses': val_losses,
-            'lrs': lrs,
-            }, ckpt_path)
+        try:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': state_dict,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_losses': losses,
+                'val_losses': val_losses,
+                'lrs': lrs,
+                }, ckpt_path)
+        except:
+            print('Failed to save weights')
+            print(traceback.format_exc())
 
         # if wandb_log:
         #     wandb.save(ckpt_path)
@@ -206,13 +211,13 @@ if wandb_log:
 progress_bar = tqdm(range(num_epochs), ncols=150, disable=(local_rank!=0))
 losses = []
 val_losses = []
+lrs = []
 best_val_loss = 1e10
 for epoch in progress_bar:
     voxel2sd.train()
     
     loss_mse_sum = 0
     loss_reconst_sum = 0
-    lrs = []
     val_loss_mse_sum = 0
     val_loss_reconst_sum = 0
 
@@ -304,16 +309,19 @@ for epoch in progress_bar:
             # Save model checkpoint every `ckpt_interval`` epochs or on the last epoch
             if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
                 save_ckpt(f'epoch{(epoch+1):03d}')
-                orig = image
-                print(image.shape, reconst.shape)
-                if reconst is None:
-                    reconst = autoenc.decode(image_enc_pred[:16].detach()/0.18215).sample
-                    orig = image[:16]
-                pred_grid = make_grid(((reconst/2 + 0.5).clamp(0,1)*255).byte(), nrow=int(len(reconst)**0.5)).permute(1,2,0).cpu().numpy()
-                orig_grid = make_grid((orig*255).byte(), nrow=int(len(orig)**0.5)).permute(1,2,0).cpu().numpy()
-                comb_grid = np.concatenate([orig_grid, pred_grid], axis=1)
-                del pred_grid, orig_grid
-                Image.fromarray(comb_grid).save(f'{outdir}/reconst_epoch{(epoch+1):03d}.png')
+                try:
+                    orig = image
+                    if reconst is None:
+                        reconst = autoenc.decode(image_enc_pred[:16].detach()/0.18215).sample
+                        orig = image[:16]
+                    pred_grid = make_grid(((reconst/2 + 0.5).clamp(0,1)*255).byte(), nrow=int(len(reconst)**0.5)).permute(1,2,0).cpu().numpy()
+                    orig_grid = make_grid((orig*255).byte(), nrow=int(len(orig)**0.5)).permute(1,2,0).cpu().numpy()
+                    comb_grid = np.concatenate([orig_grid, pred_grid], axis=1)
+                    del pred_grid, orig_grid
+                    Image.fromarray(comb_grid).save(f'{outdir}/reconst_epoch{(epoch+1):03d}.png')
+                except:
+                    print("Failed to save reconst image")
+                    print(traceback.format_exc())
 
         logs = {
             "train/loss": np.mean(losses[-(train_i+1):]),
@@ -334,6 +342,7 @@ for epoch in progress_bar:
 
 if wandb_log:
     wandb.finish()
+
 
 
 

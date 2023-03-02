@@ -296,6 +296,8 @@ if __name__ == '__main__':
                     )
                     # get the CLIP embedding for the variation and use it for x
                     clip_aug = clip_extractor.embed_image(image_aug).float()
+                    # rescale clip embeddings to have norm similar to brain embeddings
+                    clip_aug = F.normalize(clip_aug, dim=-1) * clip_embed.norm(p=2, dim=-1)
 
                     loss, pred = diffusion_prior(text_embed=clip_aug, image_embed=image_clip)
                     loss_on_aug.append(loss.item())

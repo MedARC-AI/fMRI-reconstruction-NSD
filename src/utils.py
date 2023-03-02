@@ -15,6 +15,7 @@ from torchvision.utils import make_grid
 from models import Clipper
 import json
 from torchmetrics.image.fid import FrechetInceptionDistance
+import traceback
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -124,7 +125,7 @@ def mixco(voxels, beta=0.15, s_thresh=0.5):
     betas[~select] = 1
     return voxels, perm, betas, select
 
-def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distributed=False):
+def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distributed=False, local_rank=None):
     if distributed:
         all_targs = gather_features(targs, None)
         brain_clip = (preds @ all_targs.T)/temp
@@ -134,6 +135,10 @@ def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distri
     if perm is not None and betas is not None and select is not None:
         probs = torch.diag(betas)
         probs[torch.arange(preds.shape[0]).to(preds.device), perm] = 1 - betas
+        if distributed:
+            probs_all = torch.zeros_like(brain_clip)
+            probs_all[:, local_rank*brain_clip.shape[0]:(local_rank+1)*brain_clip.shape[0]] = probs
+            probs = probs_all
 
         loss = -(brain_clip.log_softmax(-1) * probs).sum(-1).mean()
         return loss
@@ -267,6 +272,7 @@ def get_dataloaders(
     cache_dir="/tmp/wds-cache",
     n_cache_recs=0,
     voxels_key="nsdgeneral.npy",
+    val_batch_size=None
 ):
     print("Getting dataloaders...")
     train_url_hf, val_url_hf = get_huggingface_urls()
@@ -340,7 +346,7 @@ def get_dataloaders(
     
     # Validation
     # use only one GPU
-    global_batch_size = batch_size
+    global_batch_size = batch_size if val_batch_size is None else val_batch_size
     num_workers = 1
 
     num_batches = math.ceil(num_val / global_batch_size)
@@ -507,3 +513,27 @@ def sample_images(
         grids.append(grid)
 
     return grids, fid
+
+def save_ckpt(model, optimizer, losses, val_losses, lrs, epoch, tag, outdir):
+        ckpt_path = os.path.join(outdir, f'ckpt-{tag}.pth')
+        print(f'saving {ckpt_path}')
+        state_dict = model.state_dict()
+        for key in list(state_dict.keys()):
+            if 'module.' in key:
+                state_dict[key.replace('module.', '')] = state_dict[key]
+                del state_dict[key]
+        try:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': state_dict,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_losses': losses,
+                'val_losses': val_losses,
+                'lrs': lrs,
+                }, ckpt_path)
+        except:
+            print('Failed to save weights')
+            print(traceback.format_exc())
+
+def cosine_anneal(start, end, steps):
+    return end + (start - end)/2 * (1 + torch.cos(torch.pi*torch.arange(steps)/(steps-1)))

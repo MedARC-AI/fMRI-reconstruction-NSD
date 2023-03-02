@@ -48,22 +48,19 @@ class Clipper(torch.nn.Module):
         # note: antialias should be False if planning to use Pinkney's Image Variation SD model
         return nn.functional.interpolate(image.to(self.device), self.clip_size, mode="area", antialias=False)
 
-    def embed_image(self, image, return_norm=False):
+    def embed_image(self, image):
         """Expects images in -1 to 1 range"""
         clip_emb = self.resize_image(image)
         if self.transforms is not None:
             clip_emb = self.transforms(clip_emb)
         clip_emb = self.clip.encode_image(self.normalize(clip_emb))
         # input is now in CLIP space, but mind-reader preprint further processes embeddings:
-        clip_emb_norm = clip_emb.norm(2,dim=-1)
         if self.clamp_embs:
             clip_emb = torch.clamp(clip_emb, -1.5, 1.5)
         if self.norm_embs:
             clip_emb = nn.functional.normalize(clip_emb, dim=-1)
-        if not return_norm:
-            return clip_emb
-        else:
-             return clip_emb, clip_emb_norm
+        return clip_emb
+        
     
     def embed_text(self, text_samples):
         clip_text = clip.tokenize(text_samples).to(self.device)
