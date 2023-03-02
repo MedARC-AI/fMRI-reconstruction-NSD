@@ -67,7 +67,7 @@ class Transformer(nn.Module):
             else:
                 x = r(x, attn_mask=attn_mask)
         return x
-    
+
 class NewVoxel3dConvEncoder(nn.Module):
     def __init__(self, dims: List[int] = [81, 104, 83], attention_width: int = 64, out_dim: int = 768, 
         c_in: int = 1, average_output: bool = False, act_layer: Callable = nn.GELU,
@@ -105,8 +105,13 @@ class NewVoxel3dConvEncoder(nn.Module):
         channels = [c_in] + self.channels
 
         self.conv_blocks = nn.ModuleList([
-            self._get_conv_layer(channels[i], channels[i + 1], self.kernel[i], self.strides[i], 
-                                 self.padding[i], self.dilation[i], act_layer
+            nn.Sequential(
+                nn.Conv3d(channels[i], channels[i + 1], self.kernel[i], 
+                          stride=self.strides[i], padding=self.padding[i], dilation=self.dilation[i]),
+                nn.BatchNorm3d(channels[i + 1]),
+                act_layer(),
+                nn.Dropout3d(p=0.2),
+                # nn.MaxPool3d(kernel_size=2, stride=2)
             )
             for i in range(len(self.channels))
         ])
@@ -138,15 +143,6 @@ class NewVoxel3dConvEncoder(nn.Module):
 
         self.input_dropout = nn.Dropout3d(p=input_dropout_prob)
 
-    def _get_conv_layer(self, c_in, c_out, kernel_size, stride, padding, dilation, act_layer):
-        return nn.Sequential(
-            nn.Conv3d(c_in, c_out, kernel_size, stride=stride, padding=padding, dilation=dilation),
-            nn.BatchNorm3d(c_out),
-            act_layer(),
-            nn.Dropout3d(p=0.2),
-            # nn.MaxPool3d(kernel_size=2, stride=2)
-        )
-
     def forward(self, x: torch.Tensor):
         assert x.ndim == 4, f"Input must be 4D. Got {x.ndim}D"
         
@@ -159,6 +155,8 @@ class NewVoxel3dConvEncoder(nn.Module):
         for block in self.conv_blocks:
             x = block(x)
 
+        import pdb; pdb.set_trace()
+
         # Currently the output shape is [*, attention_width, x, y, z]
         x = x.reshape(x.shape[0], x.shape[1], -1) # [*, attention_width, seq_len]
         x = x.permute(2, 0, 1) # [seq_len, *, attention_width]
@@ -170,6 +168,76 @@ class NewVoxel3dConvEncoder(nn.Module):
         else:
             x = x.reshape(x.shape[0], -1) # [*, attention_width * seq_len]
             x = self.proj(x)
+        return x
+
+class SimpleVoxel3dConvEncoder(nn.Module):
+    def __init__(self, dims: List[int] = [81, 104, 83], out_dim: int = 768, 
+        c_in: int = 1, act_layer: Callable = nn.GELU,
+        channels: Optional[List[int]] = None, strides: Optional[List[int]] = None,
+        padding: Optional[List[int]] = None, dilation: Optional[List[int]] = None,
+        kernel: Optional[List[int]] = None,
+        input_dropout_prob=0.1,
+    ):
+        super().__init__()
+        
+        self.channels = channels
+        self.strides = strides
+        self.padding = padding
+        self.dilation = dilation
+        self.kernel = kernel
+
+        assert len(self.channels) == len(self.strides) == len(self.padding) == len(self.dilation) == len(self.kernel), \
+            f"Lengths of channels, strides, padding, dilation, and kernel must be the same. " \
+            f"Got {len(self.channels)}, {len(self.strides)}, {len(self.padding)}, {len(self.dilation)}, {len(self.kernel)}"
+
+        channels = [c_in] + self.channels
+
+        self.conv_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv3d(channels[i], channels[i + 1], self.kernel[i], 
+                          stride=self.strides[i], padding=self.padding[i], dilation=self.dilation[i]),
+                nn.BatchNorm3d(channels[i + 1]),
+                act_layer(),
+                nn.Dropout3d(p=0.2),
+                # nn.MaxPool3d(kernel_size=3, stride=2)
+            )
+            for i in range(len(self.channels))
+        ])
+
+        print(f"Input shape: {dims}")
+        for n in range(len(self.channels)):
+            stride = self.strides[n]
+            dilation = self.dilation[n]
+            padding = self.padding[n]
+            kernel = self.kernel[n]
+            dims = [int((d + 2*padding - dilation*(kernel - 1) - 1)/(stride) + 1) for d in dims]
+            print(f"Conv {n} output: {channels[n + 1]} x {dims}", flush=True)
+        
+        n_feats = channels[-1] * np.prod(dims)
+        print(f"Projection input features: {n_feats}", flush=True)
+        
+        self.proj = nn.Linear(n_feats, out_dim)
+        self.input_dropout = nn.Dropout3d(p=input_dropout_prob)
+
+    def forward(self, x: torch.Tensor):
+        assert x.ndim == 4, f"Input must be 4D. Got {x.ndim}D"
+        
+        # add singleton channel dimension
+        x = x.unsqueeze(1)
+
+        # dropout on raw voxel inputs
+        x = self.input_dropout(x)
+
+        for block in self.conv_blocks:
+            # print(x.shape)
+            x = block(x)
+            # print('\t', x.shape)
+
+        # import pdb; pdb.set_trace()
+
+        # [*, c_out_last, x, y, z] -> [*, ]
+        x = torch.flatten(x, 1)
+        x = self.proj(x)
         return x
     
 if __name__ == "__main__":

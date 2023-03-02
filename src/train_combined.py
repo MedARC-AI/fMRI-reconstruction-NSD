@@ -26,7 +26,7 @@ from dalle2_pytorch import DiffusionPriorNetwork
 
 import utils
 from models import Clipper, BrainNetwork, BrainDiffusionPrior, BrainSD
-from model3d import NewVoxel3dConvEncoder
+from model3d import NewVoxel3dConvEncoder, SimpleVoxel3dConvEncoder
 
 # -----------------------------------------------------------------------------
 # params for this model
@@ -34,32 +34,25 @@ model_name = "prior-w-voxel2clip"
 modality = "image" # ("image", "text")
 clip_variant = "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
 clamp_embs = False # clamp embeddings to (-1.5, 1.5)
-timesteps = 1000 # for diffusion prior
-alpha_schedule = "constant" # ("constant", "linear") - for weighting the loss
-# -- for voxel2clip model
-voxel2clip_arch = 'brainnet' # ('brainnet', '3dconv')
+alpha_schedule = "constant" # ("constant", "linear") - alpha is weight the MSE DP loss
 voxel2clip_kwargs = dict(
+    arch='brainnet',
     out_dim=768,
 )
-# -- for diffusion prior - these are ignored when pretrained=True
-pretrained = True # use pretrained prior
-dim = 768
-depth = 6
-dim_head = 64
-heads = 12 # heads * dim_head = 12 * 64 = 768
-cond_drop_prob = 0.2
-image_embed_scale = None
-condition_on_text_encodings = False
+prior_kwargs = dict(
+    pretrained=True,
+    network_kwargs=dict(),
+    prior_kwargs=dict(),
+)
 voxel_dims = 1 # (1, 3)
+use_mixco = False # use mixco on the voxels
 n_samples_save = 8 # how many SD samples from train and val to save
 sample_interval = 1 # after how many epochs to save samples
-# -- params for data
 remote_data = False # pull data from huggingface if True
 data_commit = '9947586218b6b7c8cab804009ddca5045249a38d' # only applies when remote_data=True
 cache_dir = "/tmp/wds-cache"
 # cache_dir = '/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d'
 n_cache_recs = 0
-use_mixco = False # use mixco on the voxels
 # -----------------------------------------------------------------------------
 # params for all models
 seed = 0
@@ -119,6 +112,7 @@ print('Creating Clipper...')
 clip_extractor = Clipper(clip_variant, clamp_embs=clamp_embs, norm_embs=False, device=device)
 
 print('Creating voxel2clip...')
+voxel2clip_arch = voxel2clip_kwargs.pop('arch')
 if voxel2clip_arch == 'brainnet':
     voxel2clip = BrainNetwork(**voxel2clip_kwargs)
     # 134M params
@@ -130,42 +124,35 @@ elif voxel2clip_arch == '3dconv':
     # param counts:
     # 5,584,448 total
     # 5,584,448 trainable
+elif voxel2clip_arch == '3dconv-simple':
+    voxel2clip = SimpleVoxel3dConvEncoder(**voxel2clip_kwargs)
+else:
+    raise Exception(f"Unknown voxel2clip_arch: {voxel2clip_arch}")
 print(voxel2clip)
 utils.count_params(voxel2clip)
 
 print('Creating diffusion prior...')
-if not pretrained:
+if not prior_kwargs['pretrained']:
     # same as DALLE2-pytorch
     prior_network = DiffusionPriorNetwork(
-        dim=dim,
-        depth=depth,
-        dim_head=dim_head,
-        heads=heads
+        **prior_kwargs['network_kwargs'],
     )
 
     # custom version of DiffusionPrior from DALLE2-pytorch
     diffusion_prior = BrainDiffusionPrior(
         net=prior_network,
-        image_embed_dim=dim,
-        condition_on_text_encodings=condition_on_text_encodings,
-        timesteps=timesteps,
-        cond_drop_prob=cond_drop_prob,
-        image_embed_scale=image_embed_scale,
         voxel2clip=voxel2clip,
+        **prior_kwargs['prior_kwargs'],
     )
 else:
-    print("WARNING: ignoring passed values for dim, depth, dim_head, heads, "
-            "cond_drop_prob, image_embed_scale")
-    assert timesteps == 1000
+    # not using prior_kwargs b/c the model is pretrained
     diffusion_prior = BrainDiffusionPrior.from_pretrained(
         # kwargs for DiffusionPriorNetwork
         dict(),
         # kwargs for DiffusionNetwork
         dict(
-            condition_on_text_encodings=condition_on_text_encodings,
-            timesteps=timesteps,
-            # cond_drop_prob=cond_drop_prob,
-            # image_embed_scale=image_embed_scale,
+            condition_on_text_encodings=False,
+            timesteps=1000,
             voxel2clip=voxel2clip,
         ),
     )
@@ -180,14 +167,21 @@ utils.count_params(diffusion_prior)
 
 if n_samples_save > 0:
     print('Creating SD image variation pipeline...')
-    sd_pipe = BrainSD.from_pretrained(
-        #"lambdalabs/sd-image-variations-diffusers", 
-        "/admin/home-jimgoo/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc/",
-        revision="v2.0",
-        safety_checker=None,
-        requires_safety_checker=False,
-        torch_dtype=torch.float16, # fp16 is fine if we're not training this
-    ).to(device)
+
+    def get_sd_pipe(path_or_name):
+        return BrainSD.from_pretrained(
+            path_or_name,
+            revision="v2.0",
+            safety_checker=None,
+            requires_safety_checker=False,
+            torch_dtype=torch.float16, # fp16 is fine if we're not training this
+        ).to(device)
+
+    try:
+        # try to get local copy, removes a network call to HF that can fail when lots of processes make it all at once
+        sd_pipe = get_sd_pipe("/admin/home-jimgoo/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc/")
+    except:
+        sd_pipe = get_sd_pipe("lambdalabs/sd-image-variations-diffusers")
 
     # freeze everything, we're just using this for inference
     sd_pipe.unet.eval()
@@ -218,8 +212,9 @@ else:
     # local paths
     # train_url = "/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/train/train_subj01_{0..49}.tar"
     # val_url = "/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/val/val_subj01_0.tar"
-    # meta_url = None
+    # meta_url = None # use original counts
     
+    # stability cluster paths
     train_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/train/train_subj01_{0..49}.tar"
     val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/val/val_subj01_0.tar"
     meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/metadata_subj01.json"
@@ -326,6 +321,9 @@ if first_batch:
     train_dl = [(voxel0[:bs], image0[:bs], key0[:bs])]
     val_dl = [(val_voxel0[:bs], val_image0[:bs], val_key0[:bs])]
 
+# for Atom's loss
+epoch_temps = np.linspace(0.004, 0.0075, num_epochs-int(0.5*num_epochs), endpoint=True)
+
 # feed text and images into diffusion prior network
 progress_bar = tqdm(range(epoch, num_epochs), desc='train loop', disable=(distributed and local_rank != 0))
 
@@ -347,6 +345,7 @@ for epoch in progress_bar:
     val_loss_prior_sum = 0.
 
     alpha = alphas[epoch]
+    epoch_temp = epoch_temps[epoch - int(0.5*num_epochs)]
 
     keys = set()
 
@@ -368,11 +367,18 @@ for epoch in progress_bar:
             utils.check_loss(loss)
 
             if use_mixco:
-                loss_nce = contrast_loss(
-                    nn.functional.normalize(clip_voxels, dim=-1), 
-                    nn.functional.normalize(clip_image, dim=-1),
-                    perm=perm, betas=betas, select=select,
-                )
+                if epoch < int(0.5*num_epochs):
+                    loss_nce = contrast_loss(
+                        nn.functional.normalize(clip_voxels, dim=-1), 
+                        nn.functional.normalize(clip_image, dim=-1),
+                        temp=0.006, perm=perm, betas=betas, select=select,
+                    )
+                else:
+                    loss_nce = utils.soft_clip_loss(
+                        nn.functional.normalize(clip_voxels, dim=-1), 
+                        nn.functional.normalize(clip_image, dim=-1),
+                        temp=epoch_temp,
+                    )
             else:
                 loss_nce = contrast_loss(
                     nn.functional.normalize(clip_voxels, dim=-1), 
@@ -428,10 +434,25 @@ for epoch in progress_bar:
                         if not distributed else diffusion_prior.module(image_embed=clip_image, voxel=voxel)
                     utils.check_loss(loss)
 
-                    loss_nce = contrast_loss(
-                        nn.functional.normalize(clip_voxels, dim=-1), 
-                        nn.functional.normalize(clip_image, dim=-1),
-                    )
+                    if use_mixco:
+                        if epoch < int(0.5*num_epochs):
+                            loss_nce = contrast_loss(
+                                nn.functional.normalize(clip_voxels, dim=-1), 
+                                nn.functional.normalize(clip_image, dim=-1),
+                                temp=0.006,
+                            )
+                        else:
+                            loss_nce = utils.soft_clip_loss(
+                                nn.functional.normalize(clip_voxels, dim=-1), 
+                                nn.functional.normalize(clip_image, dim=-1),
+                                temp=epoch_temp,
+                            )
+                    else:
+                        loss_nce = contrast_loss(
+                            nn.functional.normalize(clip_voxels, dim=-1), 
+                            nn.functional.normalize(clip_image, dim=-1),
+                        )
+                    
                     utils.check_loss(loss_nce)
 
                     val_loss_nce_sum += loss_nce.item()

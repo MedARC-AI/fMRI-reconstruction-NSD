@@ -2,9 +2,9 @@
 #SBATCH --account=medarc
 #SBATCH --partition=g40423
 #SBATCH --nodes=1             # node count
-#SBATCH --ntasks-per-node=8   # with DDP, must equal num of gpus
+#SBATCH --ntasks-per-node=1   # with DDP, must equal num of gpus
 #SBATCH --cpus-per-task=4     # rule-of-thumb is 4 times number of gpus
-#SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:1
 #SBATCH --mem-per-gpu=40G
 #SBATCH --time=10:00:00       # total run time limit (HH:MM:SS)
 #SBATCH --comment=medarc
@@ -89,20 +89,65 @@ conda activate medical-v1
 # --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
 # --ckpt_saving=True \
 # --first_batch=False \
-# --sample_interval=10 \
+# --sample_interval=20 \
+# --use_mixco=True \
+# &> /fsx/jimgoo/logs/log-3D.txt
+
+# srun python train_combined.py \
+# config/1D_combo.py \
+# --batch_size=64 \
+# --wandb_log=True \
+# --outdir=../train_logs/models/prior-w-voxel2clip/1D_combo \
+# --n_samples_save=8 \
+# --remote_data=True \
+# --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
+# --ckpt_saving=True \
+# --first_batch=False \
+# --sample_interval=20 \
+# --use_mixco=True \
+# &> /fsx/jimgoo/logs/log-1D.txt
+
+# srun python train_combined.py \
+# config/3D_combo_simple.py \
+# --batch_size=16 \
+# --wandb_log=True \
+# --wandb_notes='3D without transformer' \
+# --outdir=../train_logs/models/prior-w-voxel2clip/3D_combo \
+# --n_samples_save=8 \
+# --remote_data=True \
+# --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
+# --ckpt_saving=True \
+# --first_batch=False \
+# --sample_interval=20 \
+# --use_mixco=True \
+# &> /fsx/jimgoo/logs/log-3D.txt
+
+# srun python train_combined.py \
+# config/3D_combo_simple.py \
+# --batch_size=16 \
+# --wandb_log=True \
+# --wandb_notes='3D without transformer' \
+# --outdir=../train_logs/models/prior-w-voxel2clip/3D_combo \
+# --n_samples_save=8 \
+# --remote_data=True \
+# --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
+# --ckpt_saving=True \
+# --first_batch=False \
+# --sample_interval=20 \
 # --use_mixco=True \
 # &> /fsx/jimgoo/logs/log-3D.txt
 
 srun python train_combined.py \
 config/1D_combo.py \
 --batch_size=32 \
---wandb_log=True \
+--wandb_log=False \
+--wandb_notes='1D w mixco of soft loss' \
 --outdir=../train_logs/models/prior-w-voxel2clip/1D_combo \
 --n_samples_save=8 \
 --remote_data=True \
 --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
 --ckpt_saving=True \
---first_batch=False \
+--first_batch=True \
 --sample_interval=20 \
 --use_mixco=True \
 &> /fsx/jimgoo/logs/log-1D.txt
