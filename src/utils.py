@@ -12,6 +12,7 @@ import math
 import webdataset as wds
 import tempfile
 from torchvision.utils import make_grid
+from diffusers.utils import randn_tensor
 from models import Clipper
 import json
 from torchmetrics.image.fid import FrechetInceptionDistance
@@ -269,6 +270,7 @@ def get_dataloaders(
     train_url=None,
     val_url=None,
     meta_url=None,
+    num_samples=None,
     cache_dir="/tmp/wds-cache",
     n_cache_recs=0,
     voxels_key="nsdgeneral.npy",
@@ -296,6 +298,9 @@ def get_dataloaders(
         metadata = json.load(open(meta_url))
         num_train = metadata['totals']['train']
         num_val = metadata['totals']['val']
+        
+    if num_samples is not None:
+        num_train = num_samples
     
     global_batch_size = batch_size * num_devices
     num_batches = math.floor(num_train / global_batch_size)
@@ -537,3 +542,164 @@ def save_ckpt(model, optimizer, losses, val_losses, lrs, epoch, tag, outdir):
 
 def cosine_anneal(start, end, steps):
     return end + (start - end)/2 * (1 + torch.cos(torch.pi*torch.arange(steps)/(steps-1)))
+
+# below is alternative to sample_images that can also handle img2img reference
+@torch.no_grad()
+def reconstruct_from_clip(
+    image, voxel,
+    diffusion_prior,
+    clip_extractor,
+    unet, vae, noise_scheduler,
+    img_lowlevel = None,
+    num_inference_steps = 50,
+    n_samples_save = 4,
+    recons_per_clip = 2,
+    recons_per_brain = 4,
+    guidance_scale = 7.5,
+    img2img_strength = .6,
+    timesteps = 1000,
+    seed = 0,
+    distributed = False,
+):
+    def decode_latents(latents):
+        latents = 1 / 0.18215 * latents
+        image = vae.decode(latents).sample
+        image = (image / 2 + 0.5).clamp(0, 1)
+        return image
+    
+    voxel=voxel[:n_samples_save]
+    image=image[:n_samples_save]
+    if img_lowlevel is not None:
+        img_lowlevel=img_lowlevel[:n_samples_save]
+        img_lowlevel = nn.functional.interpolate(img_lowlevel, 512, mode="area", antialias=False).to(device)
+
+    do_classifier_free_guidance = guidance_scale > 1.0
+    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+    height = unet.config.sample_size * vae_scale_factor
+    width = unet.config.sample_size * vae_scale_factor
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+
+    # Prep CLIP-Image embeddings for original image for comparison with reconstructions
+    clip_embeddings = clip_extractor.embed_image(image).float()
+
+    # Encode voxels to CLIP space
+    if distributed:
+        diffusion_prior.module.voxel2clip.eval()
+        brain_clip_embeddings = diffusion_prior.module.voxel2clip(voxel.to(device).float())
+        # NOTE: requires fork of DALLE-pytorch for generator arg
+        brain_clip_embeddings = diffusion_prior.module.p_sample_loop(brain_clip_embeddings.shape, 
+                                            text_cond = dict(text_embed = brain_clip_embeddings), 
+                                            cond_scale = 1., timesteps = timesteps, #1000 timesteps used from nousr pretraining
+                                            generator=generator
+                                            )
+    else:
+        diffusion_prior.voxel2clip.eval()
+        brain_clip_embeddings = diffusion_prior.voxel2clip(voxel.to(device).float())
+        # NOTE: requires fork of DALLE-pytorch for generator arg
+        brain_clip_embeddings = diffusion_prior.p_sample_loop(brain_clip_embeddings.shape, 
+                                            text_cond = dict(text_embed = brain_clip_embeddings), 
+                                            cond_scale = 1., timesteps = timesteps, #1000 timesteps used from nousr pretraining
+                                            generator=generator
+                                            )
+
+    # Now enter individual image processing loop
+    clip_recons = None
+    brain_recons = None
+    img2img_refs = None
+    for e, emb in enumerate([clip_embeddings, brain_clip_embeddings]):
+        if e==0:
+            embed_type = 'clip'
+        else:
+            embed_type = 'brain'
+        for emb_idx, input_embedding in enumerate(emb):
+            if embed_type == 'clip':
+                recons_per_sample = recons_per_clip
+            else:
+                recons_per_sample = recons_per_brain
+            if recons_per_sample == 0: continue
+            input_embedding = input_embedding.repeat(recons_per_sample, 1)
+            input_embedding = torch.cat([torch.zeros_like(input_embedding), input_embedding]).unsqueeze(1).to(device)
+
+            # 4. Prepare timesteps
+            noise_scheduler.set_timesteps(num_inference_steps, device=device)
+
+            # 5b. Prepare latent variables
+            batch_size = input_embedding.shape[0] // 2 # divide by 2 bc we doubled it for classifier-free guidance
+            shape = (batch_size, unet.in_channels, height // vae_scale_factor, width // vae_scale_factor)
+            if img_lowlevel is not None: # use img_lowlevel for img2img initialization
+                init_timestep = min(int(num_inference_steps * img2img_strength), num_inference_steps)
+                t_start = max(num_inference_steps - init_timestep, 0)
+                timesteps = noise_scheduler.timesteps[t_start:]
+                latent_timestep = timesteps[:1].repeat(batch_size)
+
+                img_lowlevel = transforms.functional.gaussian_blur(img_lowlevel,kernel_size=99)
+                if img2img_refs is None:
+                    img2img_refs = img_lowlevel[[emb_idx]]
+                elif img2img_refs.shape[0] <= emb_idx:
+                    img2img_refs = torch.cat((img2img_refs, img_lowlevel[[emb_idx]]))
+                img_lowlevel_embeddings = clip_extractor.normalize(img_lowlevel[[emb_idx]])
+
+                init_latents = vae.encode(img_lowlevel_embeddings).latent_dist.sample(generator)
+                init_latents = vae.config.scaling_factor * init_latents
+                init_latents = init_latents.repeat(recons_per_sample, 1, 1, 1)
+
+                noise = randn_tensor(shape, generator=generator, device=device)
+                init_latents = noise_scheduler.add_noise(init_latents, noise, latent_timestep)
+                latents = init_latents
+            else:
+                timesteps = noise_scheduler.timesteps
+                latents = randn_tensor(shape, generator=generator, device=device, dtype=input_embedding.dtype)
+                latents = latents * noise_scheduler.init_noise_sigma
+
+            # 7. Denoising loop
+            for i, t in enumerate(timesteps):
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
+
+                # predict the noise residual
+                noise_pred = unet(latent_model_input, t, encoder_hidden_states=input_embedding).sample
+
+                # perform guidance
+                if do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
+            recons = decode_latents(latents).detach().cpu()
+
+            if embed_type == 'clip':
+                if clip_recons is None:
+                    clip_recons = recons.unsqueeze(0)
+                else:
+                    clip_recons = torch.cat((clip_recons,recons.unsqueeze(0)))
+            else:
+                if brain_recons is None:
+                    brain_recons = recons.unsqueeze(0)
+                else:
+                    brain_recons = torch.cat((brain_recons,recons.unsqueeze(0)))
+
+    img2img_samples = 0 if img_lowlevel is None else 1
+    num_xaxis_subplots = 1+img2img_samples+recons_per_clip+recons_per_brain
+    fig, ax = plt.subplots(n_samples_save, num_xaxis_subplots, 
+                           figsize=(20,3*n_samples_save),
+                           facecolor=(1, 1, 1))
+    for im in range(n_samples_save):
+        ax[im][0].set_title(f"Original Image")
+        ax[im][0].imshow(torch_to_Image(image[im]))
+        if img2img_samples == 1:
+            ax[im][1].set_title(f"Img2img Input")
+            ax[im][1].imshow(torch_to_Image(img2img_refs[im]))
+        for ii,i in enumerate(range(num_xaxis_subplots-recons_per_clip-recons_per_brain,num_xaxis_subplots-recons_per_brain)):
+            recon = clip_recons[im][ii]
+            ax[im][i].set_title(f"Recon {ii+1} from orig CLIP")
+            ax[im][i].imshow(torch_to_Image(recon))
+        for ii,i in enumerate(range(num_xaxis_subplots-recons_per_brain,num_xaxis_subplots)):
+            recon = brain_recons[im][ii]
+            ax[im][i].set_title(f"Recon {ii+1} from brain")
+            ax[im][i].imshow(torch_to_Image(recon))
+        for i in range(num_xaxis_subplots):
+            ax[im][i].axis('off')
+    return fig
