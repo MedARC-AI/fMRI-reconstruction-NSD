@@ -57,12 +57,13 @@ n_cache_recs = 0
 # params for all models
 seed = 0
 batch_size = 64
+val_batch_size = 64
 num_epochs = 60
 lr_scheduler = 'cycle'
 initial_lr = 1e-3 #3e-5
 max_lr = 3e-4
 wandb_log = False
-wandb_project = 'laion-fmri'
+wandb_project = 'fMRI-reconstruction-NSD'
 wandb_run_name = ''
 wandb_notes = ''
 first_batch = False
@@ -181,6 +182,7 @@ if n_samples_save > 0:
         # try to get local copy, removes a network call to HF that can fail when lots of processes make it all at once
         sd_pipe = get_sd_pipe("/admin/home-jimgoo/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc/")
     except:
+        print('Downloading SD image variation pipeline...')
         sd_pipe = get_sd_pipe("lambdalabs/sd-image-variations-diffusers")
 
     # freeze everything, we're just using this for inference
@@ -239,6 +241,7 @@ train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
     cache_dir=cache_dir,
     n_cache_recs=n_cache_recs,
     voxels_key=voxels_key,
+    val_batch_size=val_batch_size,
 )
 
 optimizer = torch.optim.AdamW(diffusion_prior.parameters(), lr=initial_lr)
@@ -307,6 +310,7 @@ if wandb_log:
             name=wandb_run_name,
             config=config,
             notes=wandb_notes,
+            entity="jimgoo",
         )
 
 # get first batches (used for generating samples with SD)
@@ -317,9 +321,11 @@ for val_i, (val_voxel0, val_image0, val_key0) in enumerate(val_dl):
 
 if first_batch:
     # fake DataLoaders with just the first batches
-    bs = batch_size
-    train_dl = [(voxel0[:bs], image0[:bs], key0[:bs])]
-    val_dl = [(val_voxel0[:bs], val_image0[:bs], val_key0[:bs])]
+    # bs = batch_size
+    # train_dl = [(voxel0[:bs], image0[:bs], key0[:bs])]
+    # val_dl = [(val_voxel0[:bs], val_image0[:bs], val_key0[:bs])]
+    train_dl = [(voxel0, image0, key0)]
+    val_dl = [(val_voxel0, val_image0, val_key0)]
 
 # for Atom's loss
 epoch_temps = np.linspace(0.004, 0.0075, num_epochs-int(0.5*num_epochs), endpoint=True)
@@ -484,9 +490,9 @@ for epoch in progress_bar:
         progress_bar.set_postfix(**logs)
 
         print('len(val_keys)', len(keys), flush=True)
-        if not first_batch:
-            # make sure we got all of the validation samples when we're not using just the first batch
-            assert len(keys) == num_val, (len(keys), num_val)
+        # if not first_batch:
+        #     # make sure we got all of the validation samples when we're not using just the first batch
+        #     assert len(keys) == num_val, (len(keys), num_val)
         # if epoch == 0:
         #     print('val_keys', keys, flush=True)
         
@@ -510,18 +516,18 @@ for epoch in progress_bar:
             "val/loss": np.mean(val_losses[-(val_i+1):]),
             "train/lr": lrs[-1],
             "train/num_steps": len(losses),
-            "train/cosine_sim": sims / (train_i + 1),
-            "val/cosine_sim": val_sims / (val_i + 1),
-            "train/cosine_sim_base": sims_base / (train_i + 1),
-            "val/cosine_sim_base": val_sims_base / (val_i + 1),
+            "train/cos_sim": sims / (train_i + 1),
+            "val/cos_sim": val_sims / (val_i + 1),
+            "train/cos_sim_base": sims_base / (train_i + 1),
+            "val/cos_sim_base": val_sims_base / (val_i + 1),
             "train/fwd_pct_correct": fwd_percent_correct / (train_i + 1),
             "train/bwd_pct_correct": bwd_percent_correct / (train_i + 1),
             "val/val_fwd_pct_correct": val_fwd_percent_correct / (val_i + 1),
             "val/val_bwd_pct_correct": val_bwd_percent_correct / (val_i + 1),
             "train/loss_nce": loss_nce_sum / (train_i + 1),
-            "train/loss_prior": loss_prior_sum / (train_i + 1),
+            "train/loss_mse": loss_prior_sum / (train_i + 1),
             "val/loss_nce": val_loss_nce_sum / (val_i + 1),
-            "val/loss_prior": val_loss_prior_sum / (val_i + 1),
+            "val/loss_mse": val_loss_prior_sum / (val_i + 1),
             "train/alpha": alpha,
         }
 
