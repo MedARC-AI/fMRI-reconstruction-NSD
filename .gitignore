@@ -5,3 +5,5 @@
 **/wandb
 **/train_logs
 **/slurm-*.out
+
+*.pth

@@ -75,6 +75,7 @@ if not os.path.exists(outdir):
     os.makedirs(outdir)
 use_mp = False
 remote_data = False
+data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
 
 # if running command line, read in args or config file values and override above params
 try:
@@ -137,10 +138,11 @@ elif voxel_dims == 3: # 3D data
     # 5,584,448 total
     # 5,584,448 trainable
     
-try:
-    utils.count_params(voxel2clip)
-except:
-    if local_rank == 0: print('Cannot count params for voxel2clip (probably because it has Lazy layers)')
+if local_rank == 0: 
+    try:
+        utils.count_params(voxel2clip)
+    except:
+        print('Cannot count params for voxel2clip (probably because it has Lazy layers)')
 
 if local_rank == 0: print('Creating diffusion prior...')
 
@@ -164,10 +166,11 @@ if distributed:
     diffusion_prior = DDP(diffusion_prior, device_ids=[local_rank])
 else:
     diffusion_prior = diffusion_prior.to(device)
-try:
-    utils.count_params(diffusion_prior)
-except:
-    if local_rank == 0: print('Cannot count params for diffusion_prior (probably because it has Lazy layers)')
+if local_rank == 0: 
+    try:
+        utils.count_params(diffusion_prior)
+    except:
+        if local_rank == 0: print('Cannot count params for diffusion_prior (probably because it has Lazy layers)')
 
 if local_rank == 0: print('Creating SD image variation pipeline...')
 sd_cache_dir = '/fsx/home-paulscotti/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc'

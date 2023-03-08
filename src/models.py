@@ -17,6 +17,8 @@ from dalle2_pytorch.train_configs import DiffusionPriorNetworkConfig
 from diffusers import StableDiffusionImageVariationPipeline
 from typing import Callable, List, Optional, Union
 
+from diffusers.models.vae import Decoder
+
 # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -46,22 +48,19 @@ class Clipper(torch.nn.Module):
         # note: antialias should be False if planning to use Pinkney's Image Variation SD model
         return nn.functional.interpolate(image.to(self.device), self.clip_size, mode="area", antialias=False)
 
-    def embed_image(self, image, return_norm=False):
+    def embed_image(self, image):
         """Expects images in -1 to 1 range"""
         clip_emb = self.resize_image(image)
         if self.transforms is not None:
             clip_emb = self.transforms(clip_emb)
         clip_emb = self.clip.encode_image(self.normalize(clip_emb))
         # input is now in CLIP space, but mind-reader preprint further processes embeddings:
-        clip_emb_norm = clip_emb.norm(2,dim=-1)
         if self.clamp_embs:
             clip_emb = torch.clamp(clip_emb, -1.5, 1.5)
         if self.norm_embs:
             clip_emb = nn.functional.normalize(clip_emb, dim=-1)
-        if not return_norm:
-            return clip_emb
-        else:
-             return clip_emb, clip_emb_norm
+        return clip_emb
+        
     
     def embed_text(self, text_samples):
         clip_text = clip.tokenize(text_samples).to(self.device)
@@ -128,48 +127,6 @@ class BrainNetwork(nn.Module):
             x += residual
             residual = x
         x = x.reshape(len(x), -1)
-        x = self.lin1(x)
-        return x
-    
-class BrainNetworkLarge(nn.Module):
-    # 235M
-    def __init__(self, out_dim, in_dim=15724, h=4096):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Linear(in_dim, h),
-            nn.GELU(),
-            nn.Dropout(0.5),
-        )
-
-        self.lins = nn.ModuleList([
-            nn.Sequential(
-                nn.Dropout(0.15) if i!=0 else nn.Identity(),
-                nn.Linear(h, h),
-                nn.GELU(),
-                nn.BatchNorm1d(h),
-                nn.Dropout(0.25),
-                # nn.Dropout(0.15),
-                nn.Linear(h, h),
-                nn.GELU(),
-                nn.BatchNorm1d(h),
-                # nn.Dropout(0.15),
-            ) for i in range(5)
-        ])  
-        
-        # zero init batchnorms
-        for lin in self.lins:
-            nn.init.constant_(lin[-1].weight, 0.0)
-            # nn.init.constant_(lin[-2].weight, 0.0)
-        
-        self.lin1 = nn.Linear(4096, out_dim)
-        
-    def forward(self, x):
-        x = self.conv(x)  # bs, 4096
-        residual = x
-        for lin in self.lins:
-            x = lin(x)
-            x += residual
-            residual = x
         x = self.lin1(x)
         return x
 
@@ -478,3 +435,55 @@ class BrainSD(StableDiffusionImageVariationPipeline):
         # return StableDiffusionPipelineOutput(images=image)
 
         return image
+
+class Voxel2StableDiffusionModel(torch.nn.Module):
+    def __init__(self, in_dim=15724, h=4096, n_blocks=2):
+        super().__init__()
+        self.lin0 = nn.Sequential(
+            nn.Linear(in_dim, h, bias=False),
+            nn.SiLU(inplace=True),
+            nn.BatchNorm1d(h),
+            nn.Dropout(0.5),
+        )
+
+        self.mlp = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(h, h, bias=False),
+                nn.SiLU(inplace=True),
+                nn.BatchNorm1d(h),
+                nn.Dropout(0.15)
+            ) for _ in range(n_blocks)
+        ])
+
+        # option 1  -> 124.56M
+        self.lin1 = nn.Linear(h, 4096, bias=True)
+        self.upsampler = Decoder(
+            in_channels=64,
+            out_channels=4,
+            up_block_types=["UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D"],
+            block_out_channels=[64, 128, 256, 256],
+            layers_per_block=1,
+        )
+
+        # option2  -> 132.52M
+        # self.lin1 = nn.Linear(h, 1024, bias=True)
+        # self.upsampler = Decoder(
+        #     in_channels=64,
+        #     out_channels=4,
+        #     up_block_types=["UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D", "UpDecoderBlock2D"],
+        #     block_out_channels=[64, 128, 256, 256, 512],
+        #     layers_per_block=1,
+        # )
+
+    def forward(self, x):
+        x = self.lin0(x)
+        residual = x
+        for res_block in self.mlp:
+            x = res_block(x)
+            x += residual
+            residual = x
+        x = x.reshape(len(x), -1)
+        x = self.lin1(x)  # bs, 4096
+
+        x = x.reshape(x.shape[0], -1, 8, 8).contiguous()  # bs, 64, 8, 8
+        return self.upsampler(x)
