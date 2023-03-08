@@ -107,12 +107,12 @@ if is_master:
     with open(os.path.join(outdir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=2)
 
-print('Creating Clipper...')
+if is_master: print('Creating Clipper...')
 # Don't L2 norm the extracted CLIP embeddings since we want the prior 
 # to learn un-normed embeddings for usage with the SD image variation pipeline.
 clip_extractor = Clipper(clip_variant, clamp_embs=clamp_embs, norm_embs=False, device=device)
 
-print('Creating voxel2clip...')
+if is_master: print('Creating voxel2clip...')
 voxel2clip_arch = voxel2clip_kwargs.pop('arch')
 if voxel2clip_arch == 'brainnet':
     voxel2clip = BrainNetwork(**voxel2clip_kwargs)
@@ -129,10 +129,10 @@ elif voxel2clip_arch == '3dconv-simple':
     voxel2clip = SimpleVoxel3dConvEncoder(**voxel2clip_kwargs)
 else:
     raise Exception(f"Unknown voxel2clip_arch: {voxel2clip_arch}")
-print(voxel2clip)
-utils.count_params(voxel2clip)
+if is_master: print(voxel2clip)
+if is_master: utils.count_params(voxel2clip)
 
-print('Creating diffusion prior...')
+if is_master: print('Creating diffusion prior...')
 if not prior_kwargs['pretrained']:
     # same as DALLE2-pytorch
     prior_network = DiffusionPriorNetwork(
@@ -164,10 +164,10 @@ if distributed:
 else:
     diffusion_prior = diffusion_prior.to(device)
 
-utils.count_params(diffusion_prior)
+if is_master: utils.count_params(diffusion_prior)
 
 if n_samples_save > 0:
-    print('Creating SD image variation pipeline...')
+    if is_master: print('Creating SD image variation pipeline...')
 
     def get_sd_pipe(path_or_name):
         return BrainSD.from_pretrained(
@@ -182,7 +182,7 @@ if n_samples_save > 0:
         # try to get local copy, removes a network call to HF that can fail when lots of processes make it all at once
         sd_pipe = get_sd_pipe("/admin/home-jimgoo/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc/")
     except:
-        print('Downloading SD image variation pipeline...')
+        if is_master: print('Downloading SD image variation pipeline...')
         sd_pipe = get_sd_pipe("lambdalabs/sd-image-variations-diffusers")
 
     # freeze everything, we're just using this for inference
@@ -291,7 +291,7 @@ if use_mixco:
     contrast_loss = utils.mixco_nce
 else:
     contrast_loss = InfoNCE()
-print('contrast_loss', contrast_loss)
+if is_master: print('contrast_loss', contrast_loss)
 
 # weight for prior's MSE loss term
 if alpha_schedule == 'constant':
@@ -310,7 +310,6 @@ if wandb_log:
             name=wandb_run_name,
             config=config,
             notes=wandb_notes,
-            entity="jimgoo",
         )
 
 # get first batches (used for generating samples with SD)
@@ -399,8 +398,8 @@ for epoch in progress_bar:
             # with alpha=0.01 we'll have something like .01*300 + .99*3 = 3 + 3
             loss = alpha * loss + (1-alpha) * loss_nce
 
-            print('train_i', train_i, 'voxel.shape', voxel.shape, 
-                'epoch', epoch, 'local_rank', local_rank, 'loss', loss, flush=True)
+            # print('train_i', train_i, 'voxel.shape', voxel.shape, 
+            #     'epoch', epoch, 'local_rank', local_rank, 'loss', loss, flush=True)
 
             losses.append(loss.item())
             lrs.append(optimizer.param_groups[0]['lr'])
