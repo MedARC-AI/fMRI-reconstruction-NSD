@@ -142,6 +142,7 @@ def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distri
             probs = probs_all
 
         loss = -(brain_clip.log_softmax(-1) * probs).sum(-1).mean()
+        print('mixco loss: ', loss.item())
         return loss
     else:
         return F.cross_entropy(brain_clip, torch.arange(brain_clip.shape[0]).to(brain_clip.device))
@@ -274,7 +275,7 @@ def get_dataloaders(
     cache_dir="/tmp/wds-cache",
     n_cache_recs=0,
     voxels_key="nsdgeneral.npy",
-    val_batch_size=None
+    val_batch_size=None,
 ):
     print("Getting dataloaders...")
     train_url_hf, val_url_hf = get_huggingface_urls()
@@ -306,11 +307,15 @@ def get_dataloaders(
     num_batches = math.floor(num_train / global_batch_size)
     num_worker_batches = math.floor(num_batches / num_workers)
 
+    if val_batch_size is None:
+        val_batch_size = batch_size
+
     print("train_url", train_url)
     print("val_url", val_url)
     print("num_devices", num_devices)
     print("num_workers", num_workers)
     print("batch_size", batch_size)
+    print("val_batch_size", val_batch_size)
     print("global_batch_size", global_batch_size)
     print("num_worker_batches", num_worker_batches)
     print('num_train', num_train)
@@ -335,7 +340,7 @@ def get_dataloaders(
 
     # can pass to .shuffle `rng=random.Random(42)` to maybe get deterministic shuffling
     train_data = wds.WebDataset(train_url, resampled=True, cache_dir=cache_dir, nodesplitter=wds.split_by_node)\
-        .shuffle(500, initial=500)\
+        .shuffle(500, initial=500, rng=random.Random(42))\
         .decode("torch")\
         .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
         .to_tuple("voxels", image_var, "__key__")\
@@ -351,7 +356,7 @@ def get_dataloaders(
     
     # Validation
     # use only one GPU
-    global_batch_size = batch_size if val_batch_size is None else val_batch_size
+    global_batch_size = val_batch_size
     num_workers = 1
 
     num_batches = math.ceil(num_val / global_batch_size)
@@ -371,7 +376,7 @@ def get_dataloaders(
         .decode("torch")\
         .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
         .to_tuple("voxels", image_var, "__key__")\
-        .batched(batch_size, partial=True)\
+        .batched(val_batch_size, partial=True)\
         .with_epoch(num_worker_batches)
     
     val_dl = wds.WebLoader(val_data, num_workers=num_workers,
