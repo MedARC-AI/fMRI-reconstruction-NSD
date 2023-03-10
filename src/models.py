@@ -265,7 +265,7 @@ class BrainDiffusionPrior(DiffusionPrior):
         return loss, pred, text_embed
    
     @staticmethod
-    def from_pretrained(net_kwargs={}, prior_kwargs={}):
+    def from_pretrained(net_kwargs={}, prior_kwargs={}, voxel2clip_path=None):
         # "https://huggingface.co/nousr/conditioned-prior/raw/main/vit-l-14/aesthetic/prior_config.json"
         config_url = "checkpoints/prior_config.json"
         config = json.load(open(config_url))
@@ -293,6 +293,13 @@ class BrainDiffusionPrior(DiffusionPrior):
         # I don't think these get used if `cond_drop_prob = 0` though (which is the default here)
         keys = diffusion_prior.load_state_dict(ckpt, strict=False)
         # print("missing keys in prior checkpoint (probably ok)", keys.missing_keys)
+
+        if voxel2clip_path:
+            # load the voxel2clip weights
+            ckpt = torch.load(voxel2clip_path, map_location=torch.device('cpu'))
+            if 'model_state_dict' in ckpt:
+                ckpt = ckpt['model_state_dict']
+            diffusion_prior.voxel2clip.load_state_dict(ckpt)
         
         return diffusion_prior
 

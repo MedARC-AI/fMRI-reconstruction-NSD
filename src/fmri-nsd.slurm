@@ -27,12 +27,13 @@ config/1D_combo.py \
 --batch_size=64 \
 --val_batch_size=300 \
 --wandb_log=True \
---wandb_notes='1D e2e (8 GPUs)' \
---wandb_project='fMRI-reconstruction-NSD' \
---outdir=../train_logs/models/prior-w-voxel2clip/1D_combo \
+--wandb_notes='1D e2e (8 GPUs) with pretrained prior AND voxel2clip, MSE loss only' \
+--outdir=../train_logs/models/prior-w-voxel2clip/1D_combo-MSE-only \
 --remote_data=True \
 --cache_dir='/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d' \
 --n_samples_save=16 \
 --sample_interval=10 \
 --use_mixco=False \
-&> /fsx/jimgoo/logs/log-1D.txt
+--voxel2clip_path='checkpoints/clip_image_vitL_2stage_mixco_lotemp_125ep_subj01_best.pth' \
+--combine_losses=False \
+&> /fsx/jimgoo/logs/log.txt

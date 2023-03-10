@@ -17,6 +17,7 @@ from models import Clipper
 import json
 from torchmetrics.image.fid import FrechetInceptionDistance
 import traceback
+from glob import glob
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -708,3 +709,27 @@ def reconstruct_from_clip(
         for i in range(num_xaxis_subplots):
             ax[im][i].axis('off')
     return fig
+
+def save_augmented_images(imgs, keys, path):
+    """
+    For saving augmented images generated with SD image variation pipeline.
+    """
+    assert imgs.ndim == 4
+    # batch, channel, height, width
+    assert imgs.shape[0] == len(keys)
+
+    to_pil = transforms.ToPILImage()    
+
+    for i in range(imgs.shape[0]):
+        img = imgs[i]
+        img = to_pil(img)
+
+        # make a directory for each key
+        key_dir = os.path.join(path, keys[i])
+        os.makedirs(key_dir, exist_ok=True)
+        
+        # count the number of images in the directory
+        count = len(glob(key_dir + '/*.jpg'))
+        
+        # save with an incremented count
+        img.save(os.path.join(key_dir, '%04d.jpg' % (count + 1)))

@@ -4,6 +4,7 @@ Train one single network that includes the voxel2clip mapper and the diffusion p
 import os
 import sys
 import json
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -27,6 +28,7 @@ from dalle2_pytorch import DiffusionPriorNetwork
 import utils
 from models import Clipper, BrainNetwork, BrainDiffusionPrior, BrainSD
 from model3d import NewVoxel3dConvEncoder, SimpleVoxel3dConvEncoder
+from diffusers import UniPCMultistepScheduler
 
 # -----------------------------------------------------------------------------
 # params for this model
@@ -44,15 +46,21 @@ prior_kwargs = dict(
     network_kwargs=dict(),
     prior_kwargs=dict(),
 )
+voxel2clip_path = '' # ckpt path for voxel2clip model
 voxel_dims = 1 # (1, 3)
 use_mixco = False # use mixco on the voxels
 n_samples_save = 8 # how many SD samples from train and val to save
 sample_interval = 1 # after how many epochs to save samples
+save_at_end = False # sample images and save at end of training only
 remote_data = False # pull data from huggingface if True
 data_commit = '9947586218b6b7c8cab804009ddca5045249a38d' # only applies when remote_data=True
-cache_dir = "/tmp/wds-cache"
-# cache_dir = '/fsx/proj-medarc/fmri/natural-scenes-dataset/9947586218b6b7c8cab804009ddca5045249a38d'
+cache_dir = "/tmp/wds-cache" # for WebDatasets
 n_cache_recs = 0
+combine_models = True # combine voxel2clip and prior into one model and train both end to end
+combine_losses = True # when combine_models=True, use two terms in the loss, NCE and MSE
+clip_aug_mode = 'none' # ('none', 'x', 'y')
+clip_aug_prob = 0.03 # prob of applying augmentation to a batch
+sd_scheduler = 'pndms' # scheduler for SD image variation pipeline ('pndms', 'unipcm')
 # -----------------------------------------------------------------------------
 # params for all models
 seed = 0
@@ -66,11 +74,9 @@ wandb_log = False
 wandb_project = 'fMRI-reconstruction-NSD'
 wandb_run_name = ''
 wandb_notes = ''
-first_batch = False
-ckpt_saving = True
-ckpt_interval = None
-save_at_end = False
-# outdir = os.path.expanduser(f'~/data/neuro/models/{model_name}/test')
+first_batch = False # use only the first batch of training and validation data
+ckpt_saving = True # enables checkpoint saving
+ckpt_interval = 0 # after how many epochs to save a checkpoint (0 = never, will only save best one)
 outdir = f'../train_logs/{model_name}/test'
 
 # -----------------------------------------------------------------------------
@@ -96,6 +102,9 @@ assert n_samples_save <= batch_size * 4
 
 if n_samples_save > 0:
     assert n_samples_save >= 2, 'FID will fail if n_samples_save < 2'
+
+if combine_losses:
+    assert combine_models, 'combine_losses=True requires combine_models=True'
 
 # need non-deterministic CuDNN for conv3D to work
 utils.seed_everything(seed + local_rank, cudnn_deterministic=False)
@@ -132,6 +141,19 @@ else:
 if is_master: print(voxel2clip)
 if is_master: utils.count_params(voxel2clip)
 
+if not combine_models:
+    voxel2clip.to(device)
+
+    # load voxel2clip model weights
+    ckpt = torch.load(voxel2clip_path, map_location=device)
+    if 'model_state_dict' in ckpt:
+        ckpt = ckpt['model_state_dict']
+    voxel2clip.load_state_dict(ckpt)
+
+    # freeze when not combining models
+    voxel2clip.eval()
+    voxel2clip.requires_grad_(False)
+
 if is_master: print('Creating diffusion prior...')
 if not prior_kwargs['pretrained']:
     # same as DALLE2-pytorch
@@ -154,8 +176,9 @@ else:
         dict(
             condition_on_text_encodings=False,
             timesteps=1000,
-            voxel2clip=voxel2clip,
+            voxel2clip=voxel2clip if combine_models else None,
         ),
+        voxel2clip_path=voxel2clip_path if combine_models else None,
     )
 
 if distributed:
@@ -180,7 +203,11 @@ if n_samples_save > 0:
 
     try:
         # try to get local copy, removes a network call to HF that can fail when lots of processes make it all at once
-        sd_pipe = get_sd_pipe("/admin/home-jimgoo/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc/")
+        sd_pipe = get_sd_pipe(
+            os.path.join(
+                os.path.expanduser('~'), 
+                ".cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc/"
+            ))
     except:
         if is_master: print('Downloading SD image variation pipeline...')
         sd_pipe = get_sd_pipe("lambdalabs/sd-image-variations-diffusers")
@@ -195,6 +222,16 @@ if n_samples_save > 0:
     sd_pipe.image_encoder.eval()
     sd_pipe.image_encoder.requires_grad_(False)
     assert sd_pipe.image_encoder.training == False
+
+    if sd_scheduler == 'pndms':
+        # this is the default
+        pass
+    elif sd_scheduler == 'unipcm':
+        sd_pipe.scheduler = UniPCMultistepScheduler.from_config(sd_pipe.scheduler.config)
+    else:
+        raise ValueError(f"Unknown sd_scheduler: {sd_scheduler}")
+    
+    if is_master: print('sd_pipe.scheduler', sd_pipe.scheduler)
 
     # disable progress bar
     sd_pipe.set_progress_bar_config(disable=True)
@@ -301,16 +338,18 @@ elif alpha_schedule == 'linear':
 else:
     raise ValueError(f'unknown alpha_schedule: {alpha_schedule}')
 
-if wandb_log:
+# for Atom's loss
+epoch_temps = np.linspace(0.004, 0.0075, num_epochs-int(0.5*num_epochs), endpoint=True)
+
+if wandb_log and is_master:
     import wandb
-    if is_master:
-        wandb.init(
-            # set the wandb project where this run will be logged
-            project=wandb_project,
-            name=wandb_run_name,
-            config=config,
-            notes=wandb_notes,
-        )
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project=wandb_project,
+        name=wandb_run_name,
+        config=config,
+        notes=wandb_notes,
+    )
 
 # get first batches (used for generating samples with SD)
 for train_i, (voxel0, image0, key0) in enumerate(train_dl):
@@ -325,9 +364,6 @@ if first_batch:
     # val_dl = [(val_voxel0[:bs], val_image0[:bs], val_key0[:bs])]
     train_dl = [(voxel0, image0, key0)]
     val_dl = [(val_voxel0, val_image0, val_key0)]
-
-# for Atom's loss
-epoch_temps = np.linspace(0.004, 0.0075, num_epochs-int(0.5*num_epochs), endpoint=True)
 
 # feed text and images into diffusion prior network
 progress_bar = tqdm(range(epoch, num_epochs), desc='train loop', disable=(distributed and local_rank != 0))
@@ -348,6 +384,9 @@ for epoch in progress_bar:
     loss_prior_sum = 0.
     val_loss_nce_sum = 0.
     val_loss_prior_sum = 0.
+    loss_on_aug = []
+    loss_off_aug = []
+    image_aug = None
 
     alpha = alphas[epoch]
     epoch_temp = epoch_temps[epoch - int(0.5*num_epochs)]
@@ -367,36 +406,110 @@ for epoch in progress_bar:
             
             if use_mixco:
                 voxel, perm, betas, select = utils.mixco(voxel)
+            
+            if combine_models:
+                # loss here is MSE for the prior, clip_voxels are voxel2clip outputs
+                loss, pred, clip_voxels = diffusion_prior(image_embed=clip_image, voxel=voxel)
+                utils.check_loss(loss)
 
-            loss, pred, clip_voxels = diffusion_prior(image_embed=clip_image, voxel=voxel)
-            utils.check_loss(loss)
+                if combine_losses:
+                    # combine losses for contrastive learned voxel2clip mapper and the prior
+                    if use_mixco:
+                        if epoch < int(0.5*num_epochs):
+                            loss_nce = contrast_loss(
+                                nn.functional.normalize(clip_voxels, dim=-1), 
+                                nn.functional.normalize(clip_image, dim=-1),
+                                temp=0.006, perm=perm, betas=betas, select=select,
+                            )
+                        else:
+                            loss_nce = utils.soft_clip_loss(
+                                nn.functional.normalize(clip_voxels, dim=-1), 
+                                nn.functional.normalize(clip_image, dim=-1),
+                                temp=epoch_temp,
+                            )
+                    else:
+                        loss_nce = contrast_loss(
+                            nn.functional.normalize(clip_voxels, dim=-1), 
+                            nn.functional.normalize(clip_image, dim=-1),
+                        )
+                    utils.check_loss(loss_nce)
 
-            if use_mixco:
-                if epoch < int(0.5*num_epochs):
-                    loss_nce = contrast_loss(
-                        nn.functional.normalize(clip_voxels, dim=-1), 
-                        nn.functional.normalize(clip_image, dim=-1),
-                        temp=0.006, perm=perm, betas=betas, select=select,
-                    )
+                    loss_nce_sum += loss_nce.item()
+                    loss_prior_sum += loss.item()
+
+                    # MSE and NCE are weighted equally at the beginning,
+                    # with alpha=0.01 we'll have something like .01*300 + .99*3 = 3 + 3
+                    loss = alpha * loss + (1-alpha) * loss_nce
                 else:
-                    loss_nce = utils.soft_clip_loss(
-                        nn.functional.normalize(clip_voxels, dim=-1), 
-                        nn.functional.normalize(clip_image, dim=-1),
-                        temp=epoch_temp,
-                    )
+                    loss_prior_sum += loss.item()
             else:
-                loss_nce = contrast_loss(
-                    nn.functional.normalize(clip_voxels, dim=-1), 
-                    nn.functional.normalize(clip_image, dim=-1),
-                )
-            utils.check_loss(loss_nce)
+                # don't train end to end, just use the frozen voxel2clip to get clip_voxels
+                clip_voxels = voxel2clip(voxel)
+                
+                ## can't go higher than 32 due to memory
+                # aug_bs = 32
+                # clip_voxels = clip_voxels[:aug_bs]
+                # clip_image = clip_image[:aug_bs]
+                # image = image[:aug_bs]
+                # key = key[:aug_bs]
 
-            loss_nce_sum += loss_nce.item()
-            loss_prior_sum += loss.item()
+                if clip_aug_mode == 'x':
+                    # the target y is fixed, and we will change the input x
+                    if random.random() < clip_aug_prob:
+                        print('Augmenting x', flush=True)
+                        # get an image variation
+                        with torch.inference_mode():
+                            image_aug = sd_pipe(
+                                image=image,
+                                width=256,
+                                height=256,
+                                num_inference_steps=30,
+                            )
+                        # utils.save_augmented_images(image_aug, key,
+                        #                             '/fsx/proj-medarc/fmri/augmented-images/type-x/')
 
-            # MSE and NCE are weighted equally at the beginning,
-            # with alpha=0.01 we'll have something like .01*300 + .99*3 = 3 + 3
-            loss = alpha * loss + (1-alpha) * loss_nce
+                        # get the CLIP embedding for the variation and use it for x
+                        clip_aug = clip_extractor.embed_image(image_aug).float()
+                        # rescale clip embeddings to have norm similar to brain embeddings
+                        clip_aug = F.normalize(clip_aug, dim=-1) * clip_voxels.norm(p=2, dim=-1).reshape(-1, 1)
+
+                        loss, pred, _ = diffusion_prior(text_embed=clip_aug, image_embed=clip_image)
+                        loss_on_aug.append(loss.item())
+                    else:
+                        loss, pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_image)
+                        loss_off_aug.append(loss.item())
+
+                elif clip_aug_mode == 'y':
+                    # the input x is fixed, and we will change the target y
+                    if random.random() < clip_aug_prob:
+                        print('Augmenting y', flush=True)
+                        _, clip_pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_image)
+
+                        # get an image variation
+                        with torch.inference_mode():
+                            image_aug = sd_pipe(
+                                # duplicate the embedding to serve classifier free guidance
+                                image_embeddings=torch.cat(
+                                    [torch.zeros_like(clip_pred), clip_pred]
+                                ).unsqueeze(1),
+                                width=256,
+                                height=256,
+                                num_inference_steps=30,
+                            )
+                            # utils.save_augmented_images(image_aug, key,
+                            #                             '/fsx/proj-medarc/fmri/augmented-images/type-y/')
+
+                        # get the CLIP embedding for the variation and use it for y
+                        clip_aug = clip_extractor.embed_image(image_aug).float()
+
+                        loss, pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_aug)
+                        loss_on_aug.append(loss.item())
+                    else:
+                        loss, pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_image)
+                        loss_off_aug.append(loss.item())
+                else:
+                    loss, pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_image)
+                utils.check_loss(loss)
 
             # print('train_i', train_i, 'voxel.shape', voxel.shape, 
             #     'epoch', epoch, 'local_rank', local_rank, 'loss', loss, flush=True)
@@ -435,35 +548,44 @@ for epoch in progress_bar:
     
                 with torch.cuda.amp.autocast(dtype=torch.float32):
                     clip_image = clip_extractor.embed_image(image).float()
-                    loss, pred, clip_voxels = diffusion_prior(image_embed=clip_image, voxel=voxel) \
-                        if not distributed else diffusion_prior.module(image_embed=clip_image, voxel=voxel)
-                    utils.check_loss(loss)
+                    if combine_models:
+                        loss, pred, clip_voxels = diffusion_prior(image_embed=clip_image, voxel=voxel) \
+                            if not distributed else diffusion_prior.module(image_embed=clip_image, voxel=voxel)
+                        utils.check_loss(loss)
 
-                    if use_mixco:
-                        if epoch < int(0.5*num_epochs):
-                            loss_nce = contrast_loss(
-                                nn.functional.normalize(clip_voxels, dim=-1), 
-                                nn.functional.normalize(clip_image, dim=-1),
-                                temp=0.006,
-                            )
+                        if combine_losses:
+                            if use_mixco:
+                                if epoch < int(0.5*num_epochs):
+                                    loss_nce = contrast_loss(
+                                        nn.functional.normalize(clip_voxels, dim=-1), 
+                                        nn.functional.normalize(clip_image, dim=-1),
+                                        temp=0.006,
+                                    )
+                                else:
+                                    loss_nce = utils.soft_clip_loss(
+                                        nn.functional.normalize(clip_voxels, dim=-1), 
+                                        nn.functional.normalize(clip_image, dim=-1),
+                                        temp=epoch_temp,
+                                    )
+                            else:
+                                loss_nce = contrast_loss(
+                                    nn.functional.normalize(clip_voxels, dim=-1), 
+                                    nn.functional.normalize(clip_image, dim=-1),
+                                )
+                            
+                            utils.check_loss(loss_nce)
+
+                            val_loss_nce_sum += loss_nce.item()
+                            val_loss_prior_sum += loss.item()
+
+                            val_loss = alpha * loss + (1-alpha) * loss_nce
                         else:
-                            loss_nce = utils.soft_clip_loss(
-                                nn.functional.normalize(clip_voxels, dim=-1), 
-                                nn.functional.normalize(clip_image, dim=-1),
-                                temp=epoch_temp,
-                            )
+                            val_loss = loss
+                            val_loss_prior_sum += loss.item()
                     else:
-                        loss_nce = contrast_loss(
-                            nn.functional.normalize(clip_voxels, dim=-1), 
-                            nn.functional.normalize(clip_image, dim=-1),
-                        )
-                    
-                    utils.check_loss(loss_nce)
-
-                    val_loss_nce_sum += loss_nce.item()
-                    val_loss_prior_sum += loss.item()
-
-                    val_loss = alpha * loss + (1-alpha) * loss_nce
+                        clip_voxels = voxel2clip(voxel)
+                        val_loss, pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_image) \
+                            if not distributed else diffusion_prior.module(text_embed=clip_voxels, image_embed=clip_image)
 
                     print('val_i', val_i, 'voxel.shape', voxel.shape, 
                         'epoch', epoch, 'loss', val_loss, flush=True)
@@ -505,7 +627,7 @@ for epoch in progress_bar:
                 print(f'not best - val_loss: {val_loss:.3f}, best_val_loss: {best_val_loss:.3f}', flush=True)
 
             # Save model checkpoint every `ckpt_interval` epochs or on the last epoch
-            if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
+            if (ckpt_interval > 0 and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
                 save_ckpt(f'epoch{epoch:03d}')
         else:
             print('Not saving checkpoints', flush=True)
@@ -528,6 +650,8 @@ for epoch in progress_bar:
             "val/loss_nce": val_loss_nce_sum / (val_i + 1),
             "val/loss_mse": val_loss_prior_sum / (val_i + 1),
             "train/alpha": alpha,
+            "train/loss_on_aug": np.mean(loss_on_aug),
+            "train/loss_off_aug": np.mean(loss_off_aug),
         }
 
         print('logs before sampling', logs, flush=True)
@@ -538,9 +662,15 @@ for epoch in progress_bar:
             if (not save_at_end) or (save_at_end and epoch == num_epochs - 1):
                 # training
                 print("Sampling training images...", flush=True)
+                
+                if combine_models:
+                    voxel2clip_ = diffusion_prior.voxel2clip if not distributed else diffusion_prior.module.voxel2clip
+                else:
+                    voxel2clip_ = voxel2clip
+
                 grids, train_fid = utils.sample_images(
                     clip_extractor, 
-                    diffusion_prior.voxel2clip if not distributed else diffusion_prior.module.voxel2clip, 
+                    voxel2clip_, 
                     sd_pipe, 
                     diffusion_prior if not distributed else diffusion_prior.module,
                     voxel0[:n_samples_save], 
@@ -558,7 +688,7 @@ for epoch in progress_bar:
                 print("Sampling validation images...", flush=True)
                 grids, val_fid = utils.sample_images(
                     clip_extractor, 
-                    diffusion_prior.voxel2clip if not distributed else diffusion_prior.module.voxel2clip, 
+                    voxel2clip_,
                     sd_pipe, 
                     diffusion_prior if not distributed else diffusion_prior.module,
                     val_voxel0[:n_samples_save], 
@@ -571,6 +701,20 @@ for epoch in progress_bar:
                     logs['val/samples'] = [wandb.Image(grid, caption=val_key0[i]) for i, grid in enumerate(grids)]
                 print('Computing val fid', flush=True)
                 logs['val/FID'] = val_fid.compute().item()
+
+                # # save augmented image pairs
+                # if n_aug_save > 0 and image_aug is not None:
+                #     assert image[0].shape == image_aug[0].shape, 'batch dim does not match'
+                #     # two rows: original, augmented
+                #     grid = utils.torch_to_Image(
+                #         make_grid(torch.cat((
+                #             nn.functional.interpolate(image[:n_aug_save], (256,256), mode="area", antialias=False),
+                #             nn.functional.interpolate(image_aug[:n_aug_save], (256,256), mode="area", antialias=False)
+                #         )), nrow=image[:n_aug_save].shape[0], padding=10)
+                #     )
+                #     grid.save(os.path.join(outdir, f'augmented-pairs.png'))
+                #     if wandb_log:
+                #         logs['train/samples-aug'] = wandb.Image(grid)
         
         if wandb_log:
             wandb.log(logs)
