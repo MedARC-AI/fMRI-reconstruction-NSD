@@ -17,6 +17,11 @@ from models import Clipper
 import json
 from torchmetrics.image.fid import FrechetInceptionDistance
 import traceback
+from PIL import Image, UnidentifiedImageError
+import traceback
+import requests
+import time
+import io
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -548,6 +553,78 @@ def save_ckpt(model, optimizer, losses, val_losses, lrs, epoch, tag, outdir):
 def cosine_anneal(start, end, steps):
     return end + (start - end)/2 * (1 + torch.cos(torch.pi*torch.arange(steps)/(steps-1)))
 
+
+size = (336, 336)  #  (1920//4, 1080//4)
+
+
+def pad_resize(im, size, fit=True):
+    ratio = (max if fit else min)((w / s for s, w in zip(im.size, size)))
+    im = im.resize([int(s * ratio) for s, w in zip(im.size, size)])
+    canvas = Image.new("RGB", size, (0, 0, 0))
+    canvas.paste(im, [w // 2 - s // 2 for s, w in zip(im.size, size)])
+    return canvas
+
+def crop_resize(im, size):
+    assert size[0] == size[1]  # unnecessary, bad design, why
+    w = size[0]
+    im = im.convert("RGB")
+    a, b = im.size
+    im = im.resize((w if a < b else int(a / b * w), w if b <= a else int(b / a * w)))
+    a, b = im.size
+    x, y = (a - w) // 2, (b - w) // 2
+    im = im.crop((x, y, x + w, y + w))
+    im = im.resize((w, w))
+    return im
+
+
+def img_result(result, size=size):
+    print(result)
+    try:
+        return crop_resize(  # pad_resize(
+            Image.open(
+            io.BytesIO(
+                requests.get(result["url"]).content  # , stream=True).raw
+            )
+        ).convert("RGB"), size)  # .resize(size).convert("RGB")
+    except (TypeError, requests.ConnectionError, UnidentifiedImageError):
+        traceback.print_exc()
+        return None  # Image.new("RGB", size)
+
+
+def query_laion(text=None, emb=None, num=50):
+    # Soft requirement
+    try:
+        from clip_retrieval.clip_client import ClipClient, Modality
+    except ImportError:
+        raise ValueError("Install clip-retrieval for retrieval support")
+    client = ClipClient(
+        url="https://knn.laion.ai/knn-service",
+        indice_name="laion5B-L-14",
+        aesthetic_score=9,
+        aesthetic_weight=0.15,
+        modality=Modality.IMAGE,
+        num_images=max(4, num * 2),
+        use_violence_detector=False,
+        use_safety_model=False
+    )
+
+    while True:
+        try:
+            while len(emb.shape) > 1:
+                emb = emb[0]
+            results = client.query(text=text, embedding_input=(emb / np.linalg.norm(emb)).tolist() if emb is not None else None)
+        except Exception:
+            traceback.print_exc()
+            time.sleep(1)
+            continue
+        break
+    if not results:
+        return Image.new("RGB", size)
+    imgs = [img_result(result) for result in results]
+    imgs = [im for im in imgs if im is not None][:num]
+    return imgs
+
+
 # below is alternative to sample_images that can also handle img2img reference
 @torch.no_grad()
 def reconstruct_from_clip(
@@ -565,6 +642,7 @@ def reconstruct_from_clip(
     timesteps = 1000,
     seed = 0,
     distributed = False,
+    retrieve=False,
 ):
     def decode_latents(latents):
         latents = 1 / 0.18215 * latents
@@ -623,6 +701,9 @@ def reconstruct_from_clip(
             else:
                 recons_per_sample = recons_per_brain
             if recons_per_sample == 0: continue
+            if embed_type == "brain" and retrieve:
+                image_retrieved = query_laion(emb=input_embedding.detach().cpu().numpy().flatten(), num=4)[0]
+                input_embedding = clip_extractor.embed_image(torch.from_numpy(np.asarray(image_retrieved)).permute(2, 0, 1).unsqueeze(0) / 255.).float()
             input_embedding = input_embedding.repeat(recons_per_sample, 1)
             input_embedding = torch.cat([torch.zeros_like(input_embedding), input_embedding]).unsqueeze(1).to(device)
 
@@ -707,4 +788,4 @@ def reconstruct_from_clip(
             ax[im][i].imshow(torch_to_Image(recon))
         for i in range(num_xaxis_subplots):
             ax[im][i].axis('off')
-    return fig
+    return fig, clip_recons, brain_recons
