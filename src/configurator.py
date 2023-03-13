@@ -22,7 +22,7 @@ from ast import literal_eval
 for arg in sys.argv[1:]:
     if '=' not in arg:
         # assume it's the name of a config file
-        assert not arg.startswith('--')
+        assert not arg.startswith('--'), 'arg must not start with "--" but got: ' + arg
         config_file = arg
         print(f"Overriding config with {config_file}:")
         with open(config_file) as f:
@@ -30,7 +30,7 @@ for arg in sys.argv[1:]:
         exec(open(config_file).read())
     else:
         # assume it's a --key=value argument
-        assert arg.startswith('--')
+        assert arg.startswith('--'), 'arg must start with "--" but got: ' + arg
         key, val = arg.split('=')
         key = key[2:]
         if key in globals():

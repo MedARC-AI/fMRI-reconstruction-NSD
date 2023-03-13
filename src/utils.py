@@ -22,6 +22,7 @@ import traceback
 import requests
 import time
 import io
+from glob import glob
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -281,8 +282,11 @@ def get_dataloaders(
     n_cache_recs=0,
     voxels_key="nsdgeneral.npy",
     val_batch_size=None,
+    to_tuple=["voxels", "images", "__key__"], # include trial with ["voxels", "images", "trial", "__key__"]
 ):
     print("Getting dataloaders...")
+    assert image_var == 'images'
+
     train_url_hf, val_url_hf = get_huggingface_urls()
     # default to huggingface urls if not specified
     if train_url is None:
@@ -348,7 +352,7 @@ def get_dataloaders(
         .shuffle(500, initial=500, rng=random.Random(42))\
         .decode("torch")\
         .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
-        .to_tuple("voxels", image_var, "__key__")\
+        .to_tuple(*to_tuple)\
         .batched(batch_size, partial=True)\
         .with_epoch(num_worker_batches)
 
@@ -380,7 +384,7 @@ def get_dataloaders(
     val_data = wds.WebDataset(val_url, resampled=True, cache_dir=cache_dir, nodesplitter=wds.split_by_node)\
         .decode("torch")\
         .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
-        .to_tuple("voxels", image_var, "__key__")\
+        .to_tuple(*to_tuple)\
         .batched(val_batch_size, partial=True)\
         .with_epoch(num_worker_batches)
     
@@ -394,7 +398,8 @@ def get_dataloaders(
 
 @torch.no_grad()
 def sample_images(
-    clip_extractor, brain_net, sd_pipe, diffusion_prior, voxel, img_input,
+    clip_extractor, brain_net, sd_pipe, diffusion_prior, voxel, img_input, 
+    annotations=None,
     num_inference_steps=50,
     clip_guidance_scale=7.5,
     vox_guidance_scale=7.5,
@@ -445,9 +450,17 @@ def sample_images(
 
         img_orig = img_input[[idx]]
         image = clip_extractor.resize_image(img_orig)
-        
+
         # Original clip embedding:
-        clip_emb = clip_extractor.embed_image(image)
+        if annotations is None:
+            clip_emb = clip_extractor.embed_image(image)
+        else:
+            print('Sampling with CLIP text guidance')
+            # random=False will use the first prompt here, which could be different from training 
+            # but should be the same during validation
+            annots = select_annotations(annotations[[idx]], random=False)
+            clip_emb = clip_extractor.embed_text(annots)
+
         # clip_emb = sd_pipe._encode_image(tform(image), device, 1, False).squeeze(1)
         norm_orig = clip_emb.norm().item()
 
@@ -458,7 +471,6 @@ def sample_images(
         # image_embeddings = nn.functional.normalize(image_embeddings, dim=-1) 
         # image_embeddings *= clip_emb[1].norm()/image_embeddings.norm() # note: this is cheating to equate norm scaling
 
-        # NOTE: requires fork of DALLE-pytorch for generator arg
         image_embeddings = diffusion_prior.p_sample_loop(image_embeddings.shape, 
                                             text_cond = dict(text_embed = image_embeddings), 
                                             cond_scale = 1., timesteps = prior_timesteps,
@@ -629,7 +641,7 @@ def query_laion(text=None, emb=None, num=50):
 @torch.no_grad()
 def reconstruct_from_clip(
     image, voxel,
-    diffusion_prior,
+    diffusion_priors,
     clip_extractor,
     unet, vae, noise_scheduler,
     img_lowlevel = None,
@@ -650,6 +662,9 @@ def reconstruct_from_clip(
         image = (image / 2 + 0.5).clamp(0, 1)
         return image
     
+    if not isinstance(diffusion_priors, list):
+        diffusion_priors = [diffusion_priors]
+    
     voxel=voxel[:n_samples_save]
     image=image[:n_samples_save]
     if img_lowlevel is not None:
@@ -667,24 +682,33 @@ def reconstruct_from_clip(
     clip_embeddings = clip_extractor.embed_image(image).float()
 
     # Encode voxels to CLIP space
-    if distributed:
-        diffusion_prior.module.voxel2clip.eval()
-        brain_clip_embeddings = diffusion_prior.module.voxel2clip(voxel.to(device).float())
-        # NOTE: requires fork of DALLE-pytorch for generator arg
-        brain_clip_embeddings = diffusion_prior.module.p_sample_loop(brain_clip_embeddings.shape, 
-                                            text_cond = dict(text_embed = brain_clip_embeddings), 
-                                            cond_scale = 1., timesteps = timesteps, #1000 timesteps used from nousr pretraining
-                                            generator=generator
-                                            )
-    else:
-        diffusion_prior.voxel2clip.eval()
-        brain_clip_embeddings = diffusion_prior.voxel2clip(voxel.to(device).float())
-        # NOTE: requires fork of DALLE-pytorch for generator arg
-        brain_clip_embeddings = diffusion_prior.p_sample_loop(brain_clip_embeddings.shape, 
-                                            text_cond = dict(text_embed = brain_clip_embeddings), 
-                                            cond_scale = 1., timesteps = timesteps, #1000 timesteps used from nousr pretraining
-                                            generator=generator
-                                            )
+    brain_clip_embeddings_sum = None
+    for diffusion_prior in diffusion_priors:
+        if distributed:
+            diffusion_prior.module.voxel2clip.eval()
+            brain_clip_embeddings = diffusion_prior.module.voxel2clip(voxel.to(device).float())
+            # NOTE: requires fork of DALLE-pytorch for generator arg
+            brain_clip_embeddings = diffusion_prior.module.p_sample_loop(brain_clip_embeddings.shape, 
+                                                text_cond = dict(text_embed = brain_clip_embeddings), 
+                                                cond_scale = 1., timesteps = timesteps, #1000 timesteps used from nousr pretraining
+                                                generator=generator
+                                                )
+        else:
+            diffusion_prior.voxel2clip.eval()
+            brain_clip_embeddings = diffusion_prior.voxel2clip(voxel.to(device).float())
+            # NOTE: requires fork of DALLE-pytorch for generator arg
+            brain_clip_embeddings = diffusion_prior.p_sample_loop(brain_clip_embeddings.shape, 
+                                                text_cond = dict(text_embed = brain_clip_embeddings), 
+                                                cond_scale = 1., timesteps = timesteps, #1000 timesteps used from nousr pretraining
+                                                generator=generator
+                                                )
+        if brain_clip_embeddings_sum is None:
+            brain_clip_embeddings_sum = brain_clip_embeddings
+        else:
+            brain_clip_embeddings_sum += brain_clip_embeddings
+
+    # average embeddings for all diffusion priors
+    brain_clip_embeddings = brain_clip_embeddings_sum / len(diffusion_priors)
 
     # Now enter individual image processing loop
     clip_recons = None
@@ -789,3 +813,51 @@ def reconstruct_from_clip(
         for i in range(num_xaxis_subplots):
             ax[im][i].axis('off')
     return fig, clip_recons, brain_recons
+
+def save_augmented_images(imgs, keys, path):
+    """
+    For saving augmented images generated with SD image variation pipeline.
+    """
+    assert imgs.ndim == 4
+    # batch, channel, height, width
+    assert imgs.shape[0] == len(keys)
+
+    to_pil = transforms.ToPILImage()    
+
+    for i in range(imgs.shape[0]):
+        img = imgs[i]
+        img = to_pil(img)
+
+        # make a directory for each key
+        key_dir = os.path.join(path, keys[i])
+        os.makedirs(key_dir, exist_ok=True)
+        
+        # count the number of images in the directory
+        count = len(glob(key_dir + '/*.jpg'))
+        
+        # save with an incremented count
+        img.save(os.path.join(key_dir, '%04d.jpg' % (count + 1)))
+
+def select_annotations(annots, random=False):
+    """
+    There are 5 annotations per image. Select one of them for each image.
+    """
+    for i, b in enumerate(annots):
+        t = ''
+        if random:
+            # select random non-empty annotation
+            while t == '':
+                rand = torch.randint(5, (1,1))[0][0]
+                t = b[0, rand]
+        else:
+            # select first non-empty annotation
+            for j in range(5):
+                if b[0, j] != '':
+                    t = b[0, j]
+                    break
+        if i == 0:
+            txt = np.array(t)
+        else:
+            txt = np.vstack((txt, t))
+    txt = txt.flatten()
+    return txt

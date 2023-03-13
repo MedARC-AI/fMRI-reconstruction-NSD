@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from torchvision import transforms
 import torch
@@ -60,8 +61,7 @@ class Clipper(torch.nn.Module):
         if self.norm_embs:
             clip_emb = nn.functional.normalize(clip_emb, dim=-1)
         return clip_emb
-        
-    
+
     def embed_text(self, text_samples):
         clip_text = clip.tokenize(text_samples).to(self.device)
         clip_text = self.clip.encode_text(clip_text)
@@ -70,7 +70,7 @@ class Clipper(torch.nn.Module):
         if self.norm_embs:
             clip_text = nn.functional.normalize(clip_text, dim=-1)
         return clip_text
-    
+
     def embed_curated_annotations(self, annots):
         for i,b in enumerate(annots):
             t = ''
@@ -265,9 +265,9 @@ class BrainDiffusionPrior(DiffusionPrior):
         return loss, pred, text_embed
    
     @staticmethod
-    def from_pretrained(net_kwargs={}, prior_kwargs={}):
+    def from_pretrained(net_kwargs={}, prior_kwargs={}, voxel2clip_path=None, ckpt_dir='./checkpoints'):
         # "https://huggingface.co/nousr/conditioned-prior/raw/main/vit-l-14/aesthetic/prior_config.json"
-        config_url = "checkpoints/prior_config.json"
+        config_url = os.path.join(ckpt_dir, "prior_config.json")
         config = json.load(open(config_url))
         
         config['prior']['net']['max_text_len'] = 256
@@ -285,7 +285,7 @@ class BrainDiffusionPrior(DiffusionPrior):
         diffusion_prior = BrainDiffusionPrior(net=diffusion_prior_network, clip=None, **kwargs).to(torch.device('cpu'))
         
         # 'https://huggingface.co/nousr/conditioned-prior/resolve/main/vit-l-14/aesthetic/best.pth'
-        ckpt_url = 'checkpoints/best.pth'
+        ckpt_url = os.path.join(ckpt_dir, 'best.pth')
         ckpt = torch.load(ckpt_url, map_location=torch.device('cpu'))
 
         # Note these keys will be missing (maybe due to an update to the code since training):
@@ -293,6 +293,13 @@ class BrainDiffusionPrior(DiffusionPrior):
         # I don't think these get used if `cond_drop_prob = 0` though (which is the default here)
         keys = diffusion_prior.load_state_dict(ckpt, strict=False)
         # print("missing keys in prior checkpoint (probably ok)", keys.missing_keys)
+
+        if voxel2clip_path:
+            # load the voxel2clip weights
+            ckpt = torch.load(voxel2clip_path, map_location=torch.device('cpu'))
+            if 'model_state_dict' in ckpt:
+                ckpt = ckpt['model_state_dict']
+            diffusion_prior.voxel2clip.load_state_dict(ckpt)
         
         return diffusion_prior
 
