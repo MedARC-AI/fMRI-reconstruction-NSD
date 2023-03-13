@@ -221,7 +221,6 @@ if n_samples_save > 0 or clip_aug_mode != 'none':
 
     sd_pipe.image_encoder.eval()
     sd_pipe.image_encoder.requires_grad_(False)
-    assert sd_pipe.image_encoder.training == False
 
     if sd_scheduler == 'pndms':
         # this is the default
@@ -285,6 +284,7 @@ train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
     n_cache_recs=n_cache_recs,
     voxels_key=voxels_key,
     val_batch_size=val_batch_size,
+    to_tuple=["voxels", "images", "trial", "__key__"],
 )
 
 optimizer = torch.optim.AdamW(diffusion_prior.parameters(), lr=initial_lr)
@@ -312,7 +312,7 @@ def save_ckpt(tag):
                     del state_dict[key]
         torch.save({
             'epoch': epoch,
-            'model_state_dict': diffusion_prior.state_dict(),
+            'model_state_dict': state_dict,
             'optimizer_state_dict': optimizer.state_dict(),
             'train_losses': losses,
             'val_losses': val_losses,

@@ -282,6 +282,7 @@ def get_dataloaders(
     n_cache_recs=0,
     voxels_key="nsdgeneral.npy",
     val_batch_size=None,
+    to_tuple=["voxels", "images", "__key__"], # include trial with ["voxels", "images", "trial", "__key__"]
 ):
     print("Getting dataloaders...")
     assert image_var == 'images'
@@ -351,7 +352,7 @@ def get_dataloaders(
         .shuffle(500, initial=500, rng=random.Random(42))\
         .decode("torch")\
         .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
-        .to_tuple("voxels", "images", "trial", "__key__")\
+        .to_tuple(*to_tuple)\
         .batched(batch_size, partial=True)\
         .with_epoch(num_worker_batches)
 
@@ -383,7 +384,7 @@ def get_dataloaders(
     val_data = wds.WebDataset(val_url, resampled=True, cache_dir=cache_dir, nodesplitter=wds.split_by_node)\
         .decode("torch")\
         .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
-        .to_tuple("voxels", "images", "trial", "__key__")\
+        .to_tuple(*to_tuple)\
         .batched(val_batch_size, partial=True)\
         .with_epoch(num_worker_batches)
     
@@ -640,7 +641,7 @@ def query_laion(text=None, emb=None, num=50):
 @torch.no_grad()
 def reconstruct_from_clip(
     image, voxel,
-    diffusion_prior,
+    diffusion_priors,
     clip_extractor,
     unet, vae, noise_scheduler,
     img_lowlevel = None,
@@ -661,6 +662,9 @@ def reconstruct_from_clip(
         image = (image / 2 + 0.5).clamp(0, 1)
         return image
     
+    if not isinstance(diffusion_priors, list):
+        diffusion_priors = [diffusion_priors]
+    
     voxel=voxel[:n_samples_save]
     image=image[:n_samples_save]
     if img_lowlevel is not None:
@@ -678,24 +682,33 @@ def reconstruct_from_clip(
     clip_embeddings = clip_extractor.embed_image(image).float()
 
     # Encode voxels to CLIP space
-    if distributed:
-        diffusion_prior.module.voxel2clip.eval()
-        brain_clip_embeddings = diffusion_prior.module.voxel2clip(voxel.to(device).float())
-        # NOTE: requires fork of DALLE-pytorch for generator arg
-        brain_clip_embeddings = diffusion_prior.module.p_sample_loop(brain_clip_embeddings.shape, 
-                                            text_cond = dict(text_embed = brain_clip_embeddings), 
-                                            cond_scale = 1., timesteps = timesteps, #1000 timesteps used from nousr pretraining
-                                            generator=generator
-                                            )
-    else:
-        diffusion_prior.voxel2clip.eval()
-        brain_clip_embeddings = diffusion_prior.voxel2clip(voxel.to(device).float())
-        # NOTE: requires fork of DALLE-pytorch for generator arg
-        brain_clip_embeddings = diffusion_prior.p_sample_loop(brain_clip_embeddings.shape, 
-                                            text_cond = dict(text_embed = brain_clip_embeddings), 
-                                            cond_scale = 1., timesteps = timesteps, #1000 timesteps used from nousr pretraining
-                                            generator=generator
-                                            )
+    brain_clip_embeddings_sum = None
+    for diffusion_prior in diffusion_priors:
+        if distributed:
+            diffusion_prior.module.voxel2clip.eval()
+            brain_clip_embeddings = diffusion_prior.module.voxel2clip(voxel.to(device).float())
+            # NOTE: requires fork of DALLE-pytorch for generator arg
+            brain_clip_embeddings = diffusion_prior.module.p_sample_loop(brain_clip_embeddings.shape, 
+                                                text_cond = dict(text_embed = brain_clip_embeddings), 
+                                                cond_scale = 1., timesteps = timesteps, #1000 timesteps used from nousr pretraining
+                                                generator=generator
+                                                )
+        else:
+            diffusion_prior.voxel2clip.eval()
+            brain_clip_embeddings = diffusion_prior.voxel2clip(voxel.to(device).float())
+            # NOTE: requires fork of DALLE-pytorch for generator arg
+            brain_clip_embeddings = diffusion_prior.p_sample_loop(brain_clip_embeddings.shape, 
+                                                text_cond = dict(text_embed = brain_clip_embeddings), 
+                                                cond_scale = 1., timesteps = timesteps, #1000 timesteps used from nousr pretraining
+                                                generator=generator
+                                                )
+        if brain_clip_embeddings_sum is None:
+            brain_clip_embeddings_sum = brain_clip_embeddings
+        else:
+            brain_clip_embeddings_sum += brain_clip_embeddings
+
+    # average embeddings for all diffusion priors
+    brain_clip_embeddings = brain_clip_embeddings_sum / len(diffusion_priors)
 
     # Now enter individual image processing loop
     clip_recons = None
@@ -826,6 +839,9 @@ def save_augmented_images(imgs, keys, path):
         img.save(os.path.join(key_dir, '%04d.jpg' % (count + 1)))
 
 def select_annotations(annots, random=False):
+    """
+    There are 5 annotations per image. Select one of them for each image.
+    """
     for i, b in enumerate(annots):
         t = ''
         if random:

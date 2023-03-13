@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from torchvision import transforms
 import torch
@@ -264,9 +265,9 @@ class BrainDiffusionPrior(DiffusionPrior):
         return loss, pred, text_embed
    
     @staticmethod
-    def from_pretrained(net_kwargs={}, prior_kwargs={}, voxel2clip_path=None):
+    def from_pretrained(net_kwargs={}, prior_kwargs={}, voxel2clip_path=None, ckpt_dir='./checkpoints'):
         # "https://huggingface.co/nousr/conditioned-prior/raw/main/vit-l-14/aesthetic/prior_config.json"
-        config_url = "checkpoints/prior_config.json"
+        config_url = os.path.join(ckpt_dir, "prior_config.json")
         config = json.load(open(config_url))
         
         config['prior']['net']['max_text_len'] = 256
@@ -284,7 +285,7 @@ class BrainDiffusionPrior(DiffusionPrior):
         diffusion_prior = BrainDiffusionPrior(net=diffusion_prior_network, clip=None, **kwargs).to(torch.device('cpu'))
         
         # 'https://huggingface.co/nousr/conditioned-prior/resolve/main/vit-l-14/aesthetic/best.pth'
-        ckpt_url = 'checkpoints/best.pth'
+        ckpt_url = os.path.join(ckpt_dir, 'best.pth')
         ckpt = torch.load(ckpt_url, map_location=torch.device('cpu'))
 
         # Note these keys will be missing (maybe due to an update to the code since training):
