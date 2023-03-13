@@ -279,6 +279,8 @@ def get_dataloaders(
     val_batch_size=None,
 ):
     print("Getting dataloaders...")
+    assert image_var == 'images'
+
     train_url_hf, val_url_hf = get_huggingface_urls()
     # default to huggingface urls if not specified
     if train_url is None:
@@ -344,7 +346,7 @@ def get_dataloaders(
         .shuffle(500, initial=500, rng=random.Random(42))\
         .decode("torch")\
         .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
-        .to_tuple("voxels", image_var, "__key__")\
+        .to_tuple("voxels", "images", "trial", "__key__")\
         .batched(batch_size, partial=True)\
         .with_epoch(num_worker_batches)
 
@@ -376,7 +378,7 @@ def get_dataloaders(
     val_data = wds.WebDataset(val_url, resampled=True, cache_dir=cache_dir, nodesplitter=wds.split_by_node)\
         .decode("torch")\
         .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
-        .to_tuple("voxels", image_var, "__key__")\
+        .to_tuple("voxels", "images", "trial", "__key__")\
         .batched(val_batch_size, partial=True)\
         .with_epoch(num_worker_batches)
     
@@ -390,7 +392,8 @@ def get_dataloaders(
 
 @torch.no_grad()
 def sample_images(
-    clip_extractor, brain_net, sd_pipe, diffusion_prior, voxel, img_input,
+    clip_extractor, brain_net, sd_pipe, diffusion_prior, voxel, img_input, 
+    annotations=None,
     num_inference_steps=50,
     clip_guidance_scale=7.5,
     vox_guidance_scale=7.5,
@@ -441,9 +444,17 @@ def sample_images(
 
         img_orig = img_input[[idx]]
         image = clip_extractor.resize_image(img_orig)
-        
+
         # Original clip embedding:
-        clip_emb = clip_extractor.embed_image(image)
+        if annotations is None:
+            clip_emb = clip_extractor.embed_image(image)
+        else:
+            print('Sampling with CLIP text guidance')
+            # random=False will use the first prompt here, which could be different from training 
+            # but should be the same during validation
+            annots = select_annotations(annotations[[idx]], random=False)
+            clip_emb = clip_extractor.embed_text(annots)
+
         # clip_emb = sd_pipe._encode_image(tform(image), device, 1, False).squeeze(1)
         norm_orig = clip_emb.norm().item()
 
@@ -454,7 +465,6 @@ def sample_images(
         # image_embeddings = nn.functional.normalize(image_embeddings, dim=-1) 
         # image_embeddings *= clip_emb[1].norm()/image_embeddings.norm() # note: this is cheating to equate norm scaling
 
-        # NOTE: requires fork of DALLE-pytorch for generator arg
         image_embeddings = diffusion_prior.p_sample_loop(image_embeddings.shape, 
                                             text_cond = dict(text_embed = image_embeddings), 
                                             cond_scale = 1., timesteps = prior_timesteps,
@@ -733,3 +743,24 @@ def save_augmented_images(imgs, keys, path):
         
         # save with an incremented count
         img.save(os.path.join(key_dir, '%04d.jpg' % (count + 1)))
+
+def select_annotations(annots, random=False):
+    for i, b in enumerate(annots):
+        t = ''
+        if random:
+            # select random non-empty annotation
+            while t == '':
+                rand = torch.randint(5, (1,1))[0][0]
+                t = b[0, rand]
+        else:
+            # select first non-empty annotation
+            for j in range(5):
+                if b[0, j] != '':
+                    t = b[0, j]
+                    break
+        if i == 0:
+            txt = np.array(t)
+        else:
+            txt = np.vstack((txt, t))
+    txt = txt.flatten()
+    return txt

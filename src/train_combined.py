@@ -1,11 +1,13 @@
 """
-Train one single network that includes the voxel2clip mapper and the diffusion prior.
+Train the diffusion prior and optionally train the voxel2clip model.
 """
 import os
 import sys
+import h5py
 import json
 import random
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,10 +39,12 @@ modality = "image" # ("image", "text")
 clip_variant = "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
 clamp_embs = False # clamp embeddings to (-1.5, 1.5)
 alpha_schedule = "constant" # ("constant", "linear") - alpha is weight the MSE DP loss
+# kwargs for the voxel2clip model
 voxel2clip_kwargs = dict(
     arch='brainnet',
     out_dim=768,
 )
+# kwargs for the diffusion prior model
 prior_kwargs = dict(
     pretrained=True,
     network_kwargs=dict(),
@@ -65,7 +69,7 @@ sd_scheduler = 'pndms' # scheduler for SD image variation pipeline ('pndms', 'un
 # params for all models
 seed = 0
 batch_size = 64
-val_batch_size = 64
+val_batch_size = 300
 num_epochs = 60
 lr_scheduler = 'cycle'
 initial_lr = 1e-3 #3e-5
@@ -91,14 +95,10 @@ if is_master:
     print('config:')
     print(json.dumps(config, indent=2))
 
-if modality == "text":
-    image_var = "trial"
-elif modality == "image":
-    image_var = "images"
-else:
-    raise Exception(f"Unknown modality: {modality}")
+assert modality in ("image", "text"), f"Unknown modality: {modality}"
+is_text = modality == "text"
 
-assert n_samples_save <= batch_size * 4
+assert n_samples_save <= batch_size, 'n_samples_save must be <= batch_size'
 
 if n_samples_save > 0:
     assert n_samples_save >= 2, 'FID will fail if n_samples_save < 2'
@@ -189,7 +189,7 @@ else:
 
 if is_master: utils.count_params(diffusion_prior)
 
-if n_samples_save > 0:
+if n_samples_save > 0 or clip_aug_mode != 'none':
     if is_master: print('Creating SD image variation pipeline...')
 
     def get_sd_pipe(path_or_name):
@@ -236,13 +236,6 @@ if n_samples_save > 0:
     # disable progress bar
     sd_pipe.set_progress_bar_config(disable=True)
 
-# # load COCO annotations curated in the same way as the mind_reader (Lin Sprague Singh) preprint
-# f = h5py.File('/scratch/gpfs/KNORMAN/nsdgeneral_hdf5/COCO_73k_subj_indices.hdf5', 'r')
-# subj01_order = f['subj01'][:]
-# f.close()
-# annots = np.load('/scratch/gpfs/KNORMAN/nsdgeneral_hdf5/COCO_73k_annots_curated.npy',allow_pickle=True)
-# subj01_annots = annots[subj01_order]
-
 if remote_data:
     # pull data directly from huggingface
     train_url, val_url = utils.get_huggingface_urls(data_commit)
@@ -258,6 +251,19 @@ else:
     val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/val/val_subj01_0.tar"
     meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/metadata_subj01.json"
 
+if is_text:
+    # load COCO annotations curated in the same way as the mind_reader (Lin Sprague Singh) preprint
+    h5_dir = '/fsx/proj-medarc/fmri/natural-scenes-dataset/'
+
+    # indices
+    f = h5py.File(os.path.join(h5_dir, 'COCO_73k_subj_indices.hdf5'), 'r')
+    subj01_order = f['subj01'][:]
+    f.close()
+
+    # annotations
+    subj01_annots = np.load(os.path.join(h5_dir, 'COCO_73k_annots_curated.npy'), allow_pickle=True)
+    subj01_annots = subj01_annots[subj01_order]
+
 # which to use for the voxels
 if voxel_dims == 1:
     voxels_key = 'nsdgeneral.npy'
@@ -270,7 +276,7 @@ num_devices = torch.cuda.device_count()
 num_workers = num_devices
 
 train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
-    batch_size, image_var,
+    batch_size, "images",
     num_workers=num_workers,
     train_url=train_url,
     val_url=val_url,
@@ -352,9 +358,9 @@ if wandb_log and is_master:
     )
 
 # get first batches (used for generating samples with SD)
-for train_i, (voxel0, image0, key0) in enumerate(train_dl):
+for train_i, (voxel0, image0, trial0, key0) in enumerate(train_dl):
     break
-for val_i, (val_voxel0, val_image0, val_key0) in enumerate(val_dl):
+for val_i, (val_voxel0, val_image0, val_trial0, val_key0) in enumerate(val_dl):
     break
 
 if first_batch:
@@ -362,8 +368,8 @@ if first_batch:
     # bs = batch_size
     # train_dl = [(voxel0[:bs], image0[:bs], key0[:bs])]
     # val_dl = [(val_voxel0[:bs], val_image0[:bs], val_key0[:bs])]
-    train_dl = [(voxel0, image0, key0)]
-    val_dl = [(val_voxel0, val_image0, val_key0)]
+    train_dl = [(voxel0, image0, trial0, key0)]
+    val_dl = [(val_voxel0, val_image0, val_trial0, val_key0)]
 
 # feed text and images into diffusion prior network
 progress_bar = tqdm(range(epoch, num_epochs), desc='train loop', disable=(distributed and local_rank != 0))
@@ -393,23 +399,31 @@ for epoch in progress_bar:
 
     keys = set()
 
-    for train_i, (voxel, image, key) in enumerate(train_dl):
+    for train_i, (voxel, image, trial, key) in enumerate(train_dl):
 
         optimizer.zero_grad()
-        
+
         image = image.to(device).float()
         voxel = voxel.to(device).float()
         keys.update(key)
-
+        
         with torch.cuda.amp.autocast(dtype=torch.float32):
-            clip_image = clip_extractor.embed_image(image).float()
             
-            if use_mixco:
+            if is_text:
+                # [bs, 1, 5]
+                # random=True means randomly select a non-empty annotation
+                annots = utils.select_annotations(subj01_annots[trial], random=True)
+                clip_target = clip_extractor.embed_text(annots).float()
+            else:
+                clip_target = clip_extractor.embed_image(image).float()
+            
+            if use_mixco and epoch < int(0.5*num_epochs):
+                # mixup augment the voxels
                 voxel, perm, betas, select = utils.mixco(voxel)
             
             if combine_models:
                 # loss here is MSE for the prior, clip_voxels are voxel2clip outputs
-                loss, pred, clip_voxels = diffusion_prior(image_embed=clip_image, voxel=voxel)
+                loss, pred, clip_voxels = diffusion_prior(image_embed=clip_target, voxel=voxel)
                 utils.check_loss(loss)
 
                 if combine_losses:
@@ -418,19 +432,19 @@ for epoch in progress_bar:
                         if epoch < int(0.5*num_epochs):
                             loss_nce = contrast_loss(
                                 nn.functional.normalize(clip_voxels, dim=-1), 
-                                nn.functional.normalize(clip_image, dim=-1),
+                                nn.functional.normalize(clip_target, dim=-1),
                                 temp=0.006, perm=perm, betas=betas, select=select,
                             )
                         else:
                             loss_nce = utils.soft_clip_loss(
                                 nn.functional.normalize(clip_voxels, dim=-1), 
-                                nn.functional.normalize(clip_image, dim=-1),
+                                nn.functional.normalize(clip_target, dim=-1),
                                 temp=epoch_temp,
                             )
                     else:
                         loss_nce = contrast_loss(
                             nn.functional.normalize(clip_voxels, dim=-1), 
-                            nn.functional.normalize(clip_image, dim=-1),
+                            nn.functional.normalize(clip_target, dim=-1),
                         )
                     utils.check_loss(loss_nce)
 
@@ -445,13 +459,6 @@ for epoch in progress_bar:
             else:
                 # don't train end to end, just use the frozen voxel2clip to get clip_voxels
                 clip_voxels = voxel2clip(voxel)
-                
-                ## can't go higher than 32 due to memory
-                # aug_bs = 32
-                # clip_voxels = clip_voxels[:aug_bs]
-                # clip_image = clip_image[:aug_bs]
-                # image = image[:aug_bs]
-                # key = key[:aug_bs]
 
                 if clip_aug_mode == 'x':
                     # the target y is fixed, and we will change the input x
@@ -473,17 +480,17 @@ for epoch in progress_bar:
                         # rescale clip embeddings to have norm similar to brain embeddings
                         clip_aug = F.normalize(clip_aug, dim=-1) * clip_voxels.norm(p=2, dim=-1).reshape(-1, 1)
 
-                        loss, pred, _ = diffusion_prior(text_embed=clip_aug, image_embed=clip_image)
+                        loss, pred, _ = diffusion_prior(text_embed=clip_aug, image_embed=clip_target)
                         loss_on_aug.append(loss.item())
                     else:
-                        loss, pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_image)
+                        loss, pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_target)
                         loss_off_aug.append(loss.item())
 
                 elif clip_aug_mode == 'y':
                     # the input x is fixed, and we will change the target y
                     if random.random() < clip_aug_prob:
                         print('Augmenting y', flush=True)
-                        _, clip_pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_image)
+                        _, clip_pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_target)
 
                         # get an image variation
                         with torch.inference_mode():
@@ -505,11 +512,13 @@ for epoch in progress_bar:
                         loss, pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_aug)
                         loss_on_aug.append(loss.item())
                     else:
-                        loss, pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_image)
+                        loss, pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_target)
                         loss_off_aug.append(loss.item())
                 else:
-                    loss, pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_image)
+                    loss, pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_target)
                 utils.check_loss(loss)
+                # loss here is MSE for the prior when not combining losses
+                loss_prior_sum += loss.item()
 
             # print('train_i', train_i, 'voxel.shape', voxel.shape, 
             #     'epoch', epoch, 'local_rank', local_rank, 'loss', loss, flush=True)
@@ -517,17 +526,17 @@ for epoch in progress_bar:
             losses.append(loss.item())
             lrs.append(optimizer.param_groups[0]['lr'])
             # similarity after prior diffusion
-            sims += F.cosine_similarity(clip_image, pred).mean().item()
+            sims += F.cosine_similarity(clip_target, pred).mean().item()
             # baseline similarity before prior diffusion
-            sims_base += F.cosine_similarity(clip_image, clip_voxels).mean().item()
+            sims_base += F.cosine_similarity(clip_target, clip_voxels).mean().item()
             # forward and backward top 1 accuracy
             labels = torch.arange(len(clip_voxels)).to(device)
             fwd_percent_correct += utils.topk(
-                utils.batchwise_cosine_similarity(clip_image, clip_voxels), labels, k=1
-            )
+                utils.batchwise_cosine_similarity(clip_target, clip_voxels), labels, k=1
+            ).item()
             bwd_percent_correct += utils.topk(
-                utils.batchwise_cosine_similarity(clip_voxels, clip_image), labels, k=1
-            )
+                utils.batchwise_cosine_similarity(clip_voxels, clip_target), labels, k=1
+            ).item()
 
         loss.backward()
         optimizer.step()
@@ -540,17 +549,24 @@ for epoch in progress_bar:
     if is_master:
         diffusion_prior.eval()
         keys = set()
-        for val_i, (voxel, image, key) in enumerate(val_dl):
+        for val_i, (voxel, image, trial, key) in enumerate(val_dl):
             with torch.no_grad():
                 image = image.to(device).float()
                 voxel = voxel.to(device).float()
                 keys.update(key)
     
                 with torch.cuda.amp.autocast(dtype=torch.float32):
-                    clip_image = clip_extractor.embed_image(image).float()
+                    if is_text:
+                        # [bs, 1, 5]
+                        # NOTE: not using random selection here to keep it consistent
+                        annots = utils.select_annotations(subj01_annots[trial], random=False)
+                        clip_target = clip_extractor.embed_text(annots).float()
+                    else:
+                        clip_target = clip_extractor.embed_image(image).float()
+
                     if combine_models:
-                        loss, pred, clip_voxels = diffusion_prior(image_embed=clip_image, voxel=voxel) \
-                            if not distributed else diffusion_prior.module(image_embed=clip_image, voxel=voxel)
+                        loss, pred, clip_voxels = diffusion_prior(image_embed=clip_target, voxel=voxel) \
+                            if not distributed else diffusion_prior.module(image_embed=clip_target, voxel=voxel)
                         utils.check_loss(loss)
 
                         if combine_losses:
@@ -558,19 +574,19 @@ for epoch in progress_bar:
                                 if epoch < int(0.5*num_epochs):
                                     loss_nce = contrast_loss(
                                         nn.functional.normalize(clip_voxels, dim=-1), 
-                                        nn.functional.normalize(clip_image, dim=-1),
+                                        nn.functional.normalize(clip_target, dim=-1),
                                         temp=0.006,
                                     )
                                 else:
                                     loss_nce = utils.soft_clip_loss(
                                         nn.functional.normalize(clip_voxels, dim=-1), 
-                                        nn.functional.normalize(clip_image, dim=-1),
+                                        nn.functional.normalize(clip_target, dim=-1),
                                         temp=epoch_temp,
                                     )
                             else:
                                 loss_nce = contrast_loss(
                                     nn.functional.normalize(clip_voxels, dim=-1), 
-                                    nn.functional.normalize(clip_image, dim=-1),
+                                    nn.functional.normalize(clip_target, dim=-1),
                                 )
                             
                             utils.check_loss(loss_nce)
@@ -584,22 +600,22 @@ for epoch in progress_bar:
                             val_loss_prior_sum += loss.item()
                     else:
                         clip_voxels = voxel2clip(voxel)
-                        val_loss, pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_image) \
-                            if not distributed else diffusion_prior.module(text_embed=clip_voxels, image_embed=clip_image)
+                        val_loss, pred, _ = diffusion_prior(text_embed=clip_voxels, image_embed=clip_target) \
+                            if not distributed else diffusion_prior.module(text_embed=clip_voxels, image_embed=clip_target)
 
                     print('val_i', val_i, 'voxel.shape', voxel.shape, 
                         'epoch', epoch, 'loss', val_loss, flush=True)
     
                     val_losses.append(val_loss.item())
-                    val_sims += F.cosine_similarity(clip_image, pred).mean().item()
-                    val_sims_base += F.cosine_similarity(clip_image, clip_voxels).mean().item()
+                    val_sims += F.cosine_similarity(clip_target, pred).mean().item()
+                    val_sims_base += F.cosine_similarity(clip_target, clip_voxels).mean().item()
                     labels = torch.arange(len(clip_voxels)).to(device)
                     val_fwd_percent_correct += utils.topk(
-                        utils.batchwise_cosine_similarity(clip_image, clip_voxels), labels, k=1
-                    )
+                        utils.batchwise_cosine_similarity(clip_target, clip_voxels), labels, k=1
+                    ).item()
                     val_bwd_percent_correct += utils.topk(
-                        utils.batchwise_cosine_similarity(clip_voxels, clip_image), labels, k=1
-                    )
+                        utils.batchwise_cosine_similarity(clip_voxels, clip_target), labels, k=1
+                    ).item()
         
         logs = OrderedDict(
             train_loss=np.mean(losses[-(train_i+1):]),
@@ -654,11 +670,9 @@ for epoch in progress_bar:
             "train/loss_off_aug": np.mean(loss_off_aug),
         }
 
-        print('logs before sampling', logs, flush=True)
-
         # sample some images
         if n_samples_save > 0 and (epoch + 1) % sample_interval == 0:
-            print('n_samples_save', n_samples_save, flush=True)
+            print('logs before sampling', logs, flush=True)
             if (not save_at_end) or (save_at_end and epoch == num_epochs - 1):
                 # training
                 print("Sampling training images...", flush=True)
@@ -675,10 +689,12 @@ for epoch in progress_bar:
                     diffusion_prior if not distributed else diffusion_prior.module,
                     voxel0[:n_samples_save], 
                     image0[:n_samples_save], 
+                    annotations=subj01_annots[trial0[:n_samples_save]] if is_text else None,
                     seed=42,
                 )
                 for i, grid in enumerate(grids):
-                    grid.save(os.path.join(outdir, f'samples-train-{key0[i]}.png'))
+                    # keys are different every epoch so just use i
+                    grid.save(os.path.join(outdir, 'samples-train-%02d.png' % i))
                 if wandb_log:
                     logs['train/samples'] = [wandb.Image(grid, caption=key0[i]) for i, grid in enumerate(grids)]
                 print('Computing train fid', flush=True)
@@ -693,6 +709,7 @@ for epoch in progress_bar:
                     diffusion_prior if not distributed else diffusion_prior.module,
                     val_voxel0[:n_samples_save], 
                     val_image0[:n_samples_save],
+                    annotations=subj01_annots[val_trial0[:n_samples_save]] if is_text else None,
                     seed=42,
                 )
                 for i, grid in enumerate(grids):

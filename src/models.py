@@ -60,8 +60,7 @@ class Clipper(torch.nn.Module):
         if self.norm_embs:
             clip_emb = nn.functional.normalize(clip_emb, dim=-1)
         return clip_emb
-        
-    
+
     def embed_text(self, text_samples):
         clip_text = clip.tokenize(text_samples).to(self.device)
         clip_text = self.clip.encode_text(clip_text)
@@ -70,7 +69,7 @@ class Clipper(torch.nn.Module):
         if self.norm_embs:
             clip_text = nn.functional.normalize(clip_text, dim=-1)
         return clip_text
-    
+
     def embed_curated_annotations(self, annots):
         for i,b in enumerate(annots):
             t = ''
