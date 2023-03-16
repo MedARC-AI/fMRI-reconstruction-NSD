@@ -3,15 +3,6 @@
 
 # # Import packages & functions
 
-# In[1]:
-
-
-# pip install matplotlib numpy torch torchvision torchaudio
-
-
-# In[2]:
-
-
 import os
 import sys
 import json
@@ -25,34 +16,43 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 from datetime import datetime
+from collections import OrderedDict
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print("device:",device)
 
 import ddp_config
-distributed,local_rank = ddp_config.ddp_test()
-if device=='cuda': torch.cuda.set_device(local_rank)
+distributed, local_rank = ddp_config.ddp_test()
+is_master = (not distributed) or (distributed and local_rank == 0)
+print(f'ddp_test: distributed: {distributed}, local_rank: {local_rank}, is_master: {is_master}', flush=True)
 
 import utils
 from models import Clipper, BrainNetwork, BrainDiffusionPrior
 
-num_devices = torch.cuda.device_count()
-if num_devices==0: num_devices = 1
-num_workers = num_devices
-
-# -----------------------------------------------------------------------------
-outdir_base = '../train_logs/eval-script-test'
+outdir = '../train_logs/eval-script-test'
 retrieve = False
-# -----------------------------------------------------------------------------
+max_batches = 0 # 0 for all, 1 for 1 batch, etc.
+num_inference_steps = 20
+timesteps = 1000
+
 # read in any command line args or config file values and override the above params
 config_keys = [k for k,v in globals().items() if not k.startswith('_') \
                and isinstance(v, (int, float, bool, str, dict))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
-# -----------------------------------------------------------------------------
+
+print('config:')
+print(json.dumps(config, indent=2))
+os.makedirs(outdir, exist_ok=True)
+with open(os.path.join(outdir, 'config.json'), 'w') as f:
+    json.dump(config, f, indent=2)
 
 seed = 42
 utils.seed_everything(seed=seed)
+
+num_devices = torch.cuda.device_count()
+if num_devices==0: num_devices = 1
+num_workers = num_devices
 
 # ## Load CLIP extractor
 
@@ -383,15 +383,20 @@ for val_i, (voxel, img_input, key) in enumerate(val_dl):
 
 from diffusers import AutoencoderKL, PNDMScheduler, UNet2DConditionModel, UniPCMultistepScheduler
 
+torch_dtype = torch.float16 ## use this so we have enough memory for two diffusion priors
+
 #sd_cache_dir = '/fsx/home-paulscotti/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc'
 sd_cache_dir = '/scratch/gpfs/ps6938/nsd/stable_recons/models/sd-image-variations-diffusers/snapshots/fffa9500babf6ab7dfdde36a35ccef6d814ae432'
 if not os.path.isdir(sd_cache_dir): # download from huggingface if not already downloaded / cached
     from diffusers import StableDiffusionImageVariationPipeline
     print("Downloading lambdalabs/sd-image-variations-diffusers from huggingface...")
-    sd_pipe = StableDiffusionImageVariationPipeline.from_pretrained("lambdalabs/sd-image-variations-diffusers", revision="v2.0")
+    sd_pipe = StableDiffusionImageVariationPipeline.from_pretrained(
+        "lambdalabs/sd-image-variations-diffusers",
+        revision="v2.0",
+        torch_dtype=torch_dtype,
+    )
     sd_cache_dir = "lambdalabs/sd-image-variations-diffusers"
 
-torch_dtype = torch.float16 ## use this so we have enough memory for two diffusion priors
 unet = UNet2DConditionModel.from_pretrained(sd_cache_dir, subfolder="unet", torch_dtype=torch_dtype).to(device)
 vae = AutoencoderKL.from_pretrained(sd_cache_dir, subfolder="vae", torch_dtype=torch_dtype).to(device)
 noise_scheduler = PNDMScheduler.from_pretrained(sd_cache_dir, subfolder="scheduler")
@@ -409,7 +414,7 @@ print("loaded")
 # This will take awhile!!
 
 
-def reconstruct_imgs(priors, outdir):
+def reconstruct_imgs(priors, outdir, max_batches=max_batches):
 
     os.makedirs(outdir, exist_ok=True)
 
@@ -427,13 +432,13 @@ def reconstruct_imgs(priors, outdir):
                     priors, 
                     clip_extractor, unet, vae, noise_scheduler,
                     img_lowlevel = None,
-                    num_inference_steps = 20,
+                    num_inference_steps = num_inference_steps,
                     n_samples_save = batch_size,
                     recons_per_clip = recons_per_clip,
                     recons_per_brain = recons_per_brain,
                     guidance_scale = 7.5,
                     img2img_strength = .6,
-                    timesteps = 1000,
+                    timesteps = timesteps,
                     seed = seed,
                     distributed = distributed,
         #             plotting = True,
@@ -441,6 +446,7 @@ def reconstruct_imgs(priors, outdir):
                 )
                 grid.savefig(os.path.join(outdir, f'val_recons_{val_i}_batchsize{batch_size}.png'))
                 plt.close()
+                
                 if all_brain_recons is None:
                     all_brain_recons = brain_recons
                     all_clip_recons = clip_recons
@@ -449,14 +455,18 @@ def reconstruct_imgs(priors, outdir):
                     all_brain_recons = torch.vstack((all_brain_recons,brain_recons))
                     all_clip_recons = torch.vstack((all_clip_recons,clip_recons))
                     all_images = torch.vstack((all_images,img))
-    #     break
+        
+        if max_batches > 0 and (val_i + 1) >= max_batches:
+            break
 
-    all_brain_recons = all_brain_recons.view(len(all_brain_recons)//recons_per_brain,-1,3,512,512)
-    all_clip_recons = all_clip_recons.view(len(all_clip_recons)//recons_per_clip,-1,3,512,512)
+    print('---')
+    print('brain_recons.shape',brain_recons.shape)
+    print('all_brain_recons.shape',all_brain_recons.shape)
+    print('all_clip_recons.shape',all_clip_recons.shape)
+    print('---')
 
-    # torch.save(all_brain_recons,f'{outdir}/all_brain_recons')
-    # torch.save(all_clip_recons,f'{outdir}/all_clip_recons')
-    # torch.save(all_images,f'{outdir}/all_images')
+    # all_brain_recons = all_brain_recons.view(len(all_brain_recons)//recons_per_brain,-1,3,512,512)
+    # all_clip_recons = all_clip_recons.view(len(all_clip_recons)//recons_per_clip,-1,3,512,512)
 
     print("all_brain_recons.shape",all_brain_recons.shape)
     print("all_clip_recons.shape",all_clip_recons.shape)
@@ -467,161 +477,154 @@ def reconstruct_imgs(priors, outdir):
     torch.save(all_clip_recons,f'{outdir}/all_clip_recons')
     torch.save(all_images,f'{outdir}/all_images')
 
-
-outdir = os.path.join(outdir_base, "img")
-reconstruct_imgs([diffusion_prior_img], outdir)
-
-outdir = os.path.join(outdir_base, "txt")
-reconstruct_imgs([diffusion_prior_txt], outdir)
-
-outdir = os.path.join(outdir_base, "img-and-txt")
-reconstruct_imgs([diffusion_prior_img, diffusion_prior_txt], outdir)
+reconstruct_imgs([diffusion_prior_img], os.path.join(outdir, "img"))
+reconstruct_imgs([diffusion_prior_txt], os.path.join(outdir, "txt"))
+reconstruct_imgs([diffusion_prior_img, diffusion_prior_txt], os.path.join(outdir, "img-and-txt"))
 
 
-# # In[ ]:
+import pytorch_fid_wrapper as pfw
+from torchvision.models import alexnet, AlexNet_Weights
+from torchvision.models import inception_v3, Inception_V3_Weights
 
+## 2-way identification
 
-# # # load variables if above cell was previously completed
-# # all_brain_recons = torch.load(f'{outdir}/all_brain_recons')
-# # all_clip_recons = torch.load(f'{outdir}/all_clip_recons')
-# # all_images = torch.load(f'{outdir}/all_images')
+def l2norm(x):
+    return nn.functional.normalize(x, dim=-1)
 
+def two_way_identification(all_brain_recons, all_images, model, preprocess, num_loops=10):
+    all_per_correct = []
+    all_l2dist_list = []
+    for loops in tqdm(range(num_loops)):
+        per_correct = []
+        l2dist_list = []
+        for irecon, recon in enumerate(all_brain_recons):
+            with torch.no_grad():        
+                real = model(preprocess(all_images[irecon]).unsqueeze(0)).float()
+                fake = model(preprocess(recon[0]).unsqueeze(0)).float()
+                rand_idx = np.random.randint(len(all_brain_recons))
+                while irecon == rand_idx:
+                    rand_idx = np.random.randint(len(all_brain_recons))
+                rand = model(preprocess(all_brain_recons[rand_idx,0]).unsqueeze(0)).float()
 
-# # ## FID evaluation
+                l2dist_fake = torch.mean(torch.sqrt((l2norm(real) - l2norm(fake))**2))
+                l2dist_rand = torch.mean(torch.sqrt((l2norm(real) - l2norm(rand))**2))
 
-# # In[28]:
+                if l2dist_fake < l2dist_rand:
+                    per_correct.append(1)
+                else:
+                    per_correct.append(0)
+                l2dist_list.append(l2dist_fake)
+        all_per_correct.append(np.mean(per_correct))
+        all_l2dist_list.append(np.mean(l2dist_list))
+    return all_per_correct, all_l2dist_list
 
+def two_way_identification_clip(all_brain_recons, all_images, num_loops=10):
+    all_per_correct = []
+    all_l2dist_list = []
+    for loops in tqdm(range(num_loops)):
+        per_correct = []
+        l2dist_list = []
+        for irecon, recon in enumerate(all_brain_recons):
+            with torch.no_grad():       
+                real = clip_extractor.embed_image(all_images[irecon].unsqueeze(0)).float()
+                fake = clip_extractor.embed_image(recon[0].unsqueeze(0)).float()
+                rand_idx = np.random.randint(len(all_brain_recons))
+                while irecon == rand_idx:
+                    rand_idx = np.random.randint(len(all_brain_recons))
+                rand = clip_extractor.embed_image(all_brain_recons[rand_idx,0].unsqueeze(0)).float()
 
-# import pytorch_fid_wrapper as pfw
+                l2dist_fake = torch.mean(torch.sqrt((l2norm(real) - l2norm(fake))**2))
+                l2dist_rand = torch.mean(torch.sqrt((l2norm(real) - l2norm(rand))**2))
 
-# # using last feature layer (2048-dim) before FCs, as used in mind_reader
-# # can lower batch size if needed for memory
-# pfw.set_config(batch_size=all_images.shape[0], dims=2048, device=device)
+                if l2dist_fake < l2dist_rand:
+                    per_correct.append(1)
+                else:
+                    per_correct.append(0)
+                l2dist_list.append(l2dist_fake.item())
+        all_per_correct.append(np.mean(per_correct))
+        all_l2dist_list.append(np.mean(l2dist_list))
+    return all_per_correct, all_l2dist_list
 
-# # automatically resizes to 299x299 suitable for Inception V3
-# val_fid = pfw.fid(all_brain_recons[:,0].float(), real_images=all_images.float())
-# print(val_fid)
+def get_alexnet():
+    weights = AlexNet_Weights.DEFAULT
+    model = alexnet(weights=weights).eval()
+    preprocess = weights.transforms()
 
+    layer = 'late' # corresponds to layers used in Takagi & Nishimoto
+    for i,f in enumerate(model.features):
+        if layer=='early' and i>1:
+            model.features[i] = nn.Identity()
+        elif layer=='mid' and i>4:
+            model.features[i] = nn.Identity()
+        elif layer=='late' and i>7:
+            model.features[i] = nn.Identity()
+    model.avgpool=nn.Identity()
+    model.classifier=nn.Identity()
+    # print(model)
+    return model, preprocess
 
-# # ## 2-way identification
+def get_inception():
+    weights = Inception_V3_Weights.DEFAULT
+    model = inception_v3(weights=weights).eval()
+    preprocess = weights.transforms()
 
-# # In[29]:
+    model.dropout = nn.Identity()
+    model.fc = nn.Identity()
+    # print(model)
+    return model, preprocess
 
+def compute_metrics(outdir):
+    metrics = OrderedDict()
 
-# def l2norm(x):
-#     return nn.functional.normalize(x, dim=-1)
+    # load variables if above cell was previously completed
+    all_brain_recons = torch.load(f'{outdir}/all_brain_recons')
+    all_clip_recons = torch.load(f'{outdir}/all_clip_recons')
+    all_images = torch.load(f'{outdir}/all_images')
 
-# def two_way_identification(all_brain_recons, all_images, model, preprocess, num_loops=10):
-#     all_per_correct = []
-#     all_l2dist_list = []
-#     for loops in tqdm(range(num_loops)):
-#         per_correct = []
-#         l2dist_list = []
-#         for irecon, recon in enumerate(all_brain_recons):
-#             with torch.no_grad():        
-#                 real = model(preprocess(all_images[irecon]).unsqueeze(0)).float()
-#                 fake = model(preprocess(recon[0]).unsqueeze(0)).float()
-#                 rand_idx = np.random.randint(len(all_brain_recons))
-#                 while irecon == rand_idx:
-#                     rand_idx = np.random.randint(len(all_brain_recons))
-#                 rand = model(preprocess(all_brain_recons[rand_idx,0]).unsqueeze(0)).float()
+    # import pdb; pdb.set_trace()
 
-#                 l2dist_fake = torch.mean(torch.sqrt((l2norm(real) - l2norm(fake))**2))
-#                 l2dist_rand = torch.mean(torch.sqrt((l2norm(real) - l2norm(rand))**2))
+    # using last feature layer (2048-dim) before FCs, as used in mind_reader
+    # can lower batch size if needed for memory
+    # pfw.set_config(batch_size=all_images.shape[0], dims=2048, device=device)
+    pfw.set_config(batch_size=min(all_images.shape[0], 32), dims=2048, device=device)
 
-#                 if l2dist_fake < l2dist_rand:
-#                     per_correct.append(1)
-#                 else:
-#                     per_correct.append(0)
-#                 l2dist_list.append(l2dist_fake)
-#         all_per_correct.append(np.mean(per_correct))
-#         all_l2dist_list.append(np.mean(l2dist_list))
-#     return all_per_correct, all_l2dist_list
+    # # automatically resizes to 299x299 suitable for Inception V3
+    val_fid = pfw.fid(all_brain_recons[:,0].float(), real_images=all_images.float())
+    print('FID score', val_fid)
+    metrics['FID'] = val_fid
 
-# def two_way_identification_clip(all_brain_recons, all_images, num_loops=10):
-#     all_per_correct = []
-#     all_l2dist_list = []
-#     for loops in tqdm(range(num_loops)):
-#         per_correct = []
-#         l2dist_list = []
-#         for irecon, recon in enumerate(all_brain_recons):
-#             with torch.no_grad():       
-#                 real = clip_extractor.embed_image(all_images[irecon].unsqueeze(0)).float()
-#                 fake = clip_extractor.embed_image(recon[0].unsqueeze(0)).float()
-#                 rand_idx = np.random.randint(len(all_brain_recons))
-#                 while irecon == rand_idx:
-#                     rand_idx = np.random.randint(len(all_brain_recons))
-#                 rand = clip_extractor.embed_image(all_brain_recons[rand_idx,0].unsqueeze(0)).float()
+    # print('AlexNet')
+    # model, preprocess = get_alexnet()
 
-#                 l2dist_fake = torch.mean(torch.sqrt((l2norm(real) - l2norm(fake))**2))
-#                 l2dist_rand = torch.mean(torch.sqrt((l2norm(real) - l2norm(rand))**2))
+    # all_per_correct, all_l2dist_list = two_way_identification(
+    #     all_brain_recons, all_images, model, preprocess, num_loops=10
+    # )
 
-#                 if l2dist_fake < l2dist_rand:
-#                     per_correct.append(1)
-#                 else:
-#                     per_correct.append(0)
-#                 l2dist_list.append(l2dist_fake.item())
-#         all_per_correct.append(np.mean(per_correct))
-#         all_l2dist_list.append(np.mean(l2dist_list))
-#     return all_per_correct, all_l2dist_list
+    # print(f"2-way Percent Correct (mu, std): {np.mean(all_per_correct):.2f} | {np.std(all_per_correct):.2f}")
+    # print(f"Avg l2dist_fake (mu, std): {np.mean(all_l2dist_list):.4f} | {np.std(all_l2dist_list):.4f}")
 
+    print('Inception V3')
+    model, preprocess = get_inception()
 
-# # ### AlexNet
-
-# # In[30]:
-
-
-# from torchvision.models import alexnet, AlexNet_Weights
-
-# weights = AlexNet_Weights.DEFAULT
-# model = alexnet(weights=weights).eval()
-# preprocess = weights.transforms()
-
-# layer = 'late' # corresponds to layers used in Takagi & Nishimoto
-# for i,f in enumerate(model.features):
-#     if layer=='early' and i>1:
-#         model.features[i] = nn.Identity()
-#     elif layer=='mid' and i>4:
-#         model.features[i] = nn.Identity()
-#     elif layer=='late' and i>7:
-#         model.features[i] = nn.Identity()
-# model.avgpool=nn.Identity()
-# model.classifier=nn.Identity()
-# print(model)
-
-# # all_per_correct, all_l2dist_list = two_way_identification(all_brain_recons, all_images, model, preprocess, num_loops=10)
+    all_per_correct, all_l2dist_list = two_way_identification(
+        all_brain_recons, all_images, model, preprocess, num_loops=30
+    )
         
-# # print(f"2-way Percent Correct (mu, std): {np.mean(all_per_correct):.2f} | {np.std(all_per_correct):.2f}")
-# # print(f"Avg l2dist_fake (mu, std): {np.mean(all_l2dist_list):.4f} | {np.std(all_l2dist_list):.4f}")
+    print(f"2-way Percent Correct (mu, std): {np.mean(all_per_correct):.2f} | {np.std(all_per_correct):.2f}")
+    print(f"Avg l2dist_fake (mu, std): {np.mean(all_l2dist_list):.4f} | {np.std(all_l2dist_list):.4f}")
+    metrics['InceptionV3'] = [np.mean(all_per_correct), np.std(all_per_correct), np.mean(all_l2dist_list), np.std(all_l2dist_list)]
 
+    print('CLIP')
+    all_per_correct, all_l2dist_list = two_way_identification_clip(
+        all_brain_recons, all_images, num_loops=10
+    )
+    print(f"2-way Percent Correct (mu, std): {np.mean(all_per_correct):.2f} | {np.std(all_per_correct):.2f}")
+    print(f"Avg l2dist_fake (mu, std): {np.mean(all_l2dist_list):.4f} | {np.std(all_l2dist_list):.4f}")
+    metrics['CLIP'] = [np.mean(all_per_correct), np.std(all_per_correct), np.mean(all_l2dist_list), np.std(all_l2dist_list)]
 
-# # ### InceptionV3
+    with open(os.path.join(outdir, 'metrics.json'), 'w+') as f:
+        json.dump(metrics, f, indent=4, default=float)
 
-# # In[31]:
-
-
-# from torchvision.models import inception_v3, Inception_V3_Weights
-
-# weights = Inception_V3_Weights.DEFAULT
-# model = inception_v3(weights=weights).eval()
-# preprocess = weights.transforms()
-
-# model.dropout = nn.Identity()
-# model.fc = nn.Identity()
-# print(model)
-
-# all_per_correct, all_l2dist_list = two_way_identification(all_brain_recons, all_images, model, preprocess, num_loops=30)
-        
-# print(f"2-way Percent Correct (mu, std): {np.mean(all_per_correct):.2f} | {np.std(all_per_correct):.2f}")
-# print(f"Avg l2dist_fake (mu, std): {np.mean(all_l2dist_list):.4f} | {np.std(all_l2dist_list):.4f}")
-
-
-# # ### CLIP
-
-# # In[32]:
-
-
-# all_per_correct, all_l2dist_list = two_way_identification_clip(all_brain_recons, all_images, num_loops=10)
-# print(f"2-way Percent Correct (mu, std): {np.mean(all_per_correct):.2f} | {np.std(all_per_correct):.2f}")
-# print(f"Avg l2dist_fake (mu, std): {np.mean(all_l2dist_list):.4f} | {np.std(all_l2dist_list):.4f}")
-
+compute_metrics(os.path.join(outdir, "img"))
+compute_metrics(os.path.join(outdir, "txt"))
+compute_metrics(os.path.join(outdir, "img-and-txt"))
