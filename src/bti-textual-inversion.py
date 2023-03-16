@@ -148,7 +148,7 @@ if wandb_log and local_rank==0:
 
 
 import requests
-open("textual_inversion.py", "w").write(requests.get("https://raw.githubusercontent.com/huggingface/diffusers/main/examples/textual_inversion/textual_inversion.py").content)
+open("textual_inversion.py", "w").write(requests.get("https://raw.githubusercontent.com/huggingface/diffusers/main/examples/textual_inversion/textual_inversion.py").text)
 
 
 # In[ ]:
@@ -211,9 +211,8 @@ for train_i, (voxel, image, key) in enumerate(train_dl):
     os.makedirs("imgs", exist_ok=True)
     os.makedirs(save_dir, exist_ok=True)
     Image.fromarray((image[0].permute(1, 2, 0).detach().cpu().numpy() * 255).astype(np.uint8)).save("imgs/source.png")
-#     hash_ = hashlib.sha256(open("imgs/source.png", "rb").read()).hexdigest()
-#     if hash_ in results:
-    if key in results:
+    hash_ = hashlib.sha256(open("imgs/source.png", "rb").read()).hexdigest()
+    if hash_ in results:
         continue
     subprocess.run(["accelerate", "launch", "textual_inversion.py",
          f'--pretrained_model_name_or_path={model_name}',
@@ -222,18 +221,17 @@ for train_i, (voxel, image, key) in enumerate(train_dl):
          '--placeholder_token="<img-token>"',
          '--initializer_token=photo',
          '--resolution=512',
-         '--train_batch_size=1',
-         '--gradient_accumulation_steps=4',
-         '--max_train_steps=1000',
+         '--train_batch_size=4',
+         '--gradient_accumulation_steps=1',
+         '--max_train_steps=800',
          '--learning_rate=5.0e-04',
          '--scale_lr',
          '--lr_scheduler=constant',
          '--lr_warmup_steps=0',
          "--only_save_embeds",
          f'--output_dir={save_dir}'])
-#     results[hash_] = torch.load(f"{save_dir}/learned_embeds.bin")['"<img-token>"']
-    results[key] = torch.load(f"{save_dir}/learned_embeds.bin")['"<img-token>"']
-torch.save(results, "tokens.pt")
+    results[hash_] = torch.load(f"{save_dir}/learned_embeds.bin")['"<img-token>"']
+    torch.save(results, "tokens.pt")
 
 
 # In[ ]:
