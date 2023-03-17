@@ -16,7 +16,7 @@ from diffusers.utils import randn_tensor
 from models import Clipper
 import json
 from torchmetrics.image.fid import FrechetInceptionDistance
-import traceback
+
 from PIL import Image, UnidentifiedImageError
 import traceback
 import requests
@@ -57,7 +57,11 @@ def torch_to_Image(x):
     return transforms.ToPILImage()(x)
 
 def Image_to_torch(x):
-    return (transforms.ToTensor()(x[0])[:3].unsqueeze(0)-.5)/.5
+    try:
+        x = (transforms.ToTensor()(x)[:3].unsqueeze(0)-.5)/.5
+    except:
+        x = (transforms.ToTensor()(x[0])[:3].unsqueeze(0)-.5)/.5
+    return x
 
 def torch_to_matplotlib(x,device=device):
     if torch.mean(x)>10:
@@ -278,6 +282,7 @@ def get_dataloaders(
     val_url=None,
     meta_url=None,
     num_samples=None,
+    num_val_samples=None,
     cache_dir="/tmp/wds-cache",
     n_cache_recs=0,
     voxels_key="nsdgeneral.npy",
@@ -311,6 +316,9 @@ def get_dataloaders(
         
     if num_samples is not None:
         num_train = num_samples
+    
+    if num_val_samples is not None:
+        num_val = num_val_samples
     
     global_batch_size = batch_size * num_devices
     num_batches = math.floor(num_train / global_batch_size)
@@ -590,7 +598,6 @@ def crop_resize(im, size):
 
 
 def img_result(result, size=size):
-    print(result)
     try:
         return crop_resize(  # pad_resize(
             Image.open(
@@ -599,11 +606,11 @@ def img_result(result, size=size):
             )
         ).convert("RGB"), size)  # .resize(size).convert("RGB")
     except (TypeError, requests.ConnectionError, UnidentifiedImageError):
-        traceback.print_exc()
+        #traceback.print_exc()
         return None  # Image.new("RGB", size)
 
 
-def query_laion(text=None, emb=None, num=50):
+def query_laion(text=None, emb=None, num=20):
     # Soft requirement
     try:
         from clip_retrieval.clip_client import ClipClient, Modality
@@ -667,9 +674,6 @@ def reconstruct_from_clip(
     
     voxel=voxel[:n_samples_save]
     image=image[:n_samples_save]
-    if img_lowlevel is not None:
-        img_lowlevel=img_lowlevel[:n_samples_save]
-        img_lowlevel = nn.functional.interpolate(img_lowlevel, 512, mode="area", antialias=False).to(device)
 
     do_classifier_free_guidance = guidance_scale > 1.0
     vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
@@ -686,19 +690,19 @@ def reconstruct_from_clip(
     for diffusion_prior in diffusion_priors:
         if distributed:
             diffusion_prior.module.voxel2clip.eval()
-            brain_clip_embeddings = diffusion_prior.module.voxel2clip(voxel.to(device).float())
+            brain_clip_embeddings0 = diffusion_prior.module.voxel2clip(voxel.to(device).float())
             # NOTE: requires fork of DALLE-pytorch for generator arg
-            brain_clip_embeddings = diffusion_prior.module.p_sample_loop(brain_clip_embeddings.shape, 
-                                                text_cond = dict(text_embed = brain_clip_embeddings), 
+            brain_clip_embeddings = diffusion_prior.module.p_sample_loop(brain_clip_embeddings0.shape, 
+                                                text_cond = dict(text_embed = brain_clip_embeddings0), 
                                                 cond_scale = 1., timesteps = timesteps, #1000 timesteps used from nousr pretraining
                                                 generator=generator
                                                 )
         else:
             diffusion_prior.voxel2clip.eval()
-            brain_clip_embeddings = diffusion_prior.voxel2clip(voxel.to(device).float())
+            brain_clip_embeddings0 = diffusion_prior.voxel2clip(voxel.to(device).float())
             # NOTE: requires fork of DALLE-pytorch for generator arg
-            brain_clip_embeddings = diffusion_prior.p_sample_loop(brain_clip_embeddings.shape, 
-                                                text_cond = dict(text_embed = brain_clip_embeddings), 
+            brain_clip_embeddings = diffusion_prior.p_sample_loop(brain_clip_embeddings0.shape, 
+                                                text_cond = dict(text_embed = brain_clip_embeddings0), 
                                                 cond_scale = 1., timesteps = timesteps, #1000 timesteps used from nousr pretraining
                                                 generator=generator
                                                 )
@@ -726,24 +730,40 @@ def reconstruct_from_clip(
                 recons_per_sample = recons_per_brain
             if recons_per_sample == 0: continue
             if embed_type == "brain" and retrieve:
-                image_retrieved = query_laion(emb=input_embedding.detach().cpu().numpy().flatten(), num=4)[0]
-                input_embedding = clip_extractor.embed_image(torch.from_numpy(np.asarray(image_retrieved)).permute(2, 0, 1).unsqueeze(0) / 255.).float()
+                try:
+                    image_retrieved0 = query_laion(emb=brain_clip_embeddings0.detach().cpu().numpy().flatten())
+                    image_retrieved = (Image_to_torch(image_retrieved0[0])[0].unsqueeze(0) + 1) / 2
+                    retrieved_clip = clip_extractor.embed_image(image_retrieved).float()
+                    
+                    # crude way to elminate coco image being the nearest neighbor
+                    if (torch.abs(torch.mean(clip_embeddings - retrieved_clip)) < .0045):
+                        image_retrieved = (Image_to_torch(image_retrieved0[1])[0].unsqueeze(0) + 1) / 2
+                        retrieved_clip = clip_extractor.embed_image(image_retrieved).float()
+                except:
+                    print("query_laion failed! probably due to 'TooManyRedirects: Exceeded 30 redirects.' error.")
+                    image_retrieved = torch.zeros_like(brain_clip_embeddings0)
+                    retrieved_clip = image_retrieved
+                
             input_embedding = input_embedding.repeat(recons_per_sample, 1)
             input_embedding = torch.cat([torch.zeros_like(input_embedding), input_embedding]).unsqueeze(1).to(device)
-
+            
             # 4. Prepare timesteps
             noise_scheduler.set_timesteps(num_inference_steps, device=device)
-
+            
             # 5b. Prepare latent variables
             batch_size = input_embedding.shape[0] // 2 # divide by 2 bc we doubled it for classifier-free guidance
             shape = (batch_size, unet.in_channels, height // vae_scale_factor, width // vae_scale_factor)
-            if img_lowlevel is not None: # use img_lowlevel for img2img initialization
+            if (embed_type == "brain") and (img_lowlevel is not None): # use img_lowlevel for img2img initialization
+                img_lowlevel = img_lowlevel[:n_samples_save]
+                # img_lowlevel = transforms.functional.gaussian_blur(img_lowlevel,kernel_size=41)
+                # img_lowlevel = image_retrieved.float()
+                # img_lowlevel = nn.functional.interpolate(img_lowlevel, 512, mode="area", antialias=False).to(device)
+                
                 init_timestep = min(int(num_inference_steps * img2img_strength), num_inference_steps)
                 t_start = max(num_inference_steps - init_timestep, 0)
                 timesteps = noise_scheduler.timesteps[t_start:]
                 latent_timestep = timesteps[:1].repeat(batch_size)
 
-                img_lowlevel = transforms.functional.gaussian_blur(img_lowlevel,kernel_size=99)
                 if img2img_refs is None:
                     img2img_refs = img_lowlevel[[emb_idx]]
                 elif img2img_refs.shape[0] <= emb_idx:
@@ -785,34 +805,74 @@ def reconstruct_from_clip(
                     clip_recons = recons.unsqueeze(0)
                 else:
                     clip_recons = torch.cat((clip_recons,recons.unsqueeze(0)))
-            else:
+            elif embed_type == 'brain':
                 if brain_recons is None:
                     brain_recons = recons.unsqueeze(0)
                 else:
                     brain_recons = torch.cat((brain_recons,recons.unsqueeze(0)))
 
+    # compare CLIP embedding of LAION nearest neighbor to your brain reconstructions
+    best_picks = np.zeros(n_samples_save)
+    if embed_type == "brain" and retrieve:
+        for im in range(n_samples_save):
+            brain_clips = clip_extractor.embed_image(brain_recons[im])
+            cos_sims_to_neighbor = batchwise_cosine_similarity(brain_clips.float(), retrieved_clip)
+            best_picks[im] = int(torch.argmax(cos_sims_to_neighbor))
+                    
     img2img_samples = 0 if img_lowlevel is None else 1
-    num_xaxis_subplots = 1+img2img_samples+recons_per_clip+recons_per_brain
+    laion_samples = 1 if retrieve else 0
+    num_xaxis_subplots = 1+img2img_samples+laion_samples+recons_per_clip+recons_per_brain
     fig, ax = plt.subplots(n_samples_save, num_xaxis_subplots, 
-                           figsize=(20,3*n_samples_save),
+                           figsize=(num_xaxis_subplots*3,8*n_samples_save),
                            facecolor=(1, 1, 1))
-    for im in range(n_samples_save):
-        ax[im][0].set_title(f"Original Image")
-        ax[im][0].imshow(torch_to_Image(image[im]))
+    if n_samples_save > 1:
+        for im in range(n_samples_save):
+            ax[im][0].set_title(f"Original Image")
+            ax[im][0].imshow(torch_to_Image(image[im]))
+            if img2img_samples == 1:
+                ax[im][1].set_title(f"Img2img ({img2img_strength})")
+                ax[im][1].imshow(torch_to_Image(img2img_refs[im]))
+            for ii,i in enumerate(range(num_xaxis_subplots-laion_samples-recons_per_clip-recons_per_brain,num_xaxis_subplots-laion_samples-recons_per_brain)):
+                recon = clip_recons[im][ii]
+                ax[im][i].set_title(f"Recon {ii+1} from orig CLIP")
+                ax[im][i].imshow(torch_to_Image(recon))
+            for ii,i in enumerate(range(num_xaxis_subplots-laion_samples-recons_per_brain,num_xaxis_subplots-laion_samples)):
+                recon = brain_recons[im][ii]
+                if ii == best_picks[im]:
+                    ax[im][i].set_title(f"Best Reconstruction",fontweight='bold')
+                else:
+                    ax[im][i].set_title(f"Recon {ii+1} from brain")
+                ax[im][i].imshow(torch_to_Image(recon))
+            if retrieve:
+                ax[im][-1].set_title(f"LAION5b top neighbor")
+                ax[im][-1].imshow(torch_to_Image(image_retrieved))
+            for i in range(num_xaxis_subplots):
+                ax[im][i].axis('off')
+    else:   
+        im = 0
+        ax[0].set_title(f"Original Image")
+        ax[0].imshow(torch_to_Image(image[im]))
         if img2img_samples == 1:
-            ax[im][1].set_title(f"Img2img Input")
-            ax[im][1].imshow(torch_to_Image(img2img_refs[im]))
-        for ii,i in enumerate(range(num_xaxis_subplots-recons_per_clip-recons_per_brain,num_xaxis_subplots-recons_per_brain)):
+            ax[1].set_title(f"Img2img ({img2img_strength})")
+            ax[1].imshow(torch_to_Image(img2img_refs[im]))
+        for ii,i in enumerate(range(num_xaxis_subplots-laion_samples-recons_per_clip-recons_per_brain,num_xaxis_subplots-recons_per_brain-laion_samples)):
             recon = clip_recons[im][ii]
-            ax[im][i].set_title(f"Recon {ii+1} from orig CLIP")
-            ax[im][i].imshow(torch_to_Image(recon))
-        for ii,i in enumerate(range(num_xaxis_subplots-recons_per_brain,num_xaxis_subplots)):
+            ax[i].set_title(f"Recon {ii+1} from orig CLIP")
+            ax[i].imshow(torch_to_Image(recon))
+        for ii,i in enumerate(range(num_xaxis_subplots-laion_samples-recons_per_brain,num_xaxis_subplots-laion_samples)):
             recon = brain_recons[im][ii]
-            ax[im][i].set_title(f"Recon {ii+1} from brain")
-            ax[im][i].imshow(torch_to_Image(recon))
+            if ii == best_picks[im]:
+                ax[i].set_title(f"Best Reconstruction",fontweight='bold')
+            else:
+                ax[i].set_title(f"Recon {ii+1} from brain")
+            ax[i].imshow(torch_to_Image(recon))
+        if retrieve:
+            ax[-1].set_title(f"LAION5b top neighbor")
+            ax[-1].imshow(torch_to_Image(image_retrieved))
         for i in range(num_xaxis_subplots):
-            ax[im][i].axis('off')
-    return fig, clip_recons, brain_recons
+            ax[i].axis('off')
+    
+    return fig, clip_recons, brain_recons, best_picks
 
 def save_augmented_images(imgs, keys, path):
     """
