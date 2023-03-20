@@ -261,7 +261,6 @@ if __name__ == '__main__':
                         val_sim=np.nan,
                     )
                     progress_bar.set_postfix(**logs)
-                    break
 
             loss.backward()
             optimizer.step()
