@@ -337,7 +337,7 @@ if __name__ == '__main__':
 
                 # Save model checkpoint every `ckpt_interval`` epochs or on the last epoch
                 if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
-                    utils.save_ckpt(f'epoch{(epoch+1):03d}')
+                    utils.save_ckpt(voxel2clip, optimizer, losses, val_losses, lrs, epoch, f'epoch{(epoch+1):03d}', outdir)
 
             logs = {
                 "train/loss": np.mean(losses[-(train_i+1):]),
