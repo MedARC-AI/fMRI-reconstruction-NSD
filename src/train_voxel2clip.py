@@ -30,17 +30,16 @@ if __name__ == '__main__':
     # params for this model
     model_name = "voxel2clip"
     modality = "image" # ("image", "text")
-    image_var = 'images' if modality=='image' else None  # trial
     clip_variant = "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
     clamp_embs = False # clamp embeddings to (-1.5, 1.5)
     dim = 768
     remote_data = False
     data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
-    voxel_dims = 3 # 1 for flattened 3 for 3d
+    voxel_dims = 1 # 1 for flattened 3 for 3d
     # -----------------------------------------------------------------------------
     # params for all models
     seed = 0
-    batch_size = 4
+    batch_size = 300
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
     num_devices = torch.cuda.device_count()
     num_workers = num_devices
@@ -66,12 +65,9 @@ if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
 
     # -----------------------------------------------------------------------------
-    try:
-        config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-        exec(open('configurator.py').read()) # overrides from command line or config file
-        config = {k: globals()[k] for k in config_keys} # will be useful for logging
-    except:
-        pass
+    config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+    exec(open('configurator.py').read()) # overrides from command line or config file
+    config = {k: globals()[k] for k in config_keys} # will be useful for logging
 
     outdir = os.path.expanduser(f'../train_logs/models/{model_name}/test')
     os.makedirs(outdir, exist_ok=True)
@@ -139,8 +135,7 @@ if __name__ == '__main__':
 
     if local_rank == 0: print('Prepping train and validation dataloaders...')
     train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
-        batch_size, 
-        image_var,
+        batch_size,
         num_devices=num_devices,
         num_workers=num_workers,
         train_url=train_url,
@@ -148,8 +143,25 @@ if __name__ == '__main__':
         cache_dir=cache_dir,
         n_cache_recs=n_cache_recs,
         voxels_key=voxels_key,
-        val_batch_size=300
+        val_batch_size=300,
+        to_tuple=["voxels", "images", "trial", "__key__"],
     )
+
+    assert modality in ("image", "text"), f"Unknown modality: {modality}"
+    is_text = modality == "text"
+    if is_text:
+        import h5py
+        # load COCO annotations curated in the same way as the mind_reader (Lin Sprague Singh) preprint
+        h5_dir = '/fsx/proj-medarc/fmri/natural-scenes-dataset/'
+
+        # indices
+        f = h5py.File(os.path.join(h5_dir, 'COCO_73k_subj_indices.hdf5'), 'r')
+        subj01_order = f['subj01'][:]
+        f.close()
+
+        # annotations
+        subj01_annots = np.load(os.path.join(h5_dir, 'COCO_73k_annots_curated.npy'), allow_pickle=True)
+        subj01_annots = subj01_annots[subj01_order]
 
     no_decay = ['bias']
     opt_grouped_parameters = [
@@ -189,7 +201,7 @@ if __name__ == '__main__':
         val_fwd_percent_correct = 0.
         val_bwd_percent_correct = 0.
 
-        for train_i, (voxel, image, _) in enumerate(train_dl):
+        for train_i, (voxel, image, trial, key) in enumerate(train_dl):
             optimizer.zero_grad()
 
             image = image.to(device).float()
@@ -199,15 +211,23 @@ if __name__ == '__main__':
 
             with torch.cuda.amp.autocast(enabled=use_mp):
                 with torch.cuda.amp.autocast(enabled=True):
-                    clip_image = clip_extractor.embed_image(image).float()
-                clip_image.to(voxel.dtype)
+                    if is_text:
+                        # [bs, 1, 5]
+                        # random=True means randomly select a non-empty annotation
+                        annots = utils.select_annotations(subj01_annots[trial], random=True)
+                        # print(annots)
+                        clip_target = clip_extractor.embed_text(annots).float()
+                    else:
+                        clip_target = clip_extractor.embed_image(image).float()
+
+                clip_target.to(voxel.dtype)
                 clip_voxels = voxel2clip(voxel)
                 
-                labels = torch.arange(len(clip_image)).to(device)
+                labels = torch.arange(len(clip_target)).to(device)
                 if epoch < int(mixup_pct * num_epochs):
                     loss = utils.mixco_nce(
                         nn.functional.normalize(clip_voxels, dim=-1), 
-                        nn.functional.normalize(clip_image, dim=-1),
+                        nn.functional.normalize(clip_target, dim=-1),
                         temp=0.006, perm=perm, betas=betas,
                         select=select, distributed=distributed, local_rank=local_rank
                     )
@@ -215,7 +235,7 @@ if __name__ == '__main__':
                     epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
                     loss = utils.soft_clip_loss(
                         nn.functional.normalize(clip_voxels, dim=-1), 
-                        nn.functional.normalize(clip_image, dim=-1),
+                        nn.functional.normalize(clip_target, dim=-1),
                         temp=epoch_temp, distributed=distributed
                     )
 
@@ -224,12 +244,12 @@ if __name__ == '__main__':
                 losses.append(loss.item())
                 lrs.append(optimizer.param_groups[0]['lr'])
 
-                sims_base += F.cosine_similarity(clip_image, clip_voxels).mean().item()
+                sims_base += F.cosine_similarity(clip_target, clip_voxels).mean().item()
                 fwd_percent_correct += utils.topk(
-                    utils.batchwise_cosine_similarity(clip_image, clip_voxels), labels, k=1
+                    utils.batchwise_cosine_similarity(clip_target, clip_voxels), labels, k=1
                 )
                 bwd_percent_correct += utils.topk(
-                    utils.batchwise_cosine_similarity(clip_voxels, clip_image), labels, k=1
+                    utils.batchwise_cosine_similarity(clip_voxels, clip_target), labels, k=1
                 )
 
                 if local_rank==0:
@@ -250,43 +270,51 @@ if __name__ == '__main__':
 
         if local_rank==0: 
             voxel2clip.eval()
-            for val_i, (voxel, image, _) in enumerate(val_dl):
+            for val_i, (voxel, image, trial, key) in enumerate(val_dl):
                 with torch.no_grad():
                     image = image.to(device).float()
                     voxel = voxel.to(device).float()
                     
                     with torch.cuda.amp.autocast(enabled=use_mp):
                         with torch.cuda.amp.autocast():
-                            clip_image = clip_extractor.embed_image(image).float()
-                        clip_image.to(voxel.dtype)
+                            if is_text:
+                                # [bs, 1, 5]
+                                # NOTE: not using random selection here to keep it consistent
+                                annots = utils.select_annotations(subj01_annots[trial], random=False)
+                                # print(annots)
+                                clip_target = clip_extractor.embed_text(annots).float()
+                            else:
+                                clip_target = clip_extractor.embed_image(image).float()
+                        clip_target.to(voxel.dtype)
                         if distributed:
                             clip_voxels = voxel2clip.module(voxel)
                         else:
                             clip_voxels = voxel2clip(voxel)
 
-                        labels = torch.arange(len(clip_image)).to(device)
+                        labels = torch.arange(len(clip_target)).to(device)
                         if epoch < int(mixup_pct * num_epochs):
                             loss = utils.mixco_nce(
                                 nn.functional.normalize(clip_voxels, dim=-1), 
-                                nn.functional.normalize(clip_image, dim=-1),
-                                temp=0.006, perm=perm, betas=betas,
-                                select=select, distributed=False
+                                nn.functional.normalize(clip_target, dim=-1),
+                                temp=0.006,
+                                distributed=distributed,
                             )
                         else:
                             epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
                             loss = utils.soft_clip_loss(
                                 nn.functional.normalize(clip_voxels, dim=-1), 
-                                nn.functional.normalize(clip_image, dim=-1),
+                                nn.functional.normalize(clip_target, dim=-1),
                                 temp=epoch_temp, distributed=distributed
                             )
+                        utils.check_loss(loss)
 
                         val_losses.append(loss.item())
-                        val_sims_base += F.cosine_similarity(clip_image, clip_voxels).mean().item()
+                        val_sims_base += F.cosine_similarity(clip_target, clip_voxels).mean().item()
                         val_fwd_percent_correct += utils.topk(
-                            utils.batchwise_cosine_similarity(clip_image, clip_voxels), labels, k=1
+                            utils.batchwise_cosine_similarity(clip_target, clip_voxels), labels, k=1
                         )
                         val_bwd_percent_correct += utils.topk(
-                            utils.batchwise_cosine_similarity(clip_voxels, clip_image), labels, k=1
+                            utils.batchwise_cosine_similarity(clip_voxels, clip_target), labels, k=1
                         )
 
                 logs = OrderedDict(
@@ -303,13 +331,13 @@ if __name__ == '__main__':
                 val_loss = np.mean(val_losses[-(val_i+1):])
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    utils.save_ckpt('best')
+                    utils.save_ckpt(voxel2clip, optimizer, losses, val_losses, lrs, epoch, 'best', outdir)
                 else:
                     print(f'not best - val_loss: {val_loss:.3f}, best_val_loss: {best_val_loss:.3f}')
 
                 # Save model checkpoint every `ckpt_interval`` epochs or on the last epoch
                 if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
-                    utils.save_ckpt(f'epoch{(epoch+1):03d}')
+                    utils.save_ckpt(voxel2clip, optimizer, losses, val_losses, lrs, epoch, f'epoch{(epoch+1):03d}', outdir)
 
             logs = {
                 "train/loss": np.mean(losses[-(train_i+1):]),
@@ -327,7 +355,7 @@ if __name__ == '__main__':
 
             if wandb_log:
                 wandb.log(logs)
-        if True:
+        if distributed:
             dist.barrier()
 
     if wandb_log:
