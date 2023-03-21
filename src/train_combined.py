@@ -26,6 +26,8 @@ from info_nce import InfoNCE
 from tqdm import tqdm
 from collections import OrderedDict
 from dalle2_pytorch import DiffusionPriorNetwork
+import kornia
+from kornia.augmentation.container import AugmentationSequential
 
 import utils
 from models import Clipper, BrainNetwork, BrainDiffusionPrior, BrainSD
@@ -52,7 +54,8 @@ prior_kwargs = dict(
 )
 voxel2clip_path = '' # ckpt path for voxel2clip model
 voxel_dims = 1 # (1, 3)
-use_mixco = False # use mixco on the voxels
+use_mixco = False # use mixup-contrastive on the voxels
+mixup_pct = 0.5 # mixup pct for voxels
 n_samples_save = 8 # how many SD samples from train and val to save
 sample_interval = 1 # after how many epochs to save samples
 save_at_end = False # sample images and save at end of training only
@@ -65,6 +68,7 @@ combine_losses = True # when combine_models=True, use two terms in the loss, NCE
 clip_aug_mode = 'none' # ('none', 'x', 'y')
 clip_aug_prob = 0.03 # prob of applying augmentation to a batch
 sd_scheduler = 'pndms' # scheduler for SD image variation pipeline ('pndms', 'unipcm')
+use_image_aug = False # use image augmentation prior to getting CLIP embeddings
 # -----------------------------------------------------------------------------
 # params for all models
 seed = 0
@@ -81,7 +85,7 @@ wandb_notes = ''
 first_batch = False # use only the first batch of training and validation data
 ckpt_saving = True # enables checkpoint saving
 ckpt_interval = 0 # after how many epochs to save a checkpoint (0 = never, will only save best one)
-outdir = f'../train_logs/{model_name}/test'
+outdir = f'../train_logs/models/{model_name}/test'
 
 # -----------------------------------------------------------------------------
 # read in any command line args or config file values and override the above params
@@ -117,9 +121,25 @@ if is_master:
         json.dump(config, f, indent=2)
 
 if is_master: print('Creating Clipper...')
+
+if use_image_aug:
+    train_augs = AugmentationSequential(
+        kornia.augmentation.RandomCrop((140, 140), p=0.3),
+        kornia.augmentation.Resize((224, 224)),
+        kornia.augmentation.RandomHorizontalFlip(p=0.5),
+        kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.3),
+        kornia.augmentation.RandomGrayscale(p=0.3),
+        data_keys=["input"],
+        # random_apply = (1,4)
+    )
+else:
+    train_augs = None
+
 # Don't L2 norm the extracted CLIP embeddings since we want the prior 
 # to learn un-normed embeddings for usage with the SD image variation pipeline.
-clip_extractor = Clipper(clip_variant, clamp_embs=clamp_embs, norm_embs=False, device=device)
+clip_extractor = Clipper(clip_variant, clamp_embs=clamp_embs, norm_embs=False, device=device,
+                        train_transforms=train_augs,
+)
 
 if is_master: print('Creating voxel2clip...')
 voxel2clip_arch = voxel2clip_kwargs.pop('arch')
@@ -275,7 +295,7 @@ num_devices = torch.cuda.device_count()
 num_workers = num_devices
 
 train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
-    batch_size, "images",
+    batch_size,
     num_workers=num_workers,
     train_url=train_url,
     val_url=val_url,
@@ -345,7 +365,7 @@ else:
     raise ValueError(f'unknown alpha_schedule: {alpha_schedule}')
 
 # for Atom's loss
-epoch_temps = np.linspace(0.004, 0.0075, num_epochs-int(0.5*num_epochs), endpoint=True)
+soft_loss_temps = utils.cosine_anneal(0.004, 0.0075, num_epochs - int(mixup_pct * num_epochs))
 
 if wandb_log and is_master:
     import wandb
@@ -371,6 +391,10 @@ if first_batch:
     train_dl = [(voxel0, image0, trial0, key0)]
     val_dl = [(val_voxel0, val_image0, val_trial0, val_key0)]
 
+# save_ckpt('best')
+# import sys
+# sys.exit(0)
+
 # feed text and images into diffusion prior network
 progress_bar = tqdm(range(epoch, num_epochs), desc='train loop', disable=(distributed and local_rank != 0))
 
@@ -395,7 +419,6 @@ for epoch in progress_bar:
     image_aug = None
 
     alpha = alphas[epoch]
-    epoch_temp = epoch_temps[epoch - int(0.5*num_epochs)]
 
     keys = set()
 
@@ -417,9 +440,10 @@ for epoch in progress_bar:
             else:
                 clip_target = clip_extractor.embed_image(image).float()
             
-            if use_mixco and epoch < int(0.5*num_epochs):
+            if use_mixco and epoch < int(mixup_pct * num_epochs):
                 # mixup augment the voxels
                 voxel, perm, betas, select = utils.mixco(voxel)
+                clip_target = utils.mixco_clip_target(clip_target, perm, select, betas)
             
             if combine_models:
                 # loss here is MSE for the prior, clip_voxels are voxel2clip outputs
@@ -429,17 +453,20 @@ for epoch in progress_bar:
                 if combine_losses:
                     # combine losses for contrastive learned voxel2clip mapper and the prior
                     if use_mixco:
-                        if epoch < int(0.5*num_epochs):
+                        if epoch < int(mixup_pct * num_epochs):
                             loss_nce = contrast_loss(
                                 nn.functional.normalize(clip_voxels, dim=-1), 
                                 nn.functional.normalize(clip_target, dim=-1),
-                                temp=0.006, perm=perm, betas=betas, select=select,
+                                temp=0.006, perm=perm, betas=betas,
+                                select=select, distributed=distributed, local_rank=local_rank,
                             )
+                         
                         else:
+                            epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
                             loss_nce = utils.soft_clip_loss(
                                 nn.functional.normalize(clip_voxels, dim=-1), 
                                 nn.functional.normalize(clip_target, dim=-1),
-                                temp=epoch_temp,
+                                temp=epoch_temp, distributed=distributed,
                             )
                     else:
                         loss_nce = contrast_loss(
@@ -571,18 +598,23 @@ for epoch in progress_bar:
 
                         if combine_losses:
                             if use_mixco:
-                                if epoch < int(0.5*num_epochs):
+                                if epoch < int(mixup_pct * num_epochs):
+                                    print('Computing contrastive loss', flush=True)
                                     loss_nce = contrast_loss(
                                         nn.functional.normalize(clip_voxels, dim=-1), 
                                         nn.functional.normalize(clip_target, dim=-1),
-                                        temp=0.006,
+                                        temp=0.006, distributed=False,
                                     )
+                                    print('loss_contrast', loss_nce, flush=True)
                                 else:
+                                    print('Computing soft clip loss', flush=True)
+                                    epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
                                     loss_nce = utils.soft_clip_loss(
                                         nn.functional.normalize(clip_voxels, dim=-1), 
                                         nn.functional.normalize(clip_target, dim=-1),
-                                        temp=epoch_temp,
+                                        temp=epoch_temp, distributed=False,
                                     )
+                                    print('loss_soft_clip', loss_nce, flush=True)
                             else:
                                 loss_nce = contrast_loss(
                                     nn.functional.normalize(clip_voxels, dim=-1), 
@@ -682,14 +714,16 @@ for epoch in progress_bar:
                 else:
                     voxel2clip_ = voxel2clip
 
+                n_samples_save_train = n_samples_save // 2
+
                 grids, train_fid = utils.sample_images(
                     clip_extractor, 
                     voxel2clip_, 
                     sd_pipe, 
                     diffusion_prior if not distributed else diffusion_prior.module,
-                    voxel0[:n_samples_save], 
-                    image0[:n_samples_save], 
-                    annotations=subj01_annots[trial0[:n_samples_save]] if is_text else None,
+                    voxel0[:n_samples_save_train], 
+                    image0[:n_samples_save_train], 
+                    annotations=subj01_annots[trial0[:n_samples_save_train]] if is_text else None,
                     seed=42,
                 )
                 for i, grid in enumerate(grids):
