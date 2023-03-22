@@ -48,7 +48,7 @@ if __name__ == '__main__':
     initial_lr = 1e-3 #3e-5
     max_lr = 3e-4
     wandb_log = False
-    wandb_project = 'laion-fmri'
+    wandb_project = 'fMRI-reconstruction-NSD'
     wandb_run_name = ''
     wandb_notes = ''
     first_batch = False
@@ -61,6 +61,8 @@ if __name__ == '__main__':
     cache_dir = 'cache'
     n_cache_recs = 0
     mixup_pct = 0.5
+    outdir = os.path.expanduser(f'../train_logs/models/{model_name}/test')
+    test_is_val = False
 
     torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -69,7 +71,6 @@ if __name__ == '__main__':
     exec(open('configurator.py').read()) # overrides from command line or config file
     config = {k: globals()[k] for k in config_keys} # will be useful for logging
 
-    outdir = os.path.expanduser(f'../train_logs/models/{model_name}/test')
     os.makedirs(outdir, exist_ok=True)
     num_devices = torch.cuda.device_count()
     if num_devices==0: num_devices = 1
@@ -117,14 +118,25 @@ if __name__ == '__main__':
     if remote_data:
         # pull data directly from huggingface
         train_url, val_url = utils.get_huggingface_urls(data_commit)
+        meta_url = None
     else:
         # local paths
         if data_commit is None:
             train_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/train/train_subj01_{0..49}.tar"
             val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/val/val_subj01_0.tar"
+            meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/metadata_subj01.json"
         else:
             train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_train/train_subj01_{{0..49}}.tar"
             val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_val/val_subj01_0.tar"
+            meta_url = None
+        
+        if test_is_val:
+            # use test data as val data and combine train+val for training
+            train_url = "{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/train/train_subj01_{0..49}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/val/val_subj01_0.tar}"
+            val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/test/test_subj01_{0..5}.tar"
+            meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/metadata_subj01.json"
+            # num_train = 24680 + 300
+            # num_val = 2770
 
     if voxel_dims == 1:
         voxels_key = 'nsdgeneral.npy'
@@ -140,11 +152,13 @@ if __name__ == '__main__':
         num_workers=num_workers,
         train_url=train_url,
         val_url=val_url,
+        meta_url=meta_url,
         cache_dir=cache_dir,
         n_cache_recs=n_cache_recs,
         voxels_key=voxels_key,
         val_batch_size=300,
         to_tuple=["voxels", "images", "trial", "__key__"],
+        test_is_val=test_is_val,
     )
 
     assert modality in ("image", "text"), f"Unknown modality: {modality}"
@@ -191,6 +205,9 @@ if __name__ == '__main__':
     best_val_loss = 1e9
     soft_loss_temps = utils.cosine_anneal(0.004, 0.0075, num_epochs - int(mixup_pct * num_epochs))
 
+    keys = set()
+    val_keys = set()
+
     for epoch in progress_bar:
         voxel2clip.train()
 
@@ -202,6 +219,7 @@ if __name__ == '__main__':
         val_bwd_percent_correct = 0.
 
         for train_i, (voxel, image, trial, key) in enumerate(train_dl):
+            keys.update(key)
             optimizer.zero_grad()
 
             image = image.to(device).float()
@@ -271,6 +289,7 @@ if __name__ == '__main__':
         if local_rank==0: 
             voxel2clip.eval()
             for val_i, (voxel, image, trial, key) in enumerate(val_dl):
+                val_keys.update(key)
                 with torch.no_grad():
                     image = image.to(device).float()
                     voxel = voxel.to(device).float()
@@ -297,14 +316,15 @@ if __name__ == '__main__':
                                 nn.functional.normalize(clip_voxels, dim=-1), 
                                 nn.functional.normalize(clip_target, dim=-1),
                                 temp=0.006,
-                                distributed=distributed,
+                                distributed=False, # always false otherwise DDP hangs here
                             )
                         else:
                             epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
                             loss = utils.soft_clip_loss(
                                 nn.functional.normalize(clip_voxels, dim=-1), 
                                 nn.functional.normalize(clip_target, dim=-1),
-                                temp=epoch_temp, distributed=distributed
+                                temp=epoch_temp,
+                                distributed=False, # always false otherwise DDP hangs here
                             )
                         utils.check_loss(loss)
 
@@ -344,12 +364,14 @@ if __name__ == '__main__':
                 "val/loss": np.mean(val_losses[-(val_i+1):]),
                 "train/lr": lrs[-1],
                 "train/num_steps": len(losses),
-                "train/cosine_sim_base": sims_base / (train_i + 1),
-                "val/cosine_sim_base": val_sims_base / (val_i + 1),
+                "train/cos_sim_base": sims_base / (train_i + 1),
+                "val/cos_sim_base": val_sims_base / (val_i + 1),
                 "train/fwd_pct_correct": fwd_percent_correct / (train_i + 1),
                 "train/bwd_pct_correct": bwd_percent_correct / (train_i + 1),
                 "val/val_fwd_pct_correct": val_fwd_percent_correct / (val_i + 1),
                 "val/val_bwd_pct_correct": val_bwd_percent_correct / (val_i + 1),
+                "train/unique_samples": len(keys), # only accurate without DDP
+                "val/unique_samples": len(val_keys),
             }
             if local_rank==0: print(logs)
 

@@ -136,6 +136,12 @@ def mixco(voxels, beta=0.15, s_thresh=0.5):
     betas[~select] = 1
     return voxels, perm, betas, select
 
+def mixco_clip_target(clip_target, perm, select, betas):
+    clip_target_shuffle = clip_target[perm]
+    clip_target[select] = clip_target[select] * betas[select].reshape(-1, 1) + \
+        clip_target_shuffle[select] * (1 - betas[select]).reshape(-1, 1)
+    return clip_target
+
 def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distributed=False, local_rank=None):
     if distributed:
         all_targs = gather_features(targs, None)
@@ -152,7 +158,7 @@ def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distri
             probs = probs_all
 
         loss = -(brain_clip.log_softmax(-1) * probs).sum(-1).mean()
-        print('mixco loss: ', loss.item())
+        # print('mixco loss: ', loss.item())
         return loss
     else:
         return F.cross_entropy(brain_clip, torch.arange(brain_clip.shape[0]).to(brain_clip.device))
@@ -275,7 +281,7 @@ def check_loss(loss):
 
 def get_dataloaders(
     batch_size,
-    image_var,
+    image_var='images',
     num_devices=None,
     num_workers=None,
     train_url=None,
@@ -288,6 +294,7 @@ def get_dataloaders(
     voxels_key="nsdgeneral.npy",
     val_batch_size=None,
     to_tuple=["voxels", "images", "__key__"], # include trial with ["voxels", "images", "trial", "__key__"]
+    test_is_val=False,
 ):
     print("Getting dataloaders...")
     assert image_var == 'images'
@@ -309,10 +316,16 @@ def get_dataloaders(
         # for commits up to 9947586218b6b7c8cab804009ddca5045249a38d
         num_train = 24983
         num_val = 492
+        assert test_is_val == False, "test_is_val == True not supported without a meta_url"
     else:
         metadata = json.load(open(meta_url))
-        num_train = metadata['totals']['train']
-        num_val = metadata['totals']['val']
+        if test_is_val:
+            # `train_url` contains train + val and `val_url` contains test
+            num_train = metadata['totals']['train'] + metadata['totals']['val']
+            num_val = metadata['totals']['test']
+        else:
+            num_train = metadata['totals']['train']
+            num_val = metadata['totals']['val']
         
     if num_samples is not None:
         num_train = num_samples
