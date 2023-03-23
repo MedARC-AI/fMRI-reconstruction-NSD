@@ -296,10 +296,18 @@ class BrainDiffusionPrior(DiffusionPrior):
 
         if voxel2clip_path:
             # load the voxel2clip weights
-            ckpt = torch.load(voxel2clip_path, map_location=torch.device('cpu'))
-            if 'model_state_dict' in ckpt:
-                ckpt = ckpt['model_state_dict']
-            diffusion_prior.voxel2clip.load_state_dict(ckpt)
+            checkpoint = torch.load(voxel2clip_path, map_location=torch.device('cpu'))
+            
+            try:
+                diffusion_prior.voxel2clip.load_state_dict(checkpoint['model_state_dict'])
+            except:
+                # converting ddp model to non-ddp format
+                state_dict = checkpoint['model_state_dict']
+                for key in list(state_dict.keys()):
+                    if 'module.' in key:
+                        state_dict[key.replace('module.', '')] = state_dict[key]
+                        del state_dict[key]
+                diffusion_prior.voxel2clip.load_state_dict(state_dict)
         
         return diffusion_prior
 

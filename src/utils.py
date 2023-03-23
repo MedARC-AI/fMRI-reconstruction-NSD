@@ -26,13 +26,6 @@ from glob import glob
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# img_augment = transforms.Compose([
-#                 transforms.RandomCrop(size=(140,140)),
-#                 transforms.RandomHorizontalFlip(p=.5),
-#                 transforms.ColorJitter(.4,.4,.2,.1),
-#                 transforms.RandomGrayscale(p=.2),
-#             ])
-
 def seed_everything(seed=0, cudnn_deterministic=True):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -103,19 +96,19 @@ def topk(similarities,labels,k=5):
         topsum += torch.sum(torch.argsort(similarities,axis=1)[:,-(i+1)] == labels)/len(labels)
     return topsum
 
-def gather_features(image_features, voxel_features):  
-    all_image_features = torch.cat(torch.distributed.nn.all_gather(image_features), dim=0)
+def gather_features(image_features, voxel_features, accelerator):  
+    all_image_features = accelerator.gather(image_features)
     if voxel_features is not None:
-        all_voxel_features = torch.cat(torch.distributed.nn.all_gather(voxel_features), dim=0)
+        all_voxel_features = accelerator.gather(voxel_features)
         return all_image_features, all_voxel_features
     return all_image_features
 
-def soft_clip_loss(preds, targs, temp=0.125, distributed=False):
+def soft_clip_loss(preds, targs, temp=0.125, distributed=False, accelerator=None):
     if not distributed:
         clip_clip = (targs @ targs.T)/temp
         brain_clip = (preds @ targs.T)/temp
     else:
-        all_targs = gather_features(targs, None)
+        all_targs = gather_features(targs, None, accelerator)
         clip_clip = (targs @ all_targs.T)/temp
         brain_clip = (preds @ all_targs.T)/temp
     
@@ -142,9 +135,13 @@ def mixco_clip_target(clip_target, perm, select, betas):
         clip_target_shuffle[select] * (1 - betas[select]).reshape(-1, 1)
     return clip_target
 
+<<<<<<< HEAD
+def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distributed=False, accelerator=None, local_rank=None):
+=======
 def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distributed=False, local_rank=None):
+>>>>>>> e1f44fb0484c63e3ea9e5538ca2ef407a965e9ac
     if distributed:
-        all_targs = gather_features(targs, None)
+        all_targs = gather_features(targs, None, accelerator)
         brain_clip = (preds @ all_targs.T)/temp
     else:
         brain_clip = (preds @ targs.T)/temp
@@ -152,13 +149,18 @@ def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distri
     if perm is not None and betas is not None and select is not None:
         probs = torch.diag(betas)
         probs[torch.arange(preds.shape[0]).to(preds.device), perm] = 1 - betas
+
         if distributed:
             probs_all = torch.zeros_like(brain_clip)
             probs_all[:, local_rank*brain_clip.shape[0]:(local_rank+1)*brain_clip.shape[0]] = probs
             probs = probs_all
 
         loss = -(brain_clip.log_softmax(-1) * probs).sum(-1).mean()
+<<<<<<< HEAD
+        #print('mixco loss: ', loss.item())
+=======
         # print('mixco loss: ', loss.item())
+>>>>>>> e1f44fb0484c63e3ea9e5538ca2ef407a965e9ac
         return loss
     else:
         return F.cross_entropy(brain_clip, torch.arange(brain_clip.shape[0]).to(brain_clip.device))
@@ -258,15 +260,8 @@ def get_huggingface_urls(commit='9947586218b6b7c8cab804009ddca5045249a38d'):
     return train_url, val_url
 
 def split_by_node(urls):
-    node_id, node_count = torch.distributed.get_rank(), torch.distributed.get_world_size()
+    node_id, node_count = accelerator.state.local_process_index, accelerator.state.num_processes
     return urls[node_id::node_count]
-
-# def split_by_node_val(urls):
-#     node_id, node_count = torch.distributed.get_rank(), torch.distributed.get_world_size()
-#     if node_id == 0:
-#         return urls
-#     else:
-#         return []
 
 def my_split_by_worker(urls):
     wi = torch.utils.data.get_worker_info()
@@ -287,16 +282,22 @@ def get_dataloaders(
     train_url=None,
     val_url=None,
     meta_url=None,
-    num_samples=None,
-    num_val_samples=None,
+    num_train=None,
+    num_val=None,
     cache_dir="/tmp/wds-cache",
     n_cache_recs=0,
+    seed=0,
     voxels_key="nsdgeneral.npy",
     val_batch_size=None,
+<<<<<<< HEAD
+    to_tuple=["voxels", "images", "trial"],
+    local_rank=0,
+=======
     to_tuple=["voxels", "images", "__key__"], # include trial with ["voxels", "images", "trial", "__key__"]
     test_is_val=False,
+>>>>>>> e1f44fb0484c63e3ea9e5538ca2ef407a965e9ac
 ):
-    print("Getting dataloaders...")
+    if local_rank==0: print("Getting dataloaders...")
     assert image_var == 'images'
 
     train_url_hf, val_url_hf = get_huggingface_urls()
@@ -314,6 +315,21 @@ def get_dataloaders(
     
     if meta_url is None:
         # for commits up to 9947586218b6b7c8cab804009ddca5045249a38d
+<<<<<<< HEAD
+        if num_train is None:
+            num_train = 24983
+        if num_val is None:
+            num_val = 492
+    else:
+        metadata = json.load(open(meta_url))
+        if num_train is None:
+            num_train = metadata['totals']['train']
+        if num_val is None:
+            num_val = metadata['totals']['val']
+
+    if val_batch_size is None:
+        val_batch_size = batch_size
+=======
         num_train = 24983
         num_val = 492
         assert test_is_val == False, "test_is_val == True not supported without a meta_url"
@@ -326,91 +342,55 @@ def get_dataloaders(
         else:
             num_train = metadata['totals']['train']
             num_val = metadata['totals']['val']
+>>>>>>> e1f44fb0484c63e3ea9e5538ca2ef407a965e9ac
         
-    if num_samples is not None:
-        num_train = num_samples
-    
-    if num_val_samples is not None:
-        num_val = num_val_samples
-    
     global_batch_size = batch_size * num_devices
     num_batches = math.floor(num_train / global_batch_size)
     num_worker_batches = math.floor(num_batches / num_workers)
-
-    if val_batch_size is None:
-        val_batch_size = batch_size
-
-    print("train_url", train_url)
-    print("val_url", val_url)
-    print("num_devices", num_devices)
-    print("num_workers", num_workers)
-    print("batch_size", batch_size)
-    print("val_batch_size", val_batch_size)
-    print("global_batch_size", global_batch_size)
-    print("num_worker_batches", num_worker_batches)
-    print('num_train', num_train)
-    print('num_val', num_val)
+    if num_worker_batches == 0: num_worker_batches = 1
     
-    # train_data = wds.DataPipeline([wds.ResampledShards(train_url),
-    #                     wds.tarfile_to_samples(),
-    #                     wds.shuffle(500,initial=500),
-    #                     wds.decode("torch"),
-    #                     wds.rename(images="jpg;png", voxels="nsdgeneral.npy", 
-    #                                 trial="trial.npy"),
-    #                     wds.to_tuple("voxels", image_var),
-    #                     wds.batched(batch_size, partial=True),
-    #                 ]).with_epoch(num_worker_batches)
-
+    if local_rank==0: print("\nnum_train",num_train)
+    if local_rank==0: print("global_batch_size",global_batch_size)
+    if local_rank==0: print("batch_size",batch_size)
+    if local_rank==0: print("num_workers",num_workers)
+    if local_rank==0: print("num_batches",num_batches)
+    if local_rank==0: print("num_worker_batches", num_worker_batches)
+    
     if 'http' not in train_url:
         # don't use cache if train_url is for local path
         cache_dir = None
     print("cache_dir", cache_dir)
     if cache_dir is not None and not os.path.exists(cache_dir):
-        os.makedirs(cache_dir)
-
-    # can pass to .shuffle `rng=random.Random(42)` to maybe get deterministic shuffling
+        os.makedirs(cache_dir,exist_ok=True)
+    
     train_data = wds.WebDataset(train_url, resampled=True, cache_dir=cache_dir, nodesplitter=wds.split_by_node)\
         .shuffle(500, initial=500, rng=random.Random(42))\
         .decode("torch")\
-        .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
+        .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy", coco="coco73k.npy", reps="num_uniques.npy")\
         .to_tuple(*to_tuple)\
         .batched(batch_size, partial=True)\
         .with_epoch(num_worker_batches)
 
     if n_cache_recs > 0:
         train_data = train_data.compose(wds.DBCache, os.path.join(cache_dir, "cache-train.db"),  n_cache_recs)
-    
-    train_dl = wds.WebLoader(train_data, num_workers=num_workers,
-                            batch_size=None, shuffle=False, persistent_workers=True)
-    # train_dl.ddp_equalize(24983 // batch_size)
-    
+        
+    train_dl = torch.utils.data.DataLoader(train_data, batch_size=None, num_workers=num_workers, shuffle=False)
+
     # Validation
-    # use only one GPU
-    global_batch_size = val_batch_size
-    num_workers = 1
-
-    num_batches = math.ceil(num_val / global_batch_size)
-    num_worker_batches = math.ceil(num_batches / num_workers)
-    print("validation: num_worker_batches", num_worker_batches)
-
-    # val_data = wds.DataPipeline([wds.SimpleShardList(val_url),
-    #                     wds.tarfile_to_samples(),
-    #                     wds.decode("torch"),
-    #                     wds.rename(images="jpg;png", voxels="nsdgeneral.npy", 
-    #                                 trial="trial.npy"),
-    #                     wds.to_tuple("voxels", image_var),
-    #                     wds.batched(batch_size, partial=True),
-    #                 ]).with_epoch(num_worker_batches)
-
-    val_data = wds.WebDataset(val_url, resampled=True, cache_dir=cache_dir, nodesplitter=wds.split_by_node)\
-        .decode("torch")\
-        .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
-        .to_tuple(*to_tuple)\
-        .batched(val_batch_size, partial=True)\
-        .with_epoch(num_worker_batches)
+    # just using the first 300 samples! no shuffling!
+    val_num_workers = num_workers
     
-    val_dl = wds.WebLoader(val_data, num_workers=num_workers,
-                        batch_size=None, shuffle=False, persistent_workers=True)
+    if local_rank==0: print("\nnum_val",num_val)
+    if local_rank==0: print("val_batch_size",val_batch_size)
+    if local_rank==0: print("val_num_workers",val_num_workers)
+    
+    val_data = wds.WebDataset(val_url, resampled=False, cache_dir=cache_dir, nodesplitter=wds.split_by_node)\
+        .decode("torch")\
+        .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy", coco="coco73k.npy", reps="num_uniques.npy")\
+        .to_tuple(*to_tuple)\
+        .batched(val_batch_size, partial=False)
+    
+    val_dl = torch.utils.data.DataLoader(val_data, batch_size=None, num_workers=val_num_workers, shuffle=False)
 
     if n_cache_recs > 0:
         val_data = val_data.compose(wds.DBCache, os.path.join(cache_dir, "cache-val.db"),  n_cache_recs)
