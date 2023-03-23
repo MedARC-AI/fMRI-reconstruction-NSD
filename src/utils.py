@@ -135,11 +135,7 @@ def mixco_clip_target(clip_target, perm, select, betas):
         clip_target_shuffle[select] * (1 - betas[select]).reshape(-1, 1)
     return clip_target
 
-<<<<<<< HEAD
 def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distributed=False, accelerator=None, local_rank=None):
-=======
-def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distributed=False, local_rank=None):
->>>>>>> e1f44fb0484c63e3ea9e5538ca2ef407a965e9ac
     if distributed:
         all_targs = gather_features(targs, None, accelerator)
         brain_clip = (preds @ all_targs.T)/temp
@@ -156,11 +152,7 @@ def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distri
             probs = probs_all
 
         loss = -(brain_clip.log_softmax(-1) * probs).sum(-1).mean()
-<<<<<<< HEAD
         #print('mixco loss: ', loss.item())
-=======
-        # print('mixco loss: ', loss.item())
->>>>>>> e1f44fb0484c63e3ea9e5538ca2ef407a965e9ac
         return loss
     else:
         return F.cross_entropy(brain_clip, torch.arange(brain_clip.shape[0]).to(brain_clip.device))
@@ -289,13 +281,8 @@ def get_dataloaders(
     seed=0,
     voxels_key="nsdgeneral.npy",
     val_batch_size=None,
-<<<<<<< HEAD
     to_tuple=["voxels", "images", "trial"],
     local_rank=0,
-=======
-    to_tuple=["voxels", "images", "__key__"], # include trial with ["voxels", "images", "trial", "__key__"]
-    test_is_val=False,
->>>>>>> e1f44fb0484c63e3ea9e5538ca2ef407a965e9ac
 ):
     if local_rank==0: print("Getting dataloaders...")
     assert image_var == 'images'
@@ -315,7 +302,6 @@ def get_dataloaders(
     
     if meta_url is None:
         # for commits up to 9947586218b6b7c8cab804009ddca5045249a38d
-<<<<<<< HEAD
         if num_train is None:
             num_train = 24983
         if num_val is None:
@@ -329,20 +315,6 @@ def get_dataloaders(
 
     if val_batch_size is None:
         val_batch_size = batch_size
-=======
-        num_train = 24983
-        num_val = 492
-        assert test_is_val == False, "test_is_val == True not supported without a meta_url"
-    else:
-        metadata = json.load(open(meta_url))
-        if test_is_val:
-            # `train_url` contains train + val and `val_url` contains test
-            num_train = metadata['totals']['train'] + metadata['totals']['val']
-            num_val = metadata['totals']['test']
-        else:
-            num_train = metadata['totals']['train']
-            num_val = metadata['totals']['val']
->>>>>>> e1f44fb0484c63e3ea9e5538ca2ef407a965e9ac
         
     global_batch_size = batch_size * num_devices
     num_batches = math.floor(num_train / global_batch_size)
