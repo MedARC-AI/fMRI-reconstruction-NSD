@@ -7,3 +7,5 @@
 **/slurm-*.out
 
 *.pth
+src/evals
+src/evals-*

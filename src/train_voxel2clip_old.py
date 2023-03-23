@@ -1,26 +1,28 @@
 # # Import packages & functions
 
 import os
-import sys
-import json
-import random
-import time
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torchvision.utils import make_grid
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'device: {device}', flush=True)
+
+import ddp_config
+distributed, local_rank = ddp_config.ddp_test()
+is_master = (not distributed) or (distributed and local_rank == 0)
+print(f'ddp_test: distributed: {distributed}, local_rank: {local_rank}, is_master: {is_master}', flush=True)
+
 import kornia
 from kornia.augmentation.container import AugmentationSequential
 from tqdm import tqdm
 import pandas as pd
 import wandb
 from collections import OrderedDict
-from dalle2_pytorch import DiffusionPriorNetwork #, DiffusionPrior
 
-import ddp_config
 import utils
 from models import Clipper, BrainNetwork
 from model3d import NewVoxel3dConvEncoder
@@ -55,7 +57,7 @@ if __name__ == '__main__':
     ckpt_saving = True
     ckpt_interval = 10
     use_mp = False
-    distributed = True
+    distributed = False
     save_at_end = False
 
     cache_dir = 'cache'
@@ -72,15 +74,18 @@ if __name__ == '__main__':
     config = {k: globals()[k] for k in config_keys} # will be useful for logging
 
     os.makedirs(outdir, exist_ok=True)
-    num_devices = torch.cuda.device_count()
-    if num_devices==0: num_devices = 1
-    num_workers = num_devices * 4
-    if distributed:
-        _, local_rank, device = ddp_config.set_ddp()
-    else:
-        local_rank, device = 0, torch.device('cuda:0')
     
-    if local_rank == 0: print('Creating Clipper...')
+    # num_devices = torch.cuda.device_count()
+    # if num_devices==0: num_devices = 1
+    # num_workers = num_devices * 4
+    # if distributed:
+    #     _, local_rank, device = ddp_config.set_ddp()
+    # else:
+    #     local_rank, device = 0, torch.device('cuda:0')
+    num_devices = torch.cuda.device_count()
+    num_workers = num_devices
+    
+    if is_master: print('Creating Clipper...', flush=True)
     
     # Don't L2 norm the extracted CLIP embeddings since we want the prior 
     # to learn un-normed embeddings for usage with the SD image variation pipeline.
@@ -95,7 +100,7 @@ if __name__ == '__main__':
     )
     clip_extractor = Clipper(clip_variant, clamp_embs=False, norm_embs=False, device=device, train_transforms=train_augs)
 
-    if local_rank == 0: print('Creating voxel2clip...')
+    if is_master: print('Creating voxel2clip...', flush=True)
 
     if voxel_dims == 1: # 1D data
         voxel2clip = BrainNetwork(out_dim=dim)
@@ -103,18 +108,18 @@ if __name__ == '__main__':
     elif voxel_dims == 3: # 3D data
         voxel2clip = NewVoxel3dConvEncoder(out_dim=dim)
 
-    if local_rank == 0:
+    if is_master:
         try:
             utils.count_params(voxel2clip)
         except:
-            print('Cannot count params for voxel2clip (probably because it has Lazy layers)')
+            print('Cannot count params for voxel2clip (probably because it has Lazy layers)', flush=True)
     
     voxel2clip = voxel2clip.to(device)
     if distributed:
         voxel2clip = torch.nn.SyncBatchNorm.convert_sync_batchnorm(voxel2clip)
         voxel2clip = DDP(voxel2clip, device_ids=[local_rank])
 
-    if local_rank == 0: print('Pulling NSD webdataset data...')
+    if is_master: print('Pulling NSD webdataset data...', flush=True)
     if remote_data:
         # pull data directly from huggingface
         train_url, val_url = utils.get_huggingface_urls(data_commit)
@@ -145,7 +150,7 @@ if __name__ == '__main__':
     else:
         raise Exception(f"voxel_dims must be 1 or 3, not {voxel_dims}")
 
-    if local_rank == 0: print('Prepping train and validation dataloaders...')
+    if is_master: print('Prepping train and validation dataloaders...', flush=True)
     train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
         batch_size,
         num_devices=num_devices,
@@ -188,10 +193,10 @@ if __name__ == '__main__':
                                                 final_div_factor=1000,
                                                 last_epoch=-1, pct_start=2/num_epochs)
 
-    if local_rank==0: print("\nDone with model preparations!")
+    if is_master: print("\nDone with model preparations!", flush=True)
     utils.seed_everything(local_rank, cudnn_deterministic=False)
 
-    if wandb_log:
+    if wandb_log and is_master:
         wandb.init(
             project=wandb_project,
             name=wandb_run_name,
@@ -199,7 +204,7 @@ if __name__ == '__main__':
             notes=wandb_notes,
         )
 
-    progress_bar = tqdm(range(num_epochs), ncols=150, disable=(local_rank!=0))
+    progress_bar = tqdm(range(num_epochs), ncols=150,  disable=(distributed and local_rank != 0))
     epoch = 0
     losses, val_losses, lrs = [], [], []
     best_val_loss = 1e9
@@ -233,7 +238,6 @@ if __name__ == '__main__':
                         # [bs, 1, 5]
                         # random=True means randomly select a non-empty annotation
                         annots = utils.select_annotations(subj01_annots[trial], random=True)
-                        # print(annots)
                         clip_target = clip_extractor.embed_text(annots).float()
                     else:
                         clip_target = clip_extractor.embed_image(image).float()
@@ -270,7 +274,7 @@ if __name__ == '__main__':
                     utils.batchwise_cosine_similarity(clip_voxels, clip_target), labels, k=1
                 )
 
-                if local_rank==0:
+                if is_master:
                     logs = OrderedDict(
                         train_loss=np.mean(losses[-(train_i+1):]),
                         val_loss=np.nan,
@@ -286,7 +290,7 @@ if __name__ == '__main__':
             if lr_scheduler is not None:
                 lr_scheduler.step()
 
-        if local_rank==0: 
+        if is_master: 
             voxel2clip.eval()
             for val_i, (voxel, image, trial, key) in enumerate(val_dl):
                 val_keys.update(key)
@@ -300,7 +304,6 @@ if __name__ == '__main__':
                                 # [bs, 1, 5]
                                 # NOTE: not using random selection here to keep it consistent
                                 annots = utils.select_annotations(subj01_annots[trial], random=False)
-                                # print(annots)
                                 clip_target = clip_extractor.embed_text(annots).float()
                             else:
                                 clip_target = clip_extractor.embed_image(image).float()
@@ -353,7 +356,7 @@ if __name__ == '__main__':
                     best_val_loss = val_loss
                     utils.save_ckpt(voxel2clip, optimizer, losses, val_losses, lrs, epoch, 'best', outdir)
                 else:
-                    print(f'not best - val_loss: {val_loss:.3f}, best_val_loss: {best_val_loss:.3f}')
+                    print(f'not best - val_loss: {val_loss:.3f}, best_val_loss: {best_val_loss:.3f}', flush=True)
 
                 # Save model checkpoint every `ckpt_interval`` epochs or on the last epoch
                 if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
@@ -373,7 +376,7 @@ if __name__ == '__main__':
                 "train/unique_samples": len(keys), # only accurate without DDP
                 "val/unique_samples": len(val_keys),
             }
-            if local_rank==0: print(logs)
+            if is_master: print(logs, flush=True)
 
             if wandb_log:
                 wandb.log(logs)
