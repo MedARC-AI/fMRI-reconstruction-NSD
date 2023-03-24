@@ -2,27 +2,22 @@
 
 import os
 import sys
-import json
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import transforms
 from tqdm import tqdm
-from info_nce import InfoNCE
-from dalle2_pytorch import DiffusionPriorNetwork
 import kornia
 from kornia.augmentation.container import AugmentationSequential
 
 import utils
-from utils import torch_to_matplotlib, torch_to_Image
-from models import Clipper, BrainNetwork, BrainDiffusionPrior
+from models import Clipper, BrainNetwork
 from model3d import SimpleVoxel3dConvEncoder
 
 import torch.distributed as dist
 from accelerate import Accelerator
 import argparse
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train voxel2clip")
@@ -36,7 +31,15 @@ def parse_args():
         "--modality",
         type=str,
         default="image",
+        choices=["image", "text"],
         help="image or text",
+    )
+    parser.add_argument(
+        "--clip_variant",
+        type=str,
+        default="ViT-L/14",
+        choices=["RN50", "ViT-L/14", "ViT-B/32"],
+        help='clip variant, one of ("RN50", "ViT-L/14", "ViT-B/32")',
     )
     parser.add_argument(
         "--outdir",
@@ -46,8 +49,7 @@ def parse_args():
     )
     parser.add_argument(
         "--wandb_log",
-        type=bool,
-        default=False,
+        action="store_true",
         help="whether to log to wandb",
     )
     parser.add_argument(
@@ -66,12 +68,12 @@ def parse_args():
         "--voxel_dims",
         type=int,
         default=1,
+        choices=[1, 3],
         help="1 for flattened input, 3 for 3d input",
     )
     parser.add_argument(
         "--remote_data",
-        type=bool,
-        default=False,
+        action="store_true",
         help="whether to pull data from huggingface",
     )
     parser.add_argument(
@@ -80,7 +82,13 @@ def parse_args():
         default='/tmp/wds-cache',
         help="directory for caching webdatasets fetched from huggingface",
     )
+    parser.add_argument(
+        "--disable_image_aug",
+        action="store_true",
+        help="whether to disable image augmentation (only used for modality=image)",
+    )
     return parser.parse_args()
+
 
 if __name__ == '__main__':
     args = parse_args()
@@ -90,11 +98,9 @@ if __name__ == '__main__':
         is_text = True
     else:
         is_text = False
-    clip_variant = "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
     clamp_embs = False # clamp embeddings to (-1.5, 1.5)
     seed = 42
     mixup_pct = 0.5
-    use_image_aug = True
     
     resume_from_ckpt = False
 
@@ -110,7 +116,6 @@ if __name__ == '__main__':
 
     ckpt_saving = True
     ckpt_interval = 10
-    save_at_end = True
     if args.outdir is None:
         outdir = f'../train_logs/{args.model_name}'
     else:
@@ -118,7 +123,7 @@ if __name__ == '__main__':
     if not os.path.exists(outdir):
         os.makedirs(outdir,exist_ok=True)
 
-    if use_image_aug:
+    if not args.disable_image_aug:
         train_augs = AugmentationSequential(
             kornia.augmentation.RandomResizedCrop((224,224), (0.6,1), p=0.3),
             kornia.augmentation.Resize((224, 224)),
@@ -171,14 +176,6 @@ if __name__ == '__main__':
         f.close()
         annots = np.load(os.path.join(args.h5_dir, 'COCO_73k_annots_curated.npy'), allow_pickle=True)
         subj01_annots = annots[subj01_order]
-
-    print('Pulling NSD webdataset data...')
-    # local paths
-    # data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
-    # train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_train/train_subj01_{{0..49}}.tar"
-    # val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_val/val_subj01_0.tar"
-    # meta_url = None
-    # num_train = num_val = None # None means use all samples as specified in webdataset metadata.json
 
     train_url = "{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj01_{0..17}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj01_0.tar}"
     val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/test/test_subj01_{0..1}.tar"
@@ -239,12 +236,17 @@ if __name__ == '__main__':
 
     # Don't L2 norm the extracted CLIP embeddings since we want the prior 
     # to learn un-normed embeddings for usage with the SD image variation pipeline.
-    clip_extractor = Clipper(clip_variant, clamp_embs=False, norm_embs=False, device=device, train_transforms=train_augs)
+    clip_extractor = Clipper(args.clip_variant, clamp_embs=False, norm_embs=False, device=device, train_transforms=train_augs)
 
     print('Creating voxel2clip...')
 
+    # size of the CLIP embedding for each variant
+    clip_sizes = {"RN50": 1024, "ViT-L/14": 768, "ViT-B/32": 512}
+    # output dim for voxel2clip model
+    out_dim = clip_sizes[args.clip_variant]
+
     if args.voxel_dims == 1: # 1D data
-        voxel2clip_kwargs = dict(out_dim=768)
+        voxel2clip_kwargs = dict(out_dim=out_dim)
         voxel2clip = BrainNetwork(**voxel2clip_kwargs)
     elif args.voxel_dims == 3: # 3D data
         voxel2clip_kwargs = dict(
@@ -285,7 +287,6 @@ if __name__ == '__main__':
     def save_ckpt(tag):
         ckpt_path = os.path.join(outdir, f'{tag}.pth')
         print(f'saving {ckpt_path}',flush=True)
-        state_dict = voxel2clip.state_dict()
         torch.save({
             'epoch': epoch,
             'model_state_dict': voxel2clip.state_dict(),
@@ -314,10 +315,10 @@ if __name__ == '__main__':
               "model_name": args.model_name,
               "modality": args.modality,
               "voxel_dims": args.voxel_dims,
-              "clip_variant": clip_variant,
+              "clip_variant": args.clip_variant,
               "batch_size": batch_size,
               "num_epochs": num_epochs,
-              "use_image_aug": use_image_aug,
+              "disable_image_aug": args.disable_image_aug,
               "max_lr": max_lr,
               "lr_scheduler": lr_scheduler,
               "clamp_embs": clamp_embs,
@@ -507,8 +508,8 @@ if __name__ == '__main__':
                 # brain, clip
                 val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target, clip_voxels), labels, k=1)
 
-        if local_rank==0:
-            if (not save_at_end and ckpt_saving) or (save_at_end and epoch == num_epochs - 1):
+        if local_rank == 0:
+            if ckpt_saving:
                 # save best model
                 val_loss = np.mean(val_losses[-(val_i+1):])
                 if val_loss < best_val_loss:
@@ -517,9 +518,9 @@ if __name__ == '__main__':
                 else:
                     print(f'not best - val_loss: {val_loss:.3f}, best_val_loss: {best_val_loss:.3f}')
 
-            # Save model checkpoint every `ckpt_interval`` epochs or on the last epoch
-            if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
-                save_ckpt(f'epoch{epoch:03d}')
+                # Save model checkpoint every `ckpt_interval` epochs or on the last epoch
+                if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
+                    save_ckpt(f'epoch{epoch:03d}')
 
             logs = {"train/loss": np.mean(losses[-(train_i+1):]),
                     "val/loss": np.mean(val_losses[-(val_i+1):]),
