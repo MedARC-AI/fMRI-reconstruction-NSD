@@ -39,7 +39,7 @@ def parse_args():
         type=str,
         default="ViT-L/14",
         choices=["RN50", "ViT-L/14", "ViT-B/32"],
-        help='clip variant, one of ("RN50", "ViT-L/14", "ViT-B/32")',
+        help='clip variant',
     )
     parser.add_argument(
         "--outdir",
