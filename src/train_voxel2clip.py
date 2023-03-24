@@ -68,8 +68,19 @@ def parse_args():
         default=1,
         help="1 for flattened input, 3 for 3d input",
     )
+    parser.add_argument(
+        "--remote_data",
+        type=bool,
+        default=False,
+        help="whether to pull data from huggingface",
+    )
+    parser.add_argument(
+        "--wds_cache_dir",
+        type=str,
+        default='/tmp/wds-cache',
+        help="directory for caching webdatasets fetched from huggingface",
+    )
     return parser.parse_args()
-
 
 if __name__ == '__main__':
     args = parse_args()
@@ -106,7 +117,6 @@ if __name__ == '__main__':
         outdir = args.outdir
     if not os.path.exists(outdir):
         os.makedirs(outdir,exist_ok=True)
-    remote_data = False # if True, pull webdatasets from huggingface
 
     if use_image_aug:
         train_augs = AugmentationSequential(
@@ -163,23 +173,26 @@ if __name__ == '__main__':
         subj01_annots = annots[subj01_order]
 
     print('Pulling NSD webdataset data...')
-    if remote_data:
-        # pull data directly from huggingface
-        train_url, val_url = utils.get_huggingface_urls(data_commit)
-        meta_url = None
-    else:
-        # local paths
-        # data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
-        # train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_train/train_subj01_{{0..49}}.tar"
-        # val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_val/val_subj01_0.tar"
-        # meta_url = None
-        # num_train = num_val = None # None means use all samples as specified in webdataset metadata.json
+    # local paths
+    # data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
+    # train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_train/train_subj01_{{0..49}}.tar"
+    # val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_val/val_subj01_0.tar"
+    # meta_url = None
+    # num_train = num_val = None # None means use all samples as specified in webdataset metadata.json
 
-        train_url = "{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj01_{0..17}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj01_0.tar}"
-        val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/test/test_subj01_{0..1}.tar"
-        meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/metadata_subj01.json"
-        num_train = 8559 + 300
-        num_val = 982
+    train_url = "{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj01_{0..17}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj01_0.tar}"
+    val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/test/test_subj01_{0..1}.tar"
+    meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/metadata_subj01.json"
+    num_train = 8559 + 300
+    num_val = 982
+
+    if args.remote_data:
+        # data loaders will fetch chunks from huggingface
+        old = '/fsx/proj-medarc/fmri/natural-scenes-dataset/'
+        new = 'https://huggingface.co/datasets/pscotti/naturalscenesdataset/resolve/a8c6147/'
+        train_url = train_url.replace(old, new)
+        val_url = val_url.replace(old, new)
+        meta_url = meta_url.replace(old, new)
 
     # which to use for the voxels
     if args.voxel_dims == 1:
@@ -191,7 +204,7 @@ if __name__ == '__main__':
 
     print('Prepping train and validation dataloaders...')
     train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
-        batch_size,'images',
+        batch_size,
         num_devices=num_devices,
         num_workers=num_workers,
         train_url=train_url,
@@ -200,7 +213,7 @@ if __name__ == '__main__':
         num_train=num_train,
         num_val=num_val,
         val_batch_size=300,
-        cache_dir="/tmp/wds-cache",
+        cache_dir=args.wds_cache_dir,
         seed=seed,
         voxels_key=voxels_key,
         local_rank=local_rank,
@@ -390,6 +403,7 @@ if __name__ == '__main__':
                 voxel, perm, betas, select = utils.mixco(voxel)
 
             if is_text:
+                trial = trial.cpu().numpy()
                 annots = utils.select_annotations(subj01_annots[trial], random=True)
                 clip_target = clip_extractor.embed_text(annots).float()
             else:
@@ -439,6 +453,7 @@ if __name__ == '__main__':
                 repeat_index = val_i % 3
 
                 image = image.float()
+                # voxel.shape: [bs, 3, 15724]
                 voxel = voxel[:,repeat_index].float()
 
                 if args.voxel_dims == 3:
@@ -451,6 +466,7 @@ if __name__ == '__main__':
                     val_voxel0 = voxel.detach().clone()
 
                 if is_text:
+                    trial = trial.cpu().numpy()
                     annots = utils.select_annotations(subj01_annots[trial], random=False)
                     clip_target = clip_extractor.embed_text(annots).float()
                 else:

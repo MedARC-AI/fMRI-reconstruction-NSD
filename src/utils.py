@@ -296,7 +296,10 @@ def get_dataloaders(
         if num_val is None:
             num_val = 492
     else:
-        metadata = json.load(open(meta_url))
+        if os.path.exists(meta_url):
+            metadata = json.load(open(meta_url))
+        else:
+            metadata = json.loads(requests.get(meta_url).text)
         if num_train is None:
             num_train = metadata['totals']['train']
         if num_val is None:

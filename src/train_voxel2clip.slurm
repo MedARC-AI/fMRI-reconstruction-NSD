@@ -15,7 +15,7 @@ eval "$(conda shell.bash hook)"
 conda activate medical-v1
 
 WANDB_PROJECT='fMRI-reconstruction-NSD'
-H5_DIR='/fsx/proj-medarc/fmri/natural-scenes-dataset/'
+# H5_DIR='/fsx/proj-medarc/fmri/natural-scenes-dataset/'
 
 MODALITY='text'
 RUNID="v2c-${MODALITY}-spAvg-1gpu"
