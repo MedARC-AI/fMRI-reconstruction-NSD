@@ -15,6 +15,8 @@ The voxel2clip feed forward model takes 1D or 3D voxel vectors and converts to a
 
 ```bash
 $ python train_voxel2clip.py --help
+```
+```
 usage: train_voxel2clip.py [-h] [--model_name MODEL_NAME] [--modality {image,text}] [--clip_variant {RN50,ViT-L/14,ViT-B/32}] [--outdir OUTDIR] [--wandb_log]
                            [--wandb_project WANDB_PROJECT] [--h5_dir H5_DIR] [--voxel_dims {1,3}] [--remote_data] [--wds_cache_dir WDS_CACHE_DIR] [--disable_image_aug]
 
