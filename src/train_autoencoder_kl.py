@@ -25,8 +25,9 @@ import ddp_config
 _, local_rank, device = ddp_config.set_ddp()
 
 import utils
-from models import Voxel2StableDiffusionModel
+from models import Voxel2StableDiffusionModel, Voxel2StableDiffusionKLModel
 from convnext import ConvnextXL
+from diffusers.models.vae import DiagonalGaussianDistribution
 
 
 from diffusers.models import AutoencoderKL
@@ -53,7 +54,7 @@ n_samples_save = 4 # how many SD samples from train and val to save
 
 use_reconst = True
 if use_reconst:
-    batch_size = 8
+    batch_size = 4
 else:
     batch_size = 32
 num_epochs = 120
@@ -96,7 +97,7 @@ if use_cont:
         kornia.augmentation.RandomGrayscale(p=0.2),
         kornia.augmentation.RandomSolarize(p=0.2),
         kornia.augmentation.RandomGaussianBlur(kernel_size=(7, 7), sigma=(0.1, 2.0), p=0.1),
-        kornia.augmentation.RandomResizedCrop((512, 512), scale=(0.5, 1.0)),
+        kornia.augmentation.RandomResizedCrop((512, 512), scale=(0.6, 1.0)),
         data_keys=["input"],
     )
 
@@ -133,7 +134,7 @@ n_cache_recs = 0
 if local_rank == 0: print('Creating voxel2sd...')
 
 if voxel_dims == 1: # 1D data
-    voxel2sd = Voxel2StableDiffusionModel(use_cont=use_cont)
+    voxel2sd = Voxel2StableDiffusionKLModel(use_cont=use_cont)
     # 134M params
 elif voxel_dims == 3: # 3D data
     raise NotImplementedError()
@@ -187,7 +188,6 @@ train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
     cache_dir=cache_dir,
     n_cache_recs=n_cache_recs,
     voxels_key=voxels_key,
-    val_batch_size=16
 )
 
 no_decay = ['bias']
@@ -268,17 +268,19 @@ for epoch in progress_bar:
         image_512 = F.interpolate(image, (512, 512), mode='bilinear', align_corners=False, antialias=True)
         voxel = voxel.to(device).float()
         if epoch <= mixup_pct * num_epochs:
+            # if local_rank==0: print('Epoch', epoch, mixup_pct * num_epochs)
             voxel, perm, betas, select = utils.mixco(voxel)
         else:
             select = None
 
         with torch.cuda.amp.autocast(enabled=use_mp):
-            autoenc_image = kornia.filters.median_blur(image_512, (15, 15)) if use_blurred_training else image_512
-            image_enc = autoenc.encode(2*autoenc_image-1).latent_dist.mode() * 0.18215
+            autoenc_image = image_512  # kornia.filters.median_blur(image_512, (15, 15)) if use_blurred_training else image_512
+            image_enc = autoenc.encode(2*autoenc_image-1).latent_dist
             if use_cont:
                 image_enc_pred, transformer_feats = voxel2sd(voxel, return_transformer_feats=True)
             else:
                 image_enc_pred = voxel2sd(voxel)
+            image_enc_pred = DiagonalGaussianDistribution(autoenc.quant_conv(image_enc_pred))
             if epoch <= mixup_pct * num_epochs:
                 image_enc_shuf = image_enc[perm]
                 betas_shape = [-1] + [1]*(len(image_enc.shape)-1)
@@ -302,7 +304,9 @@ for epoch in progress_bar:
                 cont_loss = torch.tensor(0)
 
             # mse_loss = F.mse_loss(image_enc_pred, image_enc)/0.18215
-            mse_loss = F.l1_loss(image_enc_pred, image_enc)
+            kl_loss = image_enc_pred.kl(image_enc).mean()
+            # import pdb; pdb.set_trace()
+            mse_loss = F.l1_loss(image_enc_pred.mode(), image_enc.mode())
             del image_512, voxel
 
             if use_reconst: #epoch >= 0.1 * num_epochs:
@@ -311,10 +315,9 @@ for epoch in progress_bar:
                     selected_inds = torch.where(~select)[0]
                     reconst_select = selected_inds[torch.randperm(len(selected_inds))][:4] 
                 else:
-                    # reconst_select = torch.randperm(len(image_enc_pred))[:4]
-                    reconst_select = torch.arange(len(image_enc_pred))
-                image_enc_pred = F.interpolate(image_enc_pred[reconst_select], scale_factor=0.5, mode='bilinear', align_corners=False)
-                reconst = autoenc.decode(image_enc_pred/0.18215).sample
+                    reconst_select = torch.arange(len(image_enc_pred.mode()))  # torch.randperm(len(image_enc_pred.mode()))[:4]
+                image_enc_pred = F.interpolate(image_enc_pred.mode()[reconst_select], scale_factor=0.5, mode='bilinear', align_corners=False)
+                reconst = autoenc.decode(image_enc_pred).sample
                 # reconst_loss = F.mse_loss(reconst, 2*image[reconst_select]-1)
                 reconst_image = kornia.filters.median_blur(image[reconst_select], (7, 7)) if use_blurred_training else image[reconst_select]
                 reconst_loss = F.l1_loss(reconst, 2*reconst_image-1)
@@ -331,7 +334,7 @@ for epoch in progress_bar:
                 reconst_loss = torch.tensor(0)
             
 
-            loss = mse_loss/0.18215 + 2*reconst_loss + cont_loss + 16*sobel_loss
+            loss = 2*mse_loss + kl_loss + 2*reconst_loss + cont_loss + 32*sobel_loss
             # utils.check_loss(loss)
 
             loss_mse_sum += mse_loss.item()
@@ -367,13 +370,13 @@ for epoch in progress_bar:
                 voxel = voxel.to(device).float()
                 
                 with torch.cuda.amp.autocast(enabled=use_mp):
-                    image_enc = autoenc.encode(2*image-1).latent_dist.mode() * 0.18215
-                    image_enc_pred = voxel2sd.module(voxel)
+                    image_enc = autoenc.encode(2*image-1).latent_dist.mode()
+                    image_enc_pred = DiagonalGaussianDistribution(autoenc.quant_conv(voxel2sd.module(voxel))).mode()
 
                     mse_loss = F.mse_loss(image_enc_pred, image_enc)
                     
                     if use_reconst:
-                        reconst = autoenc.decode(image_enc_pred[:16]/0.18215).sample
+                        reconst = autoenc.decode(image_enc_pred[:16]).sample
                         image = image[:16]
                         reconst_loss = F.mse_loss(reconst, 2*image-1)
                         ssim_score = ssim((reconst/2 + 0.5).clamp(0,1), image, data_range=1, size_average=True, nonnegative_ssim=True)
@@ -452,6 +455,36 @@ for epoch in progress_bar:
 if wandb_log:
     wandb.finish()
 
+
+# Traceback (most recent call last):
+#   File "train_autoencoder.py", line 300, in <module>
+#     save_ckpt('best')
+#   File "train_autoencoder.py", line 181, in save_ckpt
+#     torch.save({
+#   File "/admin/home-atom_101/python_envs/fmri/lib/python3.8/site-packages/torch/serialization.py", line 422, in save
+#     with _open_zipfile_writer(f) as opened_zipfile:
+#   File "/admin/home-atom_101/python_envs/fmri/lib/python3.8/site-packages/torch/serialization.py", line 309, in _open_zipfile_writer
+#     return container(name_or_buffer)
+#   File "/admin/home-atom_101/python_envs/fmri/lib/python3.8/site-packages/torch/serialization.py", line 287, in __init__
+#     super(_open_zipfile_writer_file, self).__init__(torch._C.PyTorchFileWriter(str(name)))
+
+#  File "/usr/lib/python3.8/multiprocessing/util.py", line 300, in _run_finalizers
+#     finalizer()
+#   File "/usr/lib/python3.8/multiprocessing/util.py", line 224, in __call__
+#     res = self._callback(*self._args, **self._kwargs)
+# FileNotFoundError: [Errno 2] No such file or directory: '/tmp/pymp-wdsexzyc/listener-4c73lr5r'
+# Traceback (most recent call last):
+#   File "/usr/lib/python3.8/multiprocessing/util.py", line 300, in _run_finalizers
+#     finalizer()
+#   File "/usr/lib/python3.8/multiprocessing/util.py", line 224, in __call__ 
+#     res = self._callback(*self._args, **self._kwargs)
+#   File "/usr/lib/python3.8/multiprocessing/util.py", line 133, in _remove_temp_dir
+#     rmtree(tempdir)
+#   File "/usr/lib/python3.8/shutil.py", line 709, in rmtree
+#     onerror(os.lstat, path, sys.exc_info())
+#   File "/usr/lib/python3.8/shutil.py", line 707, in rmtree
+#     orig_st = os.lstat(path)
+# FileNotFoundError: [Errno 2] No such file or directory: '/tmp/pymp-wdsexzyc'
 
 
 

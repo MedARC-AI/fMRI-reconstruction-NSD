@@ -104,13 +104,33 @@ def soft_clip_loss(preds, targs, temp=0.125, distributed=False):
     if not distributed:
         clip_clip = (targs @ targs.T)/temp
         brain_clip = (preds @ targs.T)/temp
+        brain_clip_t = brain_clip.T
     else:
-        all_targs = gather_features(targs, None)
+        all_targs, all_preds = gather_features(targs, preds)
         clip_clip = (targs @ all_targs.T)/temp
         brain_clip = (preds @ all_targs.T)/temp
+        brain_clip_t = (targs @ all_preds.T)/temp
     
     loss1 = -(brain_clip.log_softmax(-1) * clip_clip.softmax(-1)).sum(-1).mean()
-    loss2 = -(brain_clip.T.log_softmax(-1) * clip_clip.T.softmax(-1)).sum(-1).mean()
+    loss2 = -(brain_clip_t.log_softmax(-1) * clip_clip.softmax(-1)).sum(-1).mean()
+    
+    loss = (loss1 + loss2)/2
+    return loss
+
+def soft_cont_loss(student_preds, teacher_preds, teacher_aug_preds, temp=0.125, distributed=True):
+    if not distributed:
+        raise NotImplementedError()
+    else:
+        all_student_preds, all_teacher_preds = gather_features(student_preds, teacher_preds)
+        all_teacher_aug_preds = gather_features(teacher_aug_preds, None)
+
+        teacher_teacher_aug = (teacher_preds @ all_teacher_aug_preds.T)/temp
+        teacher_teacher_aug_t = (teacher_aug_preds @ all_teacher_preds.T)/temp
+        student_teacher_aug = (student_preds @ all_teacher_aug_preds.T)/temp
+        student_teacher_aug_t = (teacher_aug_preds @ all_student_preds.T)/temp
+    
+    loss1 = -(student_teacher_aug.log_softmax(-1) * teacher_teacher_aug.softmax(-1)).sum(-1).mean()
+    loss2 = -(student_teacher_aug_t.log_softmax(-1) * teacher_teacher_aug_t.softmax(-1)).sum(-1).mean()
     
     loss = (loss1 + loss2)/2
     return loss
@@ -371,7 +391,7 @@ def get_dataloaders(
         .decode("torch")\
         .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy")\
         .to_tuple("voxels", image_var, "__key__")\
-        .batched(batch_size, partial=True)\
+        .batched(global_batch_size, partial=True)\
         .with_epoch(num_worker_batches)
     
     val_dl = wds.WebLoader(val_data, num_workers=num_workers,

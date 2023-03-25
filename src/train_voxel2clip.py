@@ -35,16 +35,17 @@ if __name__ == '__main__':
     clamp_embs = False # clamp embeddings to (-1.5, 1.5)
     dim = 768
     remote_data = False
-    data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
-    voxel_dims = 3 # 1 for flattened 3 for 3d
+    # data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
+    data_commit = 'avg'
+    voxel_dims = 1 # 1 for flattened 3 for 3d
     # -----------------------------------------------------------------------------
     # params for all models
     seed = 0
-    batch_size = 4
+    batch_size = 300
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
     num_devices = torch.cuda.device_count()
     num_workers = num_devices
-    num_epochs = 120
+    num_epochs = 120  # 350 if data_commit=='avg' else 120
     lr_scheduler = 'cycle'
     initial_lr = 1e-3 #3e-5
     max_lr = 3e-4
@@ -56,7 +57,7 @@ if __name__ == '__main__':
     ckpt_saving = True
     ckpt_interval = 10
     use_mp = False
-    distributed = True
+    distributed = False
     save_at_end = False
 
     cache_dir = 'cache'
@@ -88,7 +89,9 @@ if __name__ == '__main__':
     # Don't L2 norm the extracted CLIP embeddings since we want the prior 
     # to learn un-normed embeddings for usage with the SD image variation pipeline.
     train_augs = AugmentationSequential(
-        kornia.augmentation.RandomCrop((140, 140), p=0.3),
+        # kornia.augmentation.RandomCrop((140, 140), p=0.3),
+        # kornia.augmentation.Resize((224, 224)),
+        kornia.augmentation.RandomResizedCrop((224,224), (0.5,1), p=0.3),
         kornia.augmentation.Resize((224, 224)),
         kornia.augmentation.RandomHorizontalFlip(p=0.5),
         kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.3),
@@ -123,9 +126,12 @@ if __name__ == '__main__':
         train_url, val_url = utils.get_huggingface_urls(data_commit)
     else:
         # local paths
-        if data_commit is None:
-            train_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/train/train_subj01_{0..49}.tar"
-            val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/val/val_subj01_0.tar"
+        if data_commit == 'avg':
+            train_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj01_{0..17}.tar"
+            val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj01_0.tar"
+        elif data_commit == 'indiv':
+            train_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/train/train_subj01_{0..49}.tar"
+            val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/val/val_subj01_0.tar"
         else:
             train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_train/train_subj01_{{0..49}}.tar"
             val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_val/val_subj01_0.tar"
@@ -303,13 +309,15 @@ if __name__ == '__main__':
                 val_loss = np.mean(val_losses[-(val_i+1):])
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    utils.save_ckpt('best')
+                    utils.save_ckpt(voxel2clip, optimizer, losses, val_losses, lrs, epoch, 'best', outdir)
                 else:
                     print(f'not best - val_loss: {val_loss:.3f}, best_val_loss: {best_val_loss:.3f}')
 
                 # Save model checkpoint every `ckpt_interval`` epochs or on the last epoch
                 if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
-                    utils.save_ckpt(f'epoch{(epoch+1):03d}')
+                    utils.save_ckpt(
+                        voxel2clip, optimizer, losses, val_losses, lrs, epoch, f'epoch{(epoch+1):03d}', outdir
+                    )
 
             logs = {
                 "train/loss": np.mean(losses[-(train_i+1):]),
@@ -327,7 +335,7 @@ if __name__ == '__main__':
 
             if wandb_log:
                 wandb.log(logs)
-        if True:
+        if distributed:
             dist.barrier()
 
     if wandb_log:
