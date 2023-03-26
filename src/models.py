@@ -3,6 +3,7 @@ import numpy as np
 from torchvision import transforms
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import PIL
 import clip
 
@@ -452,33 +453,43 @@ class BrainSD(StableDiffusionImageVariationPipeline):
         return image
 
 class Voxel2StableDiffusionModel(torch.nn.Module):
-    def __init__(self, in_dim=15724, h=4096, n_blocks=2):
+    def __init__(self, in_dim=15724, h=4096, n_blocks=4, use_cont=False):
         super().__init__()
         self.lin0 = nn.Sequential(
             nn.Linear(in_dim, h, bias=False),
+            nn.LayerNorm(h),
             nn.SiLU(inplace=True),
-            nn.BatchNorm1d(h),
             nn.Dropout(0.5),
         )
 
         self.mlp = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(h, h, bias=False),
+                nn.LayerNorm(h),
                 nn.SiLU(inplace=True),
-                nn.BatchNorm1d(h),
-                nn.Dropout(0.15)
+                nn.Dropout(0.25)
             ) for _ in range(n_blocks)
         ])
+        self.lin1 = nn.Linear(h, 16384, bias=False)
+        self.norm = nn.LayerNorm(512)
+
+        self.register_parameter('queries', nn.Parameter(torch.randn(1, 256, 512)))
+        self.transformer = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(d_model=512, nhead=8, 
+                                        dim_feedforward=1024, 
+                                        batch_first=True, dropout=0.25),
+            num_layers=n_blocks
+        )
 
         # option 1  -> 124.56M
-        self.lin1 = nn.Linear(h, 4096, bias=True)
-        self.upsampler = Decoder(
-            in_channels=64,
-            out_channels=4,
-            up_block_types=["UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D"],
-            block_out_channels=[64, 128, 256, 256],
-            layers_per_block=1,
-        )
+        # self.lin1 = nn.Linear(h, 32768, bias=True)
+        # self.upsampler = Decoder(
+        #     in_channels=64,
+        #     out_channels=4,
+        #     up_block_types=["UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D"],
+        #     block_out_channels=[64, 128, 256, 256],
+        #     layers_per_block=1,
+        # )
 
         # option2  -> 132.52M
         # self.lin1 = nn.Linear(h, 1024, bias=True)
@@ -489,8 +500,34 @@ class Voxel2StableDiffusionModel(torch.nn.Module):
         #     block_out_channels=[64, 128, 256, 256, 512],
         #     layers_per_block=1,
         # )
+        
+        if use_cont:
+            self.maps_projector = nn.Sequential(
+                nn.LayerNorm(512),
+                nn.Linear(512, 512),
+                nn.LayerNorm(512),
+                nn.ReLU(True),
+                nn.Linear(512, 512),
+                nn.LayerNorm(512),
+                nn.ReLU(True),
+                nn.Linear(512, 512)
+            )
+        else:
+            self.maps_projector = nn.Identity()
 
-    def forward(self, x):
+        self.upsampler = nn.Sequential(
+            nn.GroupNorm(1, 32),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(32, 320, 3, padding=1),
+            nn.GroupNorm(32, 320),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(320, 320, 3, padding=1),
+            nn.GroupNorm(32, 320),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(320, 4, 3, padding=1)
+        )
+
+    def forward(self, x, return_transformer_feats=False):
         x = self.lin0(x)
         residual = x
         for res_block in self.mlp:
@@ -500,5 +537,18 @@ class Voxel2StableDiffusionModel(torch.nn.Module):
         x = x.reshape(len(x), -1)
         x = self.lin1(x)  # bs, 4096
 
-        x = x.reshape(x.shape[0], -1, 8, 8).contiguous()  # bs, 64, 8, 8
-        return self.upsampler(x)
+        # # x = x.reshape(x.shape[0], -1, 8, 8).contiguous()  # bs, 64, 8, 8
+        # x = x.reshape(x.shape[0], -1, 64, 64).contiguous()
+        # return self.upsampler(x)
+
+        # decoder
+        x = self.norm(x.reshape(x.shape[0], 32, 512))
+        preds = self.transformer(self.queries.expand(x.shape[0], -1, -1), x)
+        sd_embeds = preds.permute(0,2,1).reshape(-1, 512, 16, 16)
+        sd_embeds = F.pixel_shuffle(sd_embeds, 4)  # bs, 32, 32, 32
+
+        # contrastive
+        if return_transformer_feats:
+            return self.upsampler(sd_embeds), self.maps_projector(preds)
+        
+        return self.upsampler(sd_embeds)

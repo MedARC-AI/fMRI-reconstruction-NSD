@@ -22,51 +22,82 @@ from model3d import SimpleVoxel3dConvEncoder
 
 import torch.distributed as dist
 from accelerate import Accelerator
+import ddp_config
 
 if __name__ == '__main__':
     # -----------------------------------------------------------------------------
-    model_name = "voxel2clip-test"
-    modality = "image"
-    voxel_dims = 1 # 1 for flattened input, 3 for 3d input
-    if modality == "text":
-        is_text = True
-    else:
-        is_text = False
+    # params for this model
+    model_name = "voxel2clip"
+    modality = "image" # ("image", "text")
+    image_var = 'images' if modality=='image' else None  # trial
     clip_variant = "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
     clamp_embs = False # clamp embeddings to (-1.5, 1.5)
-    seed = 42
-    mixup_pct = 0.5
-    use_image_aug = True
-    
-    wandb_log = False
-    resume_from_ckpt = False
-
-    num_epochs = 120
-    if voxel_dims==1:
-        batch_size = 300
-    else:
-        batch_size = 128
-
+    dim = 768
+    remote_data = False
+    # data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
+    data_commit = 'avg'
+    voxel_dims = 1 # 1 for flattened 3 for 3d
+    # -----------------------------------------------------------------------------
+    # params for all models
+    seed = 0
+    batch_size = 300
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
+    num_devices = torch.cuda.device_count()
+    num_workers = num_devices
+    num_epochs = 120  # 350 if data_commit=='avg' else 120
     lr_scheduler = 'cycle'
-    initial_lr = 5e-4 # only used if lr_scheduler is 'fixed'
+    initial_lr = 1e-3 #3e-5
     max_lr = 3e-4
-
+    wandb_log = False
+    wandb_project = 'laion-fmri'
+    wandb_run_name = ''
+    wandb_notes = ''
+    first_batch = False
     ckpt_saving = True
     ckpt_interval = 10
-    save_at_end = True
-    outdir = f'../train_logs/{model_name}'
-    if not os.path.exists(outdir):
-        os.makedirs(outdir,exist_ok=True)
-    remote_data = False # if True, pull webdatasets from huggingface
+    use_mp = False
+    distributed = False
+    save_at_end = False
 
+    cache_dir = 'cache'
+    n_cache_recs = 0
+    mixup_pct = 0.5
+    is_text = False
+
+    use_image_aug = True
+    resume_from_ckpt = False
+    wandb_log = False
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    try:
+        config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+        exec(open('configurator.py').read()) # overrides from command line or config file
+        config = {k: globals()[k] for k in config_keys} # will be useful for logging
+    except:
+        pass
+    
+    outdir = os.path.expanduser(f'../train_logs/models/{model_name}/test')
+    os.makedirs(outdir, exist_ok=True)
+    num_devices = torch.cuda.device_count()
+    if num_devices==0: num_devices = 1
+    num_workers = num_devices * 4
+    if distributed:
+        _, local_rank, device = ddp_config.set_ddp()
+    else:
+        local_rank, device = 0, torch.device('cuda:0')
+    
     if use_image_aug:
         train_augs = AugmentationSequential(
-            kornia.augmentation.RandomResizedCrop((224,224), (0.6,1), p=0.3),
+            # kornia.augmentation.RandomCrop((140, 140), p=0.3),
+            # kornia.augmentation.Resize((224, 224)),
+            kornia.augmentation.RandomResizedCrop((224,224), (0.5,1), p=0.3),
             kornia.augmentation.Resize((224, 224)),
             kornia.augmentation.RandomHorizontalFlip(p=0.5),
             kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.3),
             kornia.augmentation.RandomGrayscale(p=0.3),
             data_keys=["input"],
+            # random_apply = (1,4)
         )
     else:
         train_augs = None
@@ -97,16 +128,10 @@ if __name__ == '__main__':
     if num_devices<=1 and world_size<=1:
         distributed=False
     else:
-        distributed=True
-    print("distributed =",distributed,"num_devices =", num_devices, "local rank =", local_rank, "world size =", world_size)
-
-    # -----------------------------------------------------------------------------
-    config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-    exec(open('configurator.py').read()) # overrides from command line or config file
-    config = {k: globals()[k] for k in config_keys} # will be useful for logging
-
-    # need non-deterministic CuDNN for conv3D to work
-    utils.seed_everything(seed, cudnn_deterministic=False)
+        local_rank, device = 0, torch.device('cuda:0')
+    
+    if local_rank == 0: print('Creating Clipper...')
+    clip_extractor = Clipper(clip_variant, clamp_embs=False, norm_embs=False, device=device, train_transforms=train_augs)
 
     if modality=='text':
         print('Using CLIP-text, preparing COCO annotations...')
@@ -125,17 +150,15 @@ if __name__ == '__main__':
         meta_url = None
     else:
         # local paths
-        # data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
-        # train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_train/train_subj01_{{0..49}}.tar"
-        # val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_val/val_subj01_0.tar"
-        # meta_url = None
-        # num_train = num_val = None # None means use all samples as specified in webdataset metadata.json
-
-        train_url = "{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj01_{0..17}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj01_0.tar}"
-        val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/test/test_subj01_{0..1}.tar"
-        meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/metadata_subj01.json"
-        num_train = 8559 + 300
-        num_val = 982
+        if data_commit == 'avg':
+            train_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj01_{0..17}.tar"
+            val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj01_0.tar"
+        elif data_commit == 'indiv':
+            train_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/train/train_subj01_{0..49}.tar"
+            val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/val/val_subj01_0.tar"
+        else:
+            train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_train/train_subj01_{{0..49}}.tar"
+            val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_val/val_subj01_0.tar"
 
     # which to use for the voxels
     if voxel_dims == 1:
@@ -153,8 +176,6 @@ if __name__ == '__main__':
         train_url=train_url,
         val_url=val_url,
         meta_url=meta_url,
-        num_train=num_train,
-        num_val=num_val,
         val_batch_size=300,
         cache_dir="/tmp/wds-cache",
         seed=seed,

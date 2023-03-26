@@ -107,13 +107,33 @@ def soft_clip_loss(preds, targs, temp=0.125, distributed=False, accelerator=None
     if not distributed:
         clip_clip = (targs @ targs.T)/temp
         brain_clip = (preds @ targs.T)/temp
+        brain_clip_t = brain_clip.T
     else:
-        all_targs = gather_features(targs, None, accelerator)
+        all_targs, all_preds = gather_features(targs, preds, accelerator)
         clip_clip = (targs @ all_targs.T)/temp
         brain_clip = (preds @ all_targs.T)/temp
+        brain_clip_t = (targs @ all_preds.T)/temp
     
     loss1 = -(brain_clip.log_softmax(-1) * clip_clip.softmax(-1)).sum(-1).mean()
-    loss2 = -(brain_clip.T.log_softmax(-1) * clip_clip.T.softmax(-1)).sum(-1).mean()
+    loss2 = -(brain_clip_t.log_softmax(-1) * clip_clip.softmax(-1)).sum(-1).mean()
+    
+    loss = (loss1 + loss2)/2
+    return loss
+
+def soft_cont_loss(student_preds, teacher_preds, teacher_aug_preds, temp=0.125, distributed=True, accelerator=None):
+    if not distributed:
+        raise NotImplementedError()
+    else:
+        all_student_preds, all_teacher_preds = gather_features(student_preds, teacher_preds, accelerator)
+        all_teacher_aug_preds = gather_features(teacher_aug_preds, None, accelerator)
+
+        teacher_teacher_aug = (teacher_preds @ all_teacher_aug_preds.T)/temp
+        teacher_teacher_aug_t = (teacher_aug_preds @ all_teacher_preds.T)/temp
+        student_teacher_aug = (student_preds @ all_teacher_aug_preds.T)/temp
+        student_teacher_aug_t = (teacher_aug_preds @ all_student_preds.T)/temp
+    
+    loss1 = -(student_teacher_aug.log_softmax(-1) * teacher_teacher_aug.softmax(-1)).sum(-1).mean()
+    loss2 = -(student_teacher_aug_t.log_softmax(-1) * teacher_teacher_aug_t.softmax(-1)).sum(-1).mean()
     
     loss = (loss1 + loss2)/2
     return loss
@@ -251,9 +271,9 @@ def get_huggingface_urls(commit='9947586218b6b7c8cab804009ddca5045249a38d'):
     val_url = base_url + commit + "/webdataset/val/val_subj01_0.tar"
     return train_url, val_url
 
-def split_by_node(urls):
-    node_id, node_count = accelerator.state.local_process_index, accelerator.state.num_processes
-    return urls[node_id::node_count]
+# def split_by_node(urls):
+#     node_id, node_count = accelerator.state.local_process_index, accelerator.state.num_processes
+#     return urls[node_id::node_count]
 
 def my_split_by_worker(urls):
     wi = torch.utils.data.get_worker_info()
