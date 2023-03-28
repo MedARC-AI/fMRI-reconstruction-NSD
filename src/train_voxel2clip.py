@@ -11,7 +11,7 @@ import kornia
 from kornia.augmentation.container import AugmentationSequential
 
 import utils
-from models import Clipper, BrainNetwork
+from models import Clipper, BrainNetwork, ResNet50Embedder
 from model3d import SimpleVoxel3dConvEncoder
 
 import torch.distributed as dist
@@ -86,6 +86,17 @@ def parse_args():
         "--disable_image_aug",
         action="store_true",
         help="whether to disable image augmentation (only used for modality=image)",
+    )
+    parser.add_argument(
+        "--resnet50_embedder",
+        action="store_true",
+        help="whether to use ResNet50Embedder instead of Clipper",
+    )
+    parser.add_argument(
+        "--resnet50_layer",
+        type=int,
+        default=2,
+        help="which layer of ResNet50 to use for embeddings (only used if resnet50_embedder=True)",
     )
     return parser.parse_args()
 
@@ -167,7 +178,7 @@ if __name__ == '__main__':
     # need non-deterministic CuDNN for conv3D to work
     utils.seed_everything(seed, cudnn_deterministic=False)
 
-    if args.modality=='text':
+    if is_text:
         print('Using CLIP-text, preparing COCO annotations...')
         import h5py
         # load COCO annotations curated in the same way as the mind_reader (Lin Sprague Singh) preprint
@@ -236,14 +247,23 @@ if __name__ == '__main__':
 
     # Don't L2 norm the extracted CLIP embeddings since we want the prior 
     # to learn un-normed embeddings for usage with the SD image variation pipeline.
-    clip_extractor = Clipper(args.clip_variant, clamp_embs=False, norm_embs=False, device=device, train_transforms=train_augs)
+    if args.resnet50_embedder:
+        assert not is_text, 'ResNet50Embedder is only for image data, pass --modality="image"'
+        assert args.disable_image_aug, 'ResNet50Embedder has its own image augmentation, pass --disable_image_aug'
+        assert clamp_embs == False, 'ResNet50Embedder does not support clamping'
+        # layer 2 per MindReader paper (they also experimented with layer 4)
+        clip_extractor = ResNet50Embedder(layer=args.resnet50_layer, device=device).eval()
+        # output dim for voxel2clip model
+        out_dim = clip_extractor.out_dim
+    else:
+        clip_extractor = Clipper(args.clip_variant, clamp_embs=clamp_embs, norm_embs=False, device=device, train_transforms=train_augs)
+        # size of the CLIP embedding for each variant
+        clip_sizes = {"RN50": 1024, "ViT-L/14": 768, "ViT-B/32": 512}
+        # output dim for voxel2clip model
+        out_dim = clip_sizes[args.clip_variant]
 
     print('Creating voxel2clip...')
-
-    # size of the CLIP embedding for each variant
-    clip_sizes = {"RN50": 1024, "ViT-L/14": 768, "ViT-B/32": 512}
-    # output dim for voxel2clip model
-    out_dim = clip_sizes[args.clip_variant]
+    print('out_dim', out_dim)
 
     if args.voxel_dims == 1: # 1D data
         voxel2clip_kwargs = dict(out_dim=out_dim)

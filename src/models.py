@@ -86,20 +86,20 @@ class Clipper(torch.nn.Module):
         return self.embed_text(txt)
 
 
-class ResnetEmbedder(nn.Module):
-    def __init__(self, layer=2):
+class ResNet50Embedder(nn.Module):
+    def __init__(self, layer=2, device=torch.device('cpu')):
         """
         Embed images using ResNet50. Layer is the target layer to extract features from. 
         """
         super().__init__()
         
         assert layer in (2, 3, 4), 'layer must in (2, 3, 4)'
+        self.layer = layer
+        self.device = device
         
         weights = ResNet50_Weights.DEFAULT # defaults to IMAGENET1K_V2
-
-        self.layer = layer
         self.preprocess = weights.transforms()
-        self.model = resnet50(weights=weights).eval()
+        self.model = resnet50(weights=weights).eval().to(device)
         self.model.fc = nn.Identity()
         
         # set the layers beyond the target layer to identity
@@ -108,6 +108,9 @@ class ResnetEmbedder(nn.Module):
         
         out_dims = {2: 512, 3: 1024, 4: 2048}
         self.out_dim = out_dims[layer]
+
+        for param in self.model.parameters():
+            param.requires_grad = False # dont need to calculate gradients
         
     def embed_image(self, image):
         image = self.preprocess(image)
