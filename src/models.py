@@ -19,6 +19,7 @@ from diffusers import StableDiffusionImageVariationPipeline
 from typing import Callable, List, Optional, Union
 
 from diffusers.models.vae import Decoder
+from torchvision.models import ResNet50_Weights, resnet50
 
 # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -83,6 +84,37 @@ class Clipper(torch.nn.Module):
                 txt = np.vstack((txt,t))
         txt = txt.flatten()
         return self.embed_text(txt)
+
+
+class ResnetEmbedder(nn.Module):
+    def __init__(self, layer=2):
+        """
+        Embed images using ResNet50. Layer is the target layer to extract features from. 
+        """
+        super().__init__()
+        
+        assert layer in (2, 3, 4), 'layer must in (2, 3, 4)'
+        
+        weights = ResNet50_Weights.DEFAULT # defaults to IMAGENET1K_V2
+
+        self.layer = layer
+        self.preprocess = weights.transforms()
+        self.model = resnet50(weights=weights).eval()
+        self.model.fc = nn.Identity()
+        
+        # set the layers beyond the target layer to identity
+        for l in range(layer+1, 4+1):
+            setattr(self.model, f'layer{l}', nn.Identity())
+        
+        out_dims = {2: 512, 3: 1024, 4: 2048}
+        self.out_dim = out_dims[layer]
+        
+    def embed_image(self, image):
+        image = self.preprocess(image)
+        if image.ndim == 3:
+            image = image.unsqueeze(0)
+        return self.model(image)
+
 
 class BrainNetwork(nn.Module):
     # 133M
