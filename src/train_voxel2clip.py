@@ -2,47 +2,110 @@
 
 import os
 import sys
-import json
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import transforms
 from tqdm import tqdm
-from info_nce import InfoNCE
-from dalle2_pytorch import DiffusionPriorNetwork
 import kornia
 from kornia.augmentation.container import AugmentationSequential
 
 import utils
-from utils import torch_to_matplotlib, torch_to_Image
-from models import Clipper, BrainNetwork, BrainDiffusionPrior
+from models import Clipper, BrainNetwork
 from model3d import SimpleVoxel3dConvEncoder
 
 import torch.distributed as dist
 from accelerate import Accelerator
+import argparse
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train voxel2clip")
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="voxel2clip-test",
+        help="name of model, used for wandb logging",
+    )
+    parser.add_argument(
+        "--modality",
+        type=str,
+        default="image",
+        choices=["image", "text"],
+        help="image or text",
+    )
+    parser.add_argument(
+        "--clip_variant",
+        type=str,
+        default="ViT-L/14",
+        choices=["RN50", "ViT-L/14", "ViT-B/32"],
+        help='clip variant',
+    )
+    parser.add_argument(
+        "--outdir",
+        type=str,
+        default=None,
+        help="output directory for logs and checkpoints",
+    )
+    parser.add_argument(
+        "--wandb_log",
+        action="store_true",
+        help="whether to log to wandb",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="stability",
+        help="wandb project name",
+    )
+    parser.add_argument(
+        "--h5_dir",
+        type=str,
+        default='/scratch/gpfs/KNORMAN/nsdgeneral_hdf5/',
+        help="directory containing COCO h5 files (only used for modality=text)",
+    )
+    parser.add_argument(
+        "--voxel_dims",
+        type=int,
+        default=1,
+        choices=[1, 3],
+        help="1 for flattened input, 3 for 3d input",
+    )
+    parser.add_argument(
+        "--remote_data",
+        action="store_true",
+        help="whether to pull data from huggingface",
+    )
+    parser.add_argument(
+        "--wds_cache_dir",
+        type=str,
+        default='/tmp/wds-cache',
+        help="directory for caching webdatasets fetched from huggingface",
+    )
+    parser.add_argument(
+        "--disable_image_aug",
+        action="store_true",
+        help="whether to disable image augmentation (only used for modality=image)",
+    )
+    return parser.parse_args()
+
 
 if __name__ == '__main__':
-    # -----------------------------------------------------------------------------
-    model_name = "voxel2clip-test"
-    modality = "image"
-    voxel_dims = 1 # 1 for flattened input, 3 for 3d input
-    if modality == "text":
+    args = parse_args()
+    print('args', args)
+
+    if args.modality == "text":
         is_text = True
     else:
         is_text = False
-    clip_variant = "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
     clamp_embs = False # clamp embeddings to (-1.5, 1.5)
     seed = 42
     mixup_pct = 0.5
-    use_image_aug = True
     
-    wandb_log = False
     resume_from_ckpt = False
 
     num_epochs = 120
-    if voxel_dims==1:
+    if args.voxel_dims == 1:
         batch_size = 300
     else:
         batch_size = 128
@@ -53,13 +116,14 @@ if __name__ == '__main__':
 
     ckpt_saving = True
     ckpt_interval = 10
-    save_at_end = True
-    outdir = f'../train_logs/{model_name}'
+    if args.outdir is None:
+        outdir = f'../train_logs/{args.model_name}'
+    else:
+        outdir = args.outdir
     if not os.path.exists(outdir):
         os.makedirs(outdir,exist_ok=True)
-    remote_data = False # if True, pull webdatasets from huggingface
 
-    if use_image_aug:
+    if not args.disable_image_aug:
         train_augs = AugmentationSequential(
             kornia.augmentation.RandomResizedCrop((224,224), (0.6,1), p=0.3),
             kornia.augmentation.Resize((224, 224)),
@@ -94,60 +158,50 @@ if __name__ == '__main__':
     print(accelerator.state)
     local_rank = accelerator.state.local_process_index
     world_size = accelerator.state.num_processes
-    if num_devices<=1 and world_size<=1:
-        distributed=False
+    if num_devices <= 1 and world_size <= 1:
+        distributed = False
     else:
-        distributed=True
+        distributed = True
     print("distributed =",distributed,"num_devices =", num_devices, "local rank =", local_rank, "world size =", world_size)
-
-    # -----------------------------------------------------------------------------
-    config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-    exec(open('configurator.py').read()) # overrides from command line or config file
-    config = {k: globals()[k] for k in config_keys} # will be useful for logging
 
     # need non-deterministic CuDNN for conv3D to work
     utils.seed_everything(seed, cudnn_deterministic=False)
 
-    if modality=='text':
+    if args.modality=='text':
         print('Using CLIP-text, preparing COCO annotations...')
         import h5py
         # load COCO annotations curated in the same way as the mind_reader (Lin Sprague Singh) preprint
-        f = h5py.File('/scratch/gpfs/KNORMAN/nsdgeneral_hdf5/COCO_73k_subj_indices.hdf5', 'r')
+        f = h5py.File(os.path.join(args.h5_dir, 'COCO_73k_subj_indices.hdf5'), 'r')
         subj01_order = f['subj01'][:]
         f.close()
-        annots = np.load('/scratch/gpfs/KNORMAN/nsdgeneral_hdf5/COCO_73k_annots_curated.npy',allow_pickle=True)
+        annots = np.load(os.path.join(args.h5_dir, 'COCO_73k_annots_curated.npy'), allow_pickle=True)
         subj01_annots = annots[subj01_order]
 
-    print('Pulling NSD webdataset data...')
-    if remote_data:
-        # pull data directly from huggingface
-        train_url, val_url = utils.get_huggingface_urls(data_commit)
-        meta_url = None
-    else:
-        # local paths
-        # data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
-        # train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_train/train_subj01_{{0..49}}.tar"
-        # val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_val/val_subj01_0.tar"
-        # meta_url = None
-        # num_train = num_val = None # None means use all samples as specified in webdataset metadata.json
+    train_url = "{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj01_{0..17}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj01_0.tar}"
+    val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/test/test_subj01_{0..1}.tar"
+    meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/metadata_subj01.json"
+    num_train = 8559 + 300
+    num_val = 982
 
-        train_url = "{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj01_{0..17}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj01_0.tar}"
-        val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/test/test_subj01_{0..1}.tar"
-        meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/metadata_subj01.json"
-        num_train = 8559 + 300
-        num_val = 982
+    if args.remote_data:
+        # data loaders will fetch chunks from huggingface
+        old = '/fsx/proj-medarc/fmri/natural-scenes-dataset/'
+        new = 'https://huggingface.co/datasets/pscotti/naturalscenesdataset/resolve/a8c6147/'
+        train_url = train_url.replace(old, new)
+        val_url = val_url.replace(old, new)
+        meta_url = meta_url.replace(old, new)
 
     # which to use for the voxels
-    if voxel_dims == 1:
+    if args.voxel_dims == 1:
         voxels_key = 'nsdgeneral.npy'
-    elif voxel_dims == 3:
+    elif args.voxel_dims == 3:
         voxels_key = 'wholebrain_3d.npy'
     else:
-        raise Exception(f"voxel_dims must be 1 or 3, not {voxel_dims}")
+        raise Exception(f"voxel_dims must be 1 or 3, not {args.voxel_dims}")
 
     print('Prepping train and validation dataloaders...')
     train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
-        batch_size,'images',
+        batch_size,
         num_devices=num_devices,
         num_workers=num_workers,
         train_url=train_url,
@@ -156,13 +210,13 @@ if __name__ == '__main__':
         num_train=num_train,
         num_val=num_val,
         val_batch_size=300,
-        cache_dir="/tmp/wds-cache",
+        cache_dir=args.wds_cache_dir,
         seed=seed,
         voxels_key=voxels_key,
         local_rank=local_rank,
     )
 
-    if voxel_dims == 3:
+    if args.voxel_dims == 3:
         import nibabel as nib
         noise_ceils_path = '/fsx/proj-medarc/fmri/natural-scenes-dataset/temp_s3/nsddata_betas/ppdata/subj01/func1pt8mm/betas_fithrf_GLMdenoise_RR/ncsnr.nii.gz'
         noise_ceils = nib.load(noise_ceils_path).get_fdata()
@@ -182,14 +236,19 @@ if __name__ == '__main__':
 
     # Don't L2 norm the extracted CLIP embeddings since we want the prior 
     # to learn un-normed embeddings for usage with the SD image variation pipeline.
-    clip_extractor = Clipper(clip_variant, clamp_embs=False, norm_embs=False, device=device, train_transforms=train_augs)
+    clip_extractor = Clipper(args.clip_variant, clamp_embs=False, norm_embs=False, device=device, train_transforms=train_augs)
 
     print('Creating voxel2clip...')
 
-    if voxel_dims == 1: # 1D data
-        voxel2clip_kwargs = dict(out_dim=768)
+    # size of the CLIP embedding for each variant
+    clip_sizes = {"RN50": 1024, "ViT-L/14": 768, "ViT-B/32": 512}
+    # output dim for voxel2clip model
+    out_dim = clip_sizes[args.clip_variant]
+
+    if args.voxel_dims == 1: # 1D data
+        voxel2clip_kwargs = dict(out_dim=out_dim)
         voxel2clip = BrainNetwork(**voxel2clip_kwargs)
-    elif voxel_dims == 3: # 3D data
+    elif args.voxel_dims == 3: # 3D data
         voxel2clip_kwargs = dict(
             out_dim=768,
             dims=voxel.shape[2:],
@@ -215,7 +274,8 @@ if __name__ == '__main__':
     if lr_scheduler == 'fixed':
         lr_scheduler = None
     elif lr_scheduler == 'cycle':
-        total_steps=num_epochs*(num_train//batch_size)
+        global_batch_size = batch_size * num_devices
+        total_steps = num_epochs*(num_train//global_batch_size)
         lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, 
             max_lr=max_lr,
@@ -227,7 +287,6 @@ if __name__ == '__main__':
     def save_ckpt(tag):
         ckpt_path = os.path.join(outdir, f'{tag}.pth')
         print(f'saving {ckpt_path}',flush=True)
-        state_dict = voxel2clip.state_dict()
         torch.save({
             'epoch': epoch,
             'model_state_dict': voxel2clip.state_dict(),
@@ -244,23 +303,22 @@ if __name__ == '__main__':
     print("\nDone with model preparations!")
     
     #--------WANDB-----------------
-    if local_rank==0 and wandb_log:
-        wandb_project = 'stability'
-        wandb_run = model_name
+    if local_rank==0 and args.wandb_log:
+        wandb_run = args.model_name
         wandb_notes = ''
 
-        if wandb_log: 
+        if args.wandb_log: 
             import wandb
-            print(f"wandb {wandb_project} run {wandb_run}")
+            print(f"wandb {args.wandb_project} run {wandb_run}")
             wandb.login(host='https://stability.wandb.io')#, relogin=True)
             wandb_config = {
-              "model_name": model_name,
-              "modality": modality,
-              "voxel_dims": voxel_dims,
-              "clip_variant": clip_variant,
+              "model_name": args.model_name,
+              "modality": args.modality,
+              "voxel_dims": args.voxel_dims,
+              "clip_variant": args.clip_variant,
               "batch_size": batch_size,
               "num_epochs": num_epochs,
-              "use_image_aug": use_image_aug,
+              "disable_image_aug": args.disable_image_aug,
               "max_lr": max_lr,
               "lr_scheduler": lr_scheduler,
               "clamp_embs": clamp_embs,
@@ -278,7 +336,7 @@ if __name__ == '__main__':
             }
             print("wandb_config:\n",wandb_config)
             wandb.init(
-                project=wandb_project,
+                project=args.wandb_project,
                 name=wandb_run,
                 config=wandb_config,
                 notes=wandb_notes,
@@ -337,7 +395,7 @@ if __name__ == '__main__':
             image = image.float()
             voxel = voxel.float()[:,repeat_index].float()
 
-            if voxel_dims == 3:
+            if args.voxel_dims == 3:
                 voxel = voxel[:,np.unique(x_inc),:,:]
                 voxel = voxel[:,:,np.unique(y_inc),:]
                 voxel = voxel[:,:,:,np.unique(z_inc)]
@@ -346,6 +404,7 @@ if __name__ == '__main__':
                 voxel, perm, betas, select = utils.mixco(voxel)
 
             if is_text:
+                trial = trial.cpu().numpy()
                 annots = utils.select_annotations(subj01_annots[trial], random=True)
                 clip_target = clip_extractor.embed_text(annots).float()
             else:
@@ -395,9 +454,10 @@ if __name__ == '__main__':
                 repeat_index = val_i % 3
 
                 image = image.float()
+                # voxel.shape: [bs, 3, 15724]
                 voxel = voxel[:,repeat_index].float()
 
-                if voxel_dims == 3:
+                if args.voxel_dims == 3:
                     voxel = voxel[:,np.unique(x_inc),:,:]
                     voxel = voxel[:,:,np.unique(y_inc),:]
                     voxel = voxel[:,:,:,np.unique(z_inc)]
@@ -407,6 +467,7 @@ if __name__ == '__main__':
                     val_voxel0 = voxel.detach().clone()
 
                 if is_text:
+                    trial = trial.cpu().numpy()
                     annots = utils.select_annotations(subj01_annots[trial], random=False)
                     clip_target = clip_extractor.embed_text(annots).float()
                 else:
@@ -442,11 +503,13 @@ if __name__ == '__main__':
                     val_sims_base += F.cosine_similarity(clip_target,clip_voxels).mean().item()
 
                 labels = torch.arange(len(clip_target)).to(device)
-                val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target, clip_voxels), labels, k=1)
-                val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels, clip_target), labels, k=1)
+                # clip, brain
+                val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels, clip_target), labels, k=1)
+                # brain, clip
+                val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target, clip_voxels), labels, k=1)
 
-        if local_rank==0:
-            if (not save_at_end and ckpt_saving) or (save_at_end and epoch == num_epochs - 1):
+        if local_rank == 0:
+            if ckpt_saving:
                 # save best model
                 val_loss = np.mean(val_losses[-(val_i+1):])
                 if val_loss < best_val_loss:
@@ -455,9 +518,9 @@ if __name__ == '__main__':
                 else:
                     print(f'not best - val_loss: {val_loss:.3f}, best_val_loss: {best_val_loss:.3f}')
 
-            # Save model checkpoint every `ckpt_interval`` epochs or on the last epoch
-            if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
-                save_ckpt(f'epoch{epoch:03d}')
+                # Save model checkpoint every `ckpt_interval` epochs or on the last epoch
+                if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
+                    save_ckpt(f'epoch{epoch:03d}')
 
             logs = {"train/loss": np.mean(losses[-(train_i+1):]),
                     "val/loss": np.mean(val_losses[-(val_i+1):]),
@@ -472,13 +535,13 @@ if __name__ == '__main__':
                     "val/val_bwd_pct_correct": val_bwd_percent_correct / (val_i + 1)}
             progress_bar.set_postfix(**logs)
 
-            if wandb_log:
+            if args.wandb_log:
                 wandb.log(logs)
 
         if distributed:
             dist.barrier()
 
-    if wandb_log and local_rank==0:
+    if args.wandb_log and local_rank==0:
         wandb.finish()
 
     print("\n===Finished!===\n")

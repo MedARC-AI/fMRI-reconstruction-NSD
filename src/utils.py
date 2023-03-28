@@ -251,17 +251,6 @@ def get_huggingface_urls(commit='9947586218b6b7c8cab804009ddca5045249a38d'):
     val_url = base_url + commit + "/webdataset/val/val_subj01_0.tar"
     return train_url, val_url
 
-def split_by_node(urls):
-    node_id, node_count = accelerator.state.local_process_index, accelerator.state.num_processes
-    return urls[node_id::node_count]
-
-def my_split_by_worker(urls):
-    wi = torch.utils.data.get_worker_info()
-    if wi is None:
-        return urls
-    else:
-        return urls[wi.id::wi.num_workers]
-    
 def check_loss(loss):
     if loss.isnan().any():
         raise ValueError('NaN loss')
@@ -307,7 +296,10 @@ def get_dataloaders(
         if num_val is None:
             num_val = 492
     else:
-        metadata = json.load(open(meta_url))
+        if os.path.exists(meta_url):
+            metadata = json.load(open(meta_url))
+        else:
+            metadata = json.loads(requests.get(meta_url).text)
         if num_train is None:
             num_train = metadata['totals']['train']
         if num_val is None:
