@@ -22,7 +22,7 @@ from model3d import SimpleVoxel3dConvEncoder
 
 import torch.distributed as dist
 from accelerate import Accelerator
-import ddp_config
+# import ddp_config
 
 if __name__ == '__main__':
     # -----------------------------------------------------------------------------
@@ -48,7 +48,7 @@ if __name__ == '__main__':
     lr_scheduler = 'cycle'
     initial_lr = 1e-3 #3e-5
     max_lr = 3e-4
-    wandb_log = False
+    wandb_log = True
     wandb_project = 'laion-fmri'
     wandb_run_name = ''
     wandb_notes = ''
@@ -58,6 +58,7 @@ if __name__ == '__main__':
     use_mp = False
     distributed = False
     save_at_end = False
+    subj_id = '01'
 
     cache_dir = 'cache'
     n_cache_recs = 0
@@ -66,7 +67,8 @@ if __name__ == '__main__':
 
     use_image_aug = True
     resume_from_ckpt = False
-    wandb_log = False
+
+    use_mse = False
 
     torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -82,17 +84,16 @@ if __name__ == '__main__':
     num_devices = torch.cuda.device_count()
     if num_devices==0: num_devices = 1
     num_workers = num_devices * 4
-    if distributed:
-        _, local_rank, device = ddp_config.set_ddp()
-    else:
-        local_rank, device = 0, torch.device('cuda:0')
+    # if distributed:
+    #     _, local_rank, device = ddp_config.set_ddp()
+    # else:
+    #     local_rank, device = 0, torch.device('cuda:0')
     
     if use_image_aug:
         train_augs = AugmentationSequential(
             # kornia.augmentation.RandomCrop((140, 140), p=0.3),
             # kornia.augmentation.Resize((224, 224)),
             kornia.augmentation.RandomResizedCrop((224,224), (0.5,1), p=0.3),
-            kornia.augmentation.Resize((224, 224)),
             kornia.augmentation.RandomHorizontalFlip(p=0.5),
             kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.3),
             kornia.augmentation.RandomGrayscale(p=0.3),
@@ -151,14 +152,15 @@ if __name__ == '__main__':
     else:
         # local paths
         if data_commit == 'avg':
-            train_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj01_{0..17}.tar"
-            val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj01_0.tar"
+            train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj{subj_id}_{{0..17}}.tar"
+            val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj{subj_id}_0.tar"
         elif data_commit == 'indiv':
-            train_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/train/train_subj01_{0..49}.tar"
-            val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/val/val_subj01_0.tar"
+            train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/train/train_subj{subj_id}_{{0..49}}.tar"
+            val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/val/val_subj{subj_id}_0.tar"
         else:
             train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_train/train_subj01_{{0..49}}.tar"
             val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_val/val_subj01_0.tar"
+        meta_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/metadata_subj{subj_id}.json"
 
     # which to use for the voxels
     if voxel_dims == 1:
@@ -208,7 +210,7 @@ if __name__ == '__main__':
     print('Creating voxel2clip...')
 
     if voxel_dims == 1: # 1D data
-        voxel2clip_kwargs = dict(out_dim=768)
+        voxel2clip_kwargs = dict(out_dim=768, norm_type='bn')
         voxel2clip = BrainNetwork(**voxel2clip_kwargs)
     elif voxel_dims == 3: # 3D data
         voxel2clip_kwargs = dict(
@@ -226,7 +228,7 @@ if __name__ == '__main__':
     if local_rank==0:
         utils.count_params(voxel2clip)
 
-    no_decay = ['bias']
+    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     opt_grouped_parameters = [
         {'params': [p for n, p in voxel2clip.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 1e-2},
         {'params': [p for n, p in voxel2clip.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
@@ -353,11 +355,10 @@ if __name__ == '__main__':
         for train_i, (voxel, image, trial) in enumerate(train_dl):
             optimizer.zero_grad()
 
-            repeat_index = train_i % 3
-
             image = image.float()
-            voxel = voxel.float()[:,repeat_index].float()
-
+            voxel = voxel.float()
+            if voxel_dims == 1 and data_commit == 'avg':
+                voxel = utils.voxel_select(voxel)
             if voxel_dims == 3:
                 voxel = voxel[:,np.unique(x_inc),:,:]
                 voxel = voxel[:,:,np.unique(y_inc),:]
@@ -388,7 +389,12 @@ if __name__ == '__main__':
                     nn.functional.normalize(clip_target, dim=-1),
                     temp=epoch_temp,
                     distributed=distributed, accelerator=accelerator)
-            utils.check_loss(loss)
+            if use_mse and epoch >= int(mixup_pct * num_epochs):
+                clip_target_mse = clip_extractor.clip.encode_image(clip_extractor.normalize(clip_extractor.resize_image(image)))
+                mse_loss = F.mse_loss(clip_target, clip_target_mse)
+            else:
+                mse_loss = 0
+            utils.check_loss(loss + mse_loss)
 
             losses.append(loss.item())
             lrs.append(optimizer.param_groups[0]['lr'])
@@ -401,10 +407,10 @@ if __name__ == '__main__':
 
             # forward and backward top 1 accuracy
             labels = torch.arange(len(clip_target)).to(device)
-            fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target, clip_voxels), labels, k=1)
-            bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels, clip_target), labels, k=1)
+            fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target, clip_voxels), labels, k=1).item()
+            bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels, clip_target), labels, k=1).item()
 
-            accelerator.backward(loss)
+            accelerator.backward(loss + mse_loss)
             optimizer.step()
 
             if lr_scheduler is not None:
@@ -416,8 +422,9 @@ if __name__ == '__main__':
                 repeat_index = val_i % 3
 
                 image = image.float()
-                voxel = voxel[:,repeat_index].float()
-
+                voxel = voxel.float()
+                if voxel_dims == 1 and data_commit == 'avg':
+                    voxel = voxel.mean(1)
                 if voxel_dims == 3:
                     voxel = voxel[:,np.unique(x_inc),:,:]
                     voxel = voxel[:,:,np.unique(y_inc),:]
@@ -463,8 +470,8 @@ if __name__ == '__main__':
                     val_sims_base += F.cosine_similarity(clip_target,clip_voxels).mean().item()
 
                 labels = torch.arange(len(clip_target)).to(device)
-                val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target, clip_voxels), labels, k=1)
-                val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels, clip_target), labels, k=1)
+                val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target, clip_voxels), labels, k=1).item()
+                val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels, clip_target), labels, k=1).item()
 
         if local_rank==0:
             if (not save_at_end and ckpt_saving) or (save_at_end and epoch == num_epochs - 1):

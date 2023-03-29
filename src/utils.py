@@ -906,3 +906,10 @@ def select_annotations(annots, random=False):
             txt = np.vstack((txt, t))
     txt = txt.flatten()
     return txt
+
+def voxel_select(voxels):
+    if voxels.ndim == 2:
+        return voxels
+    weights = torch.rand(voxels.shape[1]).reshape(1, -1, 1).to(voxels.device)
+    return (weights * voxels).sum(1)/weights.sum()
+

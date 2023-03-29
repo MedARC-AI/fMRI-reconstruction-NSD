@@ -87,12 +87,13 @@ class Clipper(torch.nn.Module):
 
 class BrainNetwork(nn.Module):
     # 133M
-    def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4):
+    def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4, norm_type='bn'):
         super().__init__()
+        norm_func = nn.BatchNorm1d if norm_type == 'bn' else nn.LayerNorm
         self.lin0 = nn.Sequential(
             nn.Linear(in_dim, h),
             nn.ReLU(inplace=True),
-            nn.BatchNorm1d(h),
+            norm_func(h),
             nn.Dropout(0.5),
         )
             
@@ -101,7 +102,7 @@ class BrainNetwork(nn.Module):
             nn.Sequential(
                 nn.Linear(h, h),
                 nn.ReLU(inplace=True),
-                nn.BatchNorm1d(h),
+                norm_func(h),
                 nn.Dropout(0.15)
             ) for _ in range(n_blocks)
         ])
