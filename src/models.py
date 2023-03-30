@@ -1,4 +1,5 @@
 import os
+from functools import partial
 import numpy as np
 from torchvision import transforms
 import torch
@@ -87,13 +88,14 @@ class Clipper(torch.nn.Module):
 
 class BrainNetwork(nn.Module):
     # 133M
-    def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4, norm_type='bn'):
+    def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4, norm_type='bn', act_first=True):
         super().__init__()
-        norm_func = nn.BatchNorm1d if norm_type == 'bn' else nn.LayerNorm
+        norm_func = partial(nn.BatchNorm1d, num_features=h) if norm_type == 'bn' else partial(nn.LayerNorm, normalized_shape=h)
+        act_fn = partial(nn.ReLU, inplace=True) if norm_type == 'bn' else nn.GELU
+        act_and_norm = (act_fn, norm_func) if act_first else (norm_func, act_fn)
         self.lin0 = nn.Sequential(
             nn.Linear(in_dim, h),
-            nn.ReLU(inplace=True),
-            norm_func(h),
+            *[item() for item in act_and_norm],
             nn.Dropout(0.5),
         )
             
@@ -101,13 +103,12 @@ class BrainNetwork(nn.Module):
         self.mlp = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(h, h),
-                nn.ReLU(inplace=True),
-                norm_func(h),
+                *[item() for item in act_and_norm],
                 nn.Dropout(0.15)
             ) for _ in range(n_blocks)
         ])
         
-        self.lin1 = nn.Linear(h, out_dim)
+        self.lin1 = nn.Linear(h, out_dim, bias=True)
         self.n_blocks = n_blocks
         
     def forward(self, x):

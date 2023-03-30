@@ -17,7 +17,7 @@ from kornia.augmentation.container import AugmentationSequential
 
 import utils
 from utils import torch_to_matplotlib, torch_to_Image
-from models import Clipper, BrainNetwork, BrainDiffusionPrior
+from models import Clipper, BrainNetwork, BrainDiffusionPrior, BrainSD
 from model3d import SimpleVoxel3dConvEncoder
 
 import torch.distributed as dist
@@ -69,6 +69,8 @@ if __name__ == '__main__':
     resume_from_ckpt = False
 
     use_mse = False
+    n_samples_save = 4
+
 
     torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -88,6 +90,7 @@ if __name__ == '__main__':
     #     _, local_rank, device = ddp_config.set_ddp()
     # else:
     #     local_rank, device = 0, torch.device('cuda:0')
+
     
     if use_image_aug:
         train_augs = AugmentationSequential(
@@ -118,6 +121,21 @@ if __name__ == '__main__':
 
     device = accelerator.device
     print("device:",device)
+
+    if use_mse:
+        # sd_cache_dir = '/admin/home-atom_101/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc/'
+        sd_cache_dir = '/fsx/proj-medarc/fmri/atom/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc/'
+        # sd_cache_dir = '/fsx/home-paulscotti/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc'
+        sd_pipe =  BrainSD.from_pretrained(
+            # "lambdalabs/sd-image-variations-diffusers",
+            sd_cache_dir,
+            revision="v2.0",
+            safety_checker=None,
+            requires_safety_checker=False,
+            torch_dtype=torch.float16, # fp16 is fine if we're not training this
+        ).to(device)
+    else:
+        sd_pipe = None
 
     num_devices = torch.cuda.device_count()
     if num_devices==0: num_devices = 1
@@ -210,7 +228,8 @@ if __name__ == '__main__':
     print('Creating voxel2clip...')
 
     if voxel_dims == 1: # 1D data
-        voxel2clip_kwargs = dict(out_dim=768, norm_type='bn')
+        # voxel2clip_kwargs = dict(out_dim=768, norm_type='bn')
+        voxel2clip_kwargs = dict(out_dim=768, norm_type='ln', act_first=False)
         voxel2clip = BrainNetwork(**voxel2clip_kwargs)
     elif voxel_dims == 3: # 3D data
         voxel2clip_kwargs = dict(
@@ -317,11 +336,11 @@ if __name__ == '__main__':
     utils.seed_everything(seed, cudnn_deterministic=False)
 
     epoch = 0
-    losses, val_losses, lrs = [], [], []
+    losses, mse_losses, val_losses, lrs = [], [], [], []
     best_val_loss = 1e9
     soft_loss_temps = utils.cosine_anneal(0.004, 0.0075, num_epochs - int(mixup_pct * num_epochs))
 
-    val_voxel0 = val_image0 = None
+    voxel0 = image0 = val_voxel0 = val_image0 = None
 
     # Optionally resume from checkpoint #
     if resume_from_ckpt:
@@ -339,7 +358,7 @@ if __name__ == '__main__':
                     del state_dict[key]
             voxel2clip.load_state_dict(state_dict)
 
-    progress_bar = tqdm(range(epoch,num_epochs), ncols=1200, disable=(local_rank!=0))
+    progress_bar = tqdm(range(epoch,num_epochs), disable=(local_rank!=0))
     for epoch in progress_bar:
         voxel2clip.train()
 
@@ -363,6 +382,10 @@ if __name__ == '__main__':
                 voxel = voxel[:,np.unique(x_inc),:,:]
                 voxel = voxel[:,:,np.unique(y_inc),:]
                 voxel = voxel[:,:,:,np.unique(z_inc)]
+
+            if image0 is None:
+                image0 = image.clone()
+                voxel0 = voxel.clone()
 
             if epoch < int(mixup_pct * num_epochs):
                 voxel, perm, betas, select = utils.mixco(voxel)
@@ -389,9 +412,14 @@ if __name__ == '__main__':
                     nn.functional.normalize(clip_target, dim=-1),
                     temp=epoch_temp,
                     distributed=distributed, accelerator=accelerator)
-            if use_mse and epoch >= int(mixup_pct * num_epochs):
-                clip_target_mse = clip_extractor.clip.encode_image(clip_extractor.normalize(clip_extractor.resize_image(image)))
-                mse_loss = F.mse_loss(clip_target, clip_target_mse)
+            if use_mse:
+                if epoch < int(mixup_pct * num_epochs):
+                    clip_target_mse = clip_extractor.clip.encode_image(clip_extractor.normalize(clip_extractor.resize_image(image[~select])))
+                    mse_loss = F.mse_loss(clip_voxels[~select], clip_target_mse.float())
+                else:
+                    clip_target_mse = clip_extractor.clip.encode_image(clip_extractor.normalize(clip_extractor.resize_image(image)))
+                    mse_loss = F.mse_loss(clip_voxels, clip_target_mse.float())
+                mse_losses.append(mse_loss.item())
             else:
                 mse_loss = 0
             utils.check_loss(loss + mse_loss)
@@ -479,13 +507,19 @@ if __name__ == '__main__':
                 val_loss = np.mean(val_losses[-(val_i+1):])
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    save_ckpt('best')
+                    try:
+                        save_ckpt('best')
+                    except:
+                        pass
                 else:
                     print(f'not best - val_loss: {val_loss:.3f}, best_val_loss: {best_val_loss:.3f}')
 
             # Save model checkpoint every `ckpt_interval`` epochs or on the last epoch
             if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
-                save_ckpt(f'epoch{epoch:03d}')
+                try:
+                    save_ckpt(f'epoch{epoch:03d}')
+                except:
+                    pass
 
             logs = {"train/loss": np.mean(losses[-(train_i+1):]),
                     "val/loss": np.mean(val_losses[-(val_i+1):]),
@@ -498,8 +532,34 @@ if __name__ == '__main__':
                     "train/bwd_pct_correct": bwd_percent_correct / (train_i + 1),
                     "val/val_fwd_pct_correct": val_fwd_percent_correct / (val_i + 1),
                     "val/val_bwd_pct_correct": val_bwd_percent_correct / (val_i + 1)}
+            if use_mse:
+                logs['train/mse_loss'] = np.mean(mse_losses[-(train_i+1):])
             progress_bar.set_postfix(**logs)
 
+            # sample some images
+            if sd_pipe is not None:
+                if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
+                    if (not save_at_end and n_samples_save > 0) or (save_at_end and epoch == num_epochs - 1):
+                        # training
+                        grids,_ = utils.sample_images(
+                            clip_extractor, voxel2clip, sd_pipe, None,
+                            voxel0[:n_samples_save], image0[:n_samples_save], seed=42,
+                        )
+                        for i, grid in enumerate(grids):
+                            grid.save(os.path.join(outdir, f'samples-train-{i:03d}.png'))
+                        if wandb_log:
+                            logs['train/samples'] = [wandb.Image(grid) for grid in grids]
+
+                        # validation
+                        grids,_ = utils.sample_images(
+                            clip_extractor, voxel2clip, sd_pipe, None,
+                            val_voxel0[:n_samples_save], val_image0[:n_samples_save], seed=42,
+                        )
+                        for i, grid in enumerate(grids):
+                            grid.save(os.path.join(outdir, f'samples-val-{i:03d}.png'))
+                        if wandb_log:
+                            logs['val/samples'] = [wandb.Image(grid) for grid in grids]
+            
             if wandb_log:
                 wandb.log(logs)
 

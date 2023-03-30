@@ -422,7 +422,8 @@ def sample_images(
 
     clip_extractor.eval()
     brain_net.eval()
-    diffusion_prior.eval()
+    if diffusion_prior is not None:
+        diffusion_prior.eval()
 
     if seed is not None:
         # set seed
@@ -464,18 +465,21 @@ def sample_images(
         # image_embeddings = nn.functional.normalize(image_embeddings, dim=-1) 
         # image_embeddings *= clip_emb[1].norm()/image_embeddings.norm() # note: this is cheating to equate norm scaling
 
-        image_embeddings = diffusion_prior.p_sample_loop(image_embeddings.shape, 
-                                            text_cond = dict(text_embed = image_embeddings), 
-                                            cond_scale = 1., timesteps = prior_timesteps,
-                                            generator=g_cuda
-                                            )
-        norm_post_prior = image_embeddings.norm().item()
+        if diffusion_prior is not None:
+            image_embeddings = diffusion_prior.p_sample_loop(image_embeddings.shape, 
+                                                text_cond = dict(text_embed = image_embeddings), 
+                                                cond_scale = 1., timesteps = prior_timesteps,
+                                                generator=g_cuda
+                                                )
+            norm_post_prior = image_embeddings.norm().item()
 
         if verbose:
             cos_sim = nn.functional.cosine_similarity(image_embeddings, clip_emb, dim=1).item()
             mse = nn.functional.mse_loss(image_embeddings, clip_emb).item()
             print(f"cosine sim: {cos_sim:.3f}, MSE: {mse:.5f}, norm_orig: {norm_orig:.3f}, "
-                  f"norm_pre_prior: {norm_pre_prior:.3f}, norm_post_prior: {norm_post_prior:.3f}", flush=True)
+                  f"norm_pre_prior: {norm_pre_prior:.3f}" + \
+                  f", norm_post_prior: {norm_post_prior:.3f}" if diffusion_prior is not None else "",
+                  flush=True)
 
         # duplicate the embedding to serve classifier free guidance
         image_embeddings = image_embeddings.repeat(num_per_sample, 1)
