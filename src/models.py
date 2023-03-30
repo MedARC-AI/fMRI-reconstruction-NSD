@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import PIL
 import clip
+import open_clip
 
 # for prior
 from dalle2_pytorch import DiffusionPrior
@@ -22,9 +23,64 @@ from diffusers.models.vae import Decoder
 
 # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+class OpenClipper(torch.nn.Module):
+    def __init__(self, clip_variant='ViT-H-14', train_transforms=None, device=torch.device('cpu')):
+        super().__init__()
+        print(clip_variant, device)
+        assert clip_variant == 'ViT-H-14' # not setup for other models yet
+                
+        clip_model, _, preprocess = open_clip.create_model_and_transforms('ViT-H-14', 
+                                        pretrained='laion2b_s32b_b79k', device=device)
+        clip_model.eval() # dont want to train model
+        for param in clip_model.parameters():
+            param.requires_grad = False # dont need to calculate gradients
+            
+        # overwrite preprocess to accept torch inputs instead of PIL Image
+        preprocess = transforms.Compose([
+                transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC, antialias=None),
+                transforms.CenterCrop(224),
+                transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
+        ])
+        
+        tokenizer = open_clip.get_tokenizer('ViT-H-14')
+            
+        self.clip = clip_model
+        self.preprocess = preprocess
+        self.tokenizer = tokenizer
+        self.transforms = train_transforms
+        self.device = device
+        
+    def embed_image(self, image):
+        """Expects images in -1 to 1 range"""
+        image = self.preprocess(image).to(self.device)
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            image_features = self.clip.encode_image(image)
+            #image_features /= image_features.norm(dim=-1, keepdim=True)
+        return image_features
+
+    def embed_text(self, text_samples):
+        text = self.tokenizer(text_samples).to(self.device)
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            text_features = self.clip.encode_text(text)
+            #text_features /= text_features.norm(dim=-1, keepdim=True)
+        return text_features
+
+    def embed_curated_annotations(self, annots):
+        for i,b in enumerate(annots):
+            t = ''
+            while t == '':
+                rand = torch.randint(5,(1,1))[0][0]
+                t = b[0,rand]
+            if i==0:
+                txt = np.array(t)
+            else:
+                txt = np.vstack((txt,t))
+        txt = txt.flatten()
+        return self.embed_text(txt)
 
 class Clipper(torch.nn.Module):
-    def __init__(self, clip_variant, clamp_embs=False, norm_embs=False, train_transforms=None, device=torch.device('cpu')):
+    def __init__(self, clip_variant, clamp_embs=False, norm_embs=False, train_transforms=None, 
+                 device=torch.device('cpu')):
         super().__init__()
         assert clip_variant in ("RN50", "ViT-L/14", "ViT-B/32"), \
             "clip_variant must be one of RN50, ViT-L/14, ViT-B/32"
@@ -291,23 +347,20 @@ class BrainDiffusionPrior(DiffusionPrior):
         # Note these keys will be missing (maybe due to an update to the code since training):
         # "net.null_text_encodings", "net.null_text_embeds", "net.null_image_embed"
         # I don't think these get used if `cond_drop_prob = 0` though (which is the default here)
-        keys = diffusion_prior.load_state_dict(ckpt, strict=False)
+        diffusion_prior.load_state_dict(ckpt, strict=False)
+        # keys = diffusion_prior.load_state_dict(ckpt, strict=False)
         # print("missing keys in prior checkpoint (probably ok)", keys.missing_keys)
 
         if voxel2clip_path:
             # load the voxel2clip weights
             checkpoint = torch.load(voxel2clip_path, map_location=torch.device('cpu'))
             
-            try:
-                diffusion_prior.voxel2clip.load_state_dict(checkpoint['model_state_dict'])
-            except:
-                # converting ddp model to non-ddp format
-                state_dict = checkpoint['model_state_dict']
-                for key in list(state_dict.keys()):
-                    if 'module.' in key:
-                        state_dict[key.replace('module.', '')] = state_dict[key]
-                        del state_dict[key]
-                diffusion_prior.voxel2clip.load_state_dict(state_dict)
+            state_dict = checkpoint['model_state_dict']
+            for key in list(state_dict.keys()):
+                if 'module.' in key:
+                    state_dict[key.replace('module.', '')] = state_dict[key]
+                    del state_dict[key]
+            diffusion_prior.voxel2clip.load_state_dict(state_dict)
         
         return diffusion_prior
 

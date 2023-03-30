@@ -16,15 +16,19 @@ from diffusers.utils import randn_tensor
 from models import Clipper
 import json
 from torchmetrics.image.fid import FrechetInceptionDistance
-
-from PIL import Image, UnidentifiedImageError
-import traceback
+from PIL import Image
 import requests
-import time
 import io
-from glob import glob
+from clip_retrieval.clip_client import ClipClient
+import time 
+from torchvision.models import alexnet, AlexNet_Weights
+from image_finder import _check_whether_images_are_identical
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def is_interactive():
+    import __main__ as main
+    return not hasattr(main, '__file__')
 
 def seed_everything(seed=0, cudnn_deterministic=True):
     random.seed(seed)
@@ -251,6 +255,17 @@ def get_huggingface_urls(commit='9947586218b6b7c8cab804009ddca5045249a38d'):
     val_url = base_url + commit + "/webdataset/val/val_subj01_0.tar"
     return train_url, val_url
 
+def split_by_node(urls):
+    node_id, node_count = accelerator.state.local_process_index, accelerator.state.num_processes
+    return urls[node_id::node_count]
+
+def my_split_by_worker(urls):
+    wi = torch.utils.data.get_worker_info()
+    if wi is None:
+        return urls
+    else:
+        return urls[wi.id::wi.num_workers]
+    
 def check_loss(loss):
     if loss.isnan().any():
         raise ValueError('NaN loss')
@@ -296,10 +311,7 @@ def get_dataloaders(
         if num_val is None:
             num_val = 492
     else:
-        if os.path.exists(meta_url):
-            metadata = json.load(open(meta_url))
-        else:
-            metadata = json.loads(requests.get(meta_url).text)
+        metadata = json.load(open(meta_url))
         if num_train is None:
             num_train = metadata['totals']['train']
         if num_val is None:
@@ -334,7 +346,7 @@ def get_dataloaders(
         .to_tuple(*to_tuple)\
         .batched(batch_size, partial=True)\
         .with_epoch(num_worker_batches)
-
+    
     if n_cache_recs > 0:
         train_data = train_data.compose(wds.DBCache, os.path.join(cache_dir, "cache-train.db"),  n_cache_recs)
         
@@ -530,74 +542,81 @@ def save_ckpt(model, optimizer, losses, val_losses, lrs, epoch, tag, outdir):
 def cosine_anneal(start, end, steps):
     return end + (start - end)/2 * (1 + torch.cos(torch.pi*torch.arange(steps)/(steps-1)))
 
-
-size = (336, 336)  #  (1920//4, 1080//4)
-
-
-def pad_resize(im, size, fit=True):
-    ratio = (max if fit else min)((w / s for s, w in zip(im.size, size)))
-    im = im.resize([int(s * ratio) for s, w in zip(im.size, size)])
-    canvas = Image.new("RGB", size, (0, 0, 0))
-    canvas.paste(im, [w // 2 - s // 2 for s, w in zip(im.size, size)])
-    return canvas
-
-def crop_resize(im, size):
-    assert size[0] == size[1]  # unnecessary, bad design, why
-    w = size[0]
-    im = im.convert("RGB")
-    a, b = im.size
-    im = im.resize((w if a < b else int(a / b * w), w if b <= a else int(b / a * w)))
-    a, b = im.size
-    x, y = (a - w) // 2, (b - w) // 2
-    im = im.crop((x, y, x + w, y + w))
-    im = im.resize((w, w))
-    return im
-
-
-def img_result(result, size=size):
-    try:
-        return crop_resize(  # pad_resize(
-            Image.open(
-            io.BytesIO(
-                requests.get(result["url"]).content  # , stream=True).raw
-            )
-        ).convert("RGB"), size)  # .resize(size).convert("RGB")
-    except (TypeError, requests.ConnectionError, UnidentifiedImageError):
-        #traceback.print_exc()
-        return None  # Image.new("RGB", size)
-
-
-def query_laion(text=None, emb=None, num=20):
-    # Soft requirement
-    try:
-        from clip_retrieval.clip_client import ClipClient, Modality
-    except ImportError:
-        raise ValueError("Install clip-retrieval for retrieval support")
+# class SquarePad:
+#     def __call__(self, image):
+#         w, h = image.size
+#         max_wh = np.max([w, h])
+#         hp = int((max_wh - w) / 2)
+#         vp = int((max_wh - h) / 2)
+#         padding = (hp, vp, hp, vp)
+#         return F.pad(image, padding, 0, 'constant')
+laion_transform=transforms.Compose([
+    transforms.Resize((512,512)),
+    transforms.ToTensor(),
+])
+def query_laion(text=None, emb=None, num=20, indice_name="laion5B-L-14", groundtruth=None):
+    #emb = emb / np.linalg.norm(emb, axis=-1, keepdims=True)
+    if indice_name == "laion5B-L-14":
+        groundtruth = nn.functional.interpolate(groundtruth, 512, mode="area", antialias=False).to(device)
+    elif indice_name == "laion5B-H-14":
+        groundtruth = nn.functional.interpolate(groundtruth, 768, mode="area", antialias=False).to(device)
     client = ClipClient(
         url="https://knn.laion.ai/knn-service",
-        indice_name="laion5B-L-14",
-        aesthetic_score=9,
-        aesthetic_weight=0.15,
-        modality=Modality.IMAGE,
-        num_images=max(4, num * 2),
+        indice_name=indice_name, 
+        num_images=num,
         use_violence_detector=False,
         use_safety_model=False
     )
-
-    while True:
+    result = None
+    while result is None:
         try:
-            while len(emb.shape) > 1:
-                emb = emb[0]
-            results = client.query(text=text, embedding_input=(emb / np.linalg.norm(emb)).tolist() if emb is not None else None)
-        except Exception:
-            traceback.print_exc()
-            time.sleep(1)
-            continue
-        break
-    if not results:
-        return Image.new("RGB", size)
-    imgs = [img_result(result) for result in results]
-    imgs = [im for im in imgs if im is not None][:num]
+            result = client.query(text=text, embedding_input=emb.tolist() if emb is not None else None)
+        except:
+            print("No result... retrying query_laion() in 5 seconds...")
+            time.sleep(5)
+    
+    if len(result) < 3:
+        client = ClipClient(
+            url="https://knn.laion.ai/knn-service",
+            indice_name=indice_name, 
+            num_images=num,
+            aesthetic_score=5,
+            aesthetic_weight=1,
+            use_violence_detector=False,
+            use_safety_model=False
+        )
+        result = None
+        while result is None:
+            try:
+                result = client.query(text=text, embedding_input=emb.tolist() if emb is not None else None)
+            except:
+                print("No result... retrying query_laion() in 5 seconds...")
+                time.sleep(5)
+    
+    imgs = None
+    for res in result:
+        try:
+            img = laion_transform(Image.open(io.BytesIO(requests.get(res["url"],timeout=5).content)))
+            if _check_whether_images_are_identical(img, groundtruth):
+                continue
+            if imgs is None:
+                if img.shape[0] == 1:
+                    img = img.repeat(3,1,1)
+                imgs = img[None]
+                imgs = torch.vstack((imgs,transforms.functional.hflip(img[None])))
+            else:
+                imgs = torch.vstack((imgs,img[None]))
+                imgs = torch.vstack((imgs,transforms.functional.hflip(img[None])))
+        except:
+            time.sleep(.5)
+    if imgs is None:
+        print("No images retrieved??? Using blank white image as substitute...")
+        if indice_name == "laion5B-L-14":
+            imgs = torch.zeros((num*2,3,512,512))
+        else:
+            imgs = torch.zeros((num*2,3,768,768))
+    while len(imgs)<num*2:
+        imgs = torch.vstack((imgs,torch.zeros(imgs[[0]].shape)))
     return imgs
 
 
@@ -617,8 +636,8 @@ def reconstruct_from_clip(
     img2img_strength = .6,
     timesteps = 1000,
     seed = 0,
-    distributed = False,
     retrieve=False,
+    plotting=True,
 ):
     def decode_latents(latents):
         latents = 1 / 0.18215 * latents
@@ -640,36 +659,33 @@ def reconstruct_from_clip(
     generator.manual_seed(seed)
 
     # Prep CLIP-Image embeddings for original image for comparison with reconstructions
-    clip_embeddings = clip_extractor.embed_image(image).float()
+    if recons_per_clip > 0:
+        clip_embeddings = clip_extractor.embed_image(image).float()
+    else:
+        clip_embeddings = torch.Tensor([])
 
     # Encode voxels to CLIP space
     brain_clip_embeddings_sum = None
     for diffusion_prior in diffusion_priors:
-        if distributed:
-            diffusion_prior.module.voxel2clip.eval()
-            brain_clip_embeddings0 = diffusion_prior.module.voxel2clip(voxel.to(device).float())
-            # NOTE: requires fork of DALLE-pytorch for generator arg
-            brain_clip_embeddings = diffusion_prior.module.p_sample_loop(brain_clip_embeddings0.shape, 
-                                                text_cond = dict(text_embed = brain_clip_embeddings0), 
-                                                cond_scale = 1., timesteps = timesteps, #1000 timesteps used from nousr pretraining
-                                                generator=generator
-                                                )
-        else:
-            diffusion_prior.voxel2clip.eval()
-            brain_clip_embeddings0 = diffusion_prior.voxel2clip(voxel.to(device).float())
-            # NOTE: requires fork of DALLE-pytorch for generator arg
+        diffusion_prior.voxel2clip.eval()
+        brain_clip_embeddings0 = diffusion_prior.voxel2clip(voxel.to(device).float())
+        # NOTE: requires fork of DALLE-pytorch for generator arg
+        if recons_per_brain>0:
             brain_clip_embeddings = diffusion_prior.p_sample_loop(brain_clip_embeddings0.shape, 
-                                                text_cond = dict(text_embed = brain_clip_embeddings0), 
-                                                cond_scale = 1., timesteps = timesteps, #1000 timesteps used from nousr pretraining
-                                                generator=generator
-                                                )
-        if brain_clip_embeddings_sum is None:
-            brain_clip_embeddings_sum = brain_clip_embeddings
-        else:
-            brain_clip_embeddings_sum += brain_clip_embeddings
+                                            text_cond = dict(text_embed = brain_clip_embeddings0), 
+                                            cond_scale = 1., timesteps = timesteps, #1000 timesteps used from nousr pretraining
+                                            generator=generator
+                                            )
+            if brain_clip_embeddings_sum is None:
+                brain_clip_embeddings_sum = brain_clip_embeddings
+            else:
+                brain_clip_embeddings_sum += brain_clip_embeddings
 
     # average embeddings for all diffusion priors
-    brain_clip_embeddings = brain_clip_embeddings_sum / len(diffusion_priors)
+    if recons_per_brain>0:
+        brain_clip_embeddings = brain_clip_embeddings_sum / len(diffusion_priors)
+    else:
+        brain_clip_embeddings = brain_clip_embeddings0
 
     # Now enter individual image processing loop
     clip_recons = None
@@ -685,32 +701,32 @@ def reconstruct_from_clip(
                 recons_per_sample = recons_per_clip
             else:
                 recons_per_sample = recons_per_brain
-            if recons_per_sample == 0: continue
             if embed_type == "brain" and retrieve:
-                try:
-                    image_retrieved0 = query_laion(emb=brain_clip_embeddings0.detach().cpu().numpy().flatten())
-                    image_retrieved = (Image_to_torch(image_retrieved0[0])[0].unsqueeze(0) + 1) / 2
+                image_retrieved0 = query_laion(emb=brain_clip_embeddings0.float().detach().cpu().numpy().flatten(),groundtruth=image[0])
+                if embed_type == "brain" and retrieve and recons_per_brain>0:
+                    image_retrieved = (image_retrieved0[0] + 1) / 2
                     retrieved_clip = clip_extractor.embed_image(image_retrieved).float()
-                    
-                    # crude way to elminate coco image being the nearest neighbor
-                    if (torch.abs(torch.mean(clip_embeddings - retrieved_clip)) < .0045):
-                        image_retrieved = (Image_to_torch(image_retrieved0[1])[0].unsqueeze(0) + 1) / 2
-                        retrieved_clip = clip_extractor.embed_image(image_retrieved).float()
-                except:
-                    print("query_laion failed! probably due to 'TooManyRedirects: Exceeded 30 redirects.' error.")
-                    image_retrieved = torch.zeros_like(brain_clip_embeddings0)
-                    retrieved_clip = image_retrieved
-                
+            
+            if recons_per_clip == 0 and embed_type =='clip':
+                continue
+            elif recons_per_brain == 0 and embed_type =='brain' and retrieve:
+                if brain_recons is None:
+                    brain_recons = image_retrieved0[None]
+                else:
+                    brain_recons = torch.vstack((brain_recons,image_retrieved0[None]))
+                brain_recons.to(device)
+                continue
+            
             input_embedding = input_embedding.repeat(recons_per_sample, 1)
             input_embedding = torch.cat([torch.zeros_like(input_embedding), input_embedding]).unsqueeze(1).to(device)
             
             # 4. Prepare timesteps
-            noise_scheduler.set_timesteps(num_inference_steps, device=device)
+            noise_scheduler.set_timesteps(num_inference_steps=num_inference_steps, device=device)
             
             # 5b. Prepare latent variables
             batch_size = input_embedding.shape[0] // 2 # divide by 2 bc we doubled it for classifier-free guidance
             shape = (batch_size, unet.in_channels, height // vae_scale_factor, width // vae_scale_factor)
-            if (embed_type == "brain") and (img_lowlevel is not None): # use img_lowlevel for img2img initialization
+            if img_lowlevel is not None: # use img_lowlevel for img2img initialization
                 img_lowlevel = img_lowlevel[:n_samples_save]
                 # img_lowlevel = transforms.functional.gaussian_blur(img_lowlevel,kernel_size=41)
                 # img_lowlevel = image_retrieved.float()
@@ -720,7 +736,7 @@ def reconstruct_from_clip(
                 t_start = max(num_inference_steps - init_timestep, 0)
                 timesteps = noise_scheduler.timesteps[t_start:]
                 latent_timestep = timesteps[:1].repeat(batch_size)
-
+                
                 if img2img_refs is None:
                     img2img_refs = img_lowlevel[[emb_idx]]
                 elif img2img_refs.shape[0] <= emb_idx:
@@ -746,7 +762,15 @@ def reconstruct_from_clip(
                 latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
 
                 # predict the noise residual
-                noise_pred = unet(latent_model_input, t, encoder_hidden_states=input_embedding).sample
+                #noise_pred = unet(latent_model_input, t, encoder_hidden_states=input_embedding).sample
+                
+                noise_pred = unet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=None, #input_embedding
+                    class_labels=input_embedding, #image_embeds
+                    cross_attention_kwargs=None, 
+                ).sample
 
                 # perform guidance
                 if do_classifier_free_guidance:
@@ -756,7 +780,7 @@ def reconstruct_from_clip(
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
             recons = decode_latents(latents).detach().cpu()
-
+            
             if embed_type == 'clip':
                 if clip_recons is None:
                     clip_recons = recons.unsqueeze(0)
@@ -768,66 +792,127 @@ def reconstruct_from_clip(
                 else:
                     brain_recons = torch.cat((brain_recons,recons.unsqueeze(0)))
 
+    # ensure no alpha channel
+    brain_recons = brain_recons[:,:,:3]
+                    
     # compare CLIP embedding of LAION nearest neighbor to your brain reconstructions
     best_picks = np.zeros(n_samples_save)
-    if embed_type == "brain" and retrieve:
-        for im in range(n_samples_save):
-            brain_clips = clip_extractor.embed_image(brain_recons[im])
-            cos_sims_to_neighbor = batchwise_cosine_similarity(brain_clips.float(), retrieved_clip)
-            best_picks[im] = int(torch.argmax(cos_sims_to_neighbor))
+    if embed_type == "brain" and (retrieve or img_lowlevel is not None):
+        for im in range(n_samples_save):            
+            # brain_clips = clip_extractor.embed_image(brain_recons[im])
+            # cos_sims_to_neighbor = batchwise_cosine_similarity(brain_clips.float(), retrieved_clip)
+            # best_picks[im] = int(torch.argmax(cos_sims_to_neighbor))
+            
+            # prevent a blank image from being selected
+            for ii in range(len(brain_recons[im])):
+                if torch.all(brain_recons[im][ii]==0):
+                    brain_recons[im][ii] *= np.nan
+
+            weights = AlexNet_Weights.DEFAULT
+            model = alexnet(weights=weights).eval()
+            model.requires_grad_(False)
+            preprocess = weights.transforms()
+            for i,f in enumerate(model.features):
+                if recons_per_brain==0 and retrieve:
+                    if i>4: model.features[i] = nn.Identity() # mid
+                else:
+                    if i>1: model.features[i] = nn.Identity() # early
+            model.avgpool=nn.Identity()
+            model.classifier=nn.Identity()
+            model.to(img_lowlevel.device)
+            
+            brain_recons = brain_recons.to(img_lowlevel.device)
+            with torch.cuda.amp.autocast(False): # tendency to go infinity if using half()
+                pix_dist = None
+                img_lowlevel_alex = model(preprocess(img_lowlevel[[0]]))
+                for ii in range(len(brain_recons[im])):
+                    recon_alex = model(preprocess(brain_recons[im][[ii]])) 
+                    cos_dist = pairwise_cosine_similarity(img_lowlevel_alex,recon_alex).item()
+                    if pix_dist is None:
+                        pix_dist = cos_dist
+                    else:
+                        pix_dist = np.hstack((pix_dist, cos_dist))
+                best_picks[im] = int(np.nanargmax(pix_dist))
+    best_picks = best_picks.astype(np.int8)
+    
+    if recons_per_brain==0 and retrieve:
+        recon_is_laion = True
+        recons_per_brain = 1 # brain reconstruction will simply be the LAION nearest neighbor
+    else:
+        recon_is_laion = False
                     
     img2img_samples = 0 if img_lowlevel is None else 1
     laion_samples = 1 if retrieve else 0
     num_xaxis_subplots = 1+img2img_samples+laion_samples+recons_per_clip+recons_per_brain
-    fig, ax = plt.subplots(n_samples_save, num_xaxis_subplots, 
-                           figsize=(num_xaxis_subplots*3,8*n_samples_save),
+    if plotting:
+        fig, ax = plt.subplots(n_samples_save, num_xaxis_subplots, 
+                           figsize=(num_xaxis_subplots*3,4.5*n_samples_save),
                            facecolor=(1, 1, 1))
+    else:
+        fig = None
     if n_samples_save > 1:
         for im in range(n_samples_save):
-            ax[im][0].set_title(f"Original Image")
-            ax[im][0].imshow(torch_to_Image(image[im]))
-            if img2img_samples == 1:
-                ax[im][1].set_title(f"Img2img ({img2img_strength})")
-                ax[im][1].imshow(torch_to_Image(img2img_refs[im]))
+            if plotting:
+                ax[im][0].set_title(f"Original Image")
+                ax[im][0].imshow(torch_to_Image(image[im]))
+                if img2img_samples == 1:
+                    ax[im][1].set_title(f"Img2img ({img2img_strength})")
+                    ax[im][1].imshow(torch_to_Image(img_lowlevel[im]))
+                    # ax[im][1].imshow(torch_to_Image(img2img_refs[im]))
             for ii,i in enumerate(range(num_xaxis_subplots-laion_samples-recons_per_clip-recons_per_brain,num_xaxis_subplots-laion_samples-recons_per_brain)):
                 recon = clip_recons[im][ii]
-                ax[im][i].set_title(f"Recon {ii+1} from orig CLIP")
-                ax[im][i].imshow(torch_to_Image(recon))
+                if plotting:
+                    ax[im][i].set_title(f"Recon {ii+1} from orig CLIP")
+                    ax[im][i].imshow(torch_to_Image(recon))
             for ii,i in enumerate(range(num_xaxis_subplots-laion_samples-recons_per_brain,num_xaxis_subplots-laion_samples)):
                 recon = brain_recons[im][ii]
-                if ii == best_picks[im]:
-                    ax[im][i].set_title(f"Best Reconstruction",fontweight='bold')
-                else:
-                    ax[im][i].set_title(f"Recon {ii+1} from brain")
-                ax[im][i].imshow(torch_to_Image(recon))
-            if retrieve:
-                ax[im][-1].set_title(f"LAION5b top neighbor")
-                ax[im][-1].imshow(torch_to_Image(image_retrieved))
-            for i in range(num_xaxis_subplots):
-                ax[im][i].axis('off')
+                if recon_is_laion:
+                    recon = brain_recons[im][best_picks[0]]
+                if plotting:
+                    if ii == best_picks[im]:
+                        ax[im][i].set_title(f"Reconstruction",fontweight='bold')
+                    else:
+                        ax[im][i].set_title(f"Recon {ii+1} from brain")
+                    ax[im][i].imshow(torch_to_Image(recon))
+            if plotting:
+                if retrieve and not recon_is_laion:
+                    ax[im][-1].set_title(f"LAION5b top neighbor")
+                    ax[im][-1].imshow(torch_to_Image(image_retrieved0))
+                for i in range(num_xaxis_subplots):
+                    ax[im][i].axis('off')
     else:   
         im = 0
-        ax[0].set_title(f"Original Image")
-        ax[0].imshow(torch_to_Image(image[im]))
-        if img2img_samples == 1:
-            ax[1].set_title(f"Img2img ({img2img_strength})")
-            ax[1].imshow(torch_to_Image(img2img_refs[im]))
+        if plotting:
+            ax[0].set_title(f"Original Image")
+            ax[0].imshow(torch_to_Image(image[im]))
+            if img2img_samples == 1:
+                ax[1].set_title(f"Img2img ({img2img_strength})")
+                ax[1].imshow(torch_to_Image(img_lowlevel[im]))
+                # ax[1].imshow(torch_to_Image(img2img_refs[im]))
         for ii,i in enumerate(range(num_xaxis_subplots-laion_samples-recons_per_clip-recons_per_brain,num_xaxis_subplots-recons_per_brain-laion_samples)):
             recon = clip_recons[im][ii]
-            ax[i].set_title(f"Recon {ii+1} from orig CLIP")
-            ax[i].imshow(torch_to_Image(recon))
+            if plotting:
+                ax[i].set_title(f"Recon {ii+1} from orig CLIP")
+                ax[i].imshow(torch_to_Image(recon))
         for ii,i in enumerate(range(num_xaxis_subplots-laion_samples-recons_per_brain,num_xaxis_subplots-laion_samples)):
             recon = brain_recons[im][ii]
-            if ii == best_picks[im]:
-                ax[i].set_title(f"Best Reconstruction",fontweight='bold')
-            else:
-                ax[i].set_title(f"Recon {ii+1} from brain")
-            ax[i].imshow(torch_to_Image(recon))
-        if retrieve:
-            ax[-1].set_title(f"LAION5b top neighbor")
-            ax[-1].imshow(torch_to_Image(image_retrieved))
-        for i in range(num_xaxis_subplots):
-            ax[i].axis('off')
+            if recon_is_laion:
+                recon = brain_recons[im][best_picks[0]]
+            if plotting:
+                if ii == best_picks[im]:
+                    ax[i].set_title(f"Reconstruction",fontweight='bold')
+                else:
+                    ax[i].set_title(f"Recon {ii+1} from brain")
+                ax[i].imshow(torch_to_Image(recon))
+        if plotting:
+            if retrieve and not recon_is_laion:
+                ax[-1].set_title(f"LAION5b top neighbor")
+                ax[-1].imshow(torch_to_Image(image_retrieved0))
+            for i in range(num_xaxis_subplots):
+                ax[i].axis('off')
+                
+    if torch.all(brain_recons[im][best_picks[im]]==0):
+        print("Reconstruction is empty image...")
     
     return fig, clip_recons, brain_recons, best_picks
 
@@ -878,3 +963,316 @@ def select_annotations(annots, random=False):
             txt = np.vstack((txt, t))
     txt = txt.flatten()
     return txt
+
+def soft_cont_loss(student_preds, teacher_preds, teacher_aug_preds, temp=0.125, distributed=True):
+    # if not distributed:
+    #     raise NotImplementedError()
+    # else:
+    #     all_student_preds, all_teacher_preds = gather_features(student_preds, teacher_preds)
+    #     all_teacher_aug_preds = gather_features(teacher_aug_preds, None)
+    
+    all_student_preds = student_preds
+    all_teacher_preds = teacher_preds
+    all_teacher_aug_preds = teacher_aug_preds
+
+    teacher_teacher_aug = (teacher_preds @ all_teacher_aug_preds.T)/temp
+    teacher_teacher_aug_t = (teacher_aug_preds @ all_teacher_preds.T)/temp
+    student_teacher_aug = (student_preds @ all_teacher_aug_preds.T)/temp
+    student_teacher_aug_t = (teacher_aug_preds @ all_student_preds.T)/temp
+
+    loss1 = -(student_teacher_aug.log_softmax(-1) * teacher_teacher_aug.softmax(-1)).sum(-1).mean()
+    loss2 = -(student_teacher_aug_t.log_softmax(-1) * teacher_teacher_aug_t.softmax(-1)).sum(-1).mean()
+    
+    loss = (loss1 + loss2)/2
+    return loss
+
+
+@torch.no_grad()
+def reconstruct_from_openclip(
+    image, voxel,
+    voxel2clip,
+    clip_extractor,
+    unet, vae, noise_scheduler,
+    prompt_embeds0,
+    img_lowlevel = None,
+    num_inference_steps = 50,
+    n_samples_save = 4,
+    recons_per_clip = 2,
+    recons_per_brain = 4,
+    guidance_scale = 7.5,
+    img2img_strength = .6,
+    timesteps = 1000,
+    seed = 0,
+    retrieve=False,
+    plotting=True,
+):
+    def decode_latents(latents):
+        latents = 1 / 0.18215 * latents
+        image = vae.decode(latents).sample
+        image = (image / 2 + 0.5).clamp(0, 1)
+        return image
+
+    voxel=voxel[:n_samples_save]
+    image=image[:n_samples_save]
+
+    do_classifier_free_guidance = guidance_scale > 1.0
+    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+    height = unet.config.sample_size * vae_scale_factor
+    width = unet.config.sample_size * vae_scale_factor
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+
+    # Prep CLIP-Image embeddings for original image for comparison with reconstructions
+    if recons_per_clip > 0:
+        clip_embeddings = clip_extractor.embed_image(image).float()
+    else:
+        clip_embeddings = torch.Tensor([])
+
+    voxel2clip.eval()
+    brain_clip_embeddings = brain_clip_embeddings0 = voxel2clip(voxel.to(device).float())
+
+    # Now enter individual image processing loop
+    clip_recons = None
+    brain_recons = None
+    img2img_refs = None
+    for e, emb in enumerate([clip_embeddings, brain_clip_embeddings]):
+        if e==0:
+            embed_type = 'clip'
+        else:
+            embed_type = 'brain'
+        for emb_idx, input_embedding in enumerate(emb):
+            if embed_type == 'clip':
+                recons_per_sample = recons_per_clip
+            else:
+                recons_per_sample = recons_per_brain
+            if embed_type == "brain" and retrieve:
+                image_retrieved0 = query_laion(emb=brain_clip_embeddings0.float().detach().cpu().numpy().flatten(),
+                                               indice_name="laion5B-H-14",groundtruth=image[0])
+                if embed_type == "brain" and retrieve and recons_per_brain>0:
+                    image_retrieved = (image_retrieved0[0] + 1) / 2
+                    retrieved_clip = clip_extractor.embed_image(image_retrieved).float()
+
+            if recons_per_clip == 0 and embed_type =='clip':
+                continue
+            elif recons_per_brain == 0 and embed_type =='brain' and retrieve:
+                if brain_recons is None:
+                    brain_recons = image_retrieved0[None]
+                else:
+                    brain_recons = torch.vstack((brain_recons,image_retrieved0[None]))
+                brain_recons.to(device)
+                continue
+
+            # image_embeds = sd_pipe.noise_image_embeddings(
+            #     image_embeds=input_embedding,
+            #     noise_level=0, #0 to 1000
+            # )
+            
+            # prompt_embeds = sd_pipe._encode_prompt(
+            #     prompt="",
+            #     device=device,
+            #     num_images_per_prompt=recons_per_sample,
+            #     do_classifier_free_guidance=True,
+            #     negative_prompt="",
+            # )
+            
+            input_embedding = input_embedding.repeat(recons_per_sample, 1)
+            input_embedding = torch.cat([torch.zeros_like(input_embedding), input_embedding]).unsqueeze(1).to(device)
+            
+            image_embeds = input_embedding.repeat(1,1,2).squeeze(1)
+            prompt_embeds = prompt_embeds0.repeat(image_embeds.shape[0], 1, 1).float()
+
+            # 4. Prepare timesteps
+            noise_scheduler.set_timesteps(num_inference_steps=num_inference_steps, device=device)
+
+            # 5b. Prepare latent variables
+            batch_size = input_embedding.shape[0] // 2 # divide by 2 bc we doubled it for classifier-free guidance
+            shape = (batch_size, unet.in_channels, height // vae_scale_factor, width // vae_scale_factor)
+            if img_lowlevel is not None: # use img_lowlevel for img2img initialization
+                img_lowlevel = img_lowlevel[:n_samples_save]
+                # img_lowlevel = transforms.functional.gaussian_blur(img_lowlevel,kernel_size=41)
+                # img_lowlevel = image_retrieved.float()
+                # img_lowlevel = nn.functional.interpolate(img_lowlevel, 512, mode="area", antialias=False).to(device)
+
+                init_timestep = min(int(num_inference_steps * img2img_strength), num_inference_steps)
+                t_start = max(num_inference_steps - init_timestep, 0)
+                timesteps = noise_scheduler.timesteps[t_start:]
+                latent_timestep = timesteps[:1].repeat(batch_size)
+
+                if img2img_refs is None:
+                    img2img_refs = img_lowlevel[[emb_idx]]
+                elif img2img_refs.shape[0] <= emb_idx:
+                    img2img_refs = torch.cat((img2img_refs, img_lowlevel[[emb_idx]]))
+                img_lowlevel_embeddings = clip_extractor.preprocess(img_lowlevel[[emb_idx]])
+                
+                img_lowlevel_embeddings = nn.functional.interpolate(img_lowlevel_embeddings, 
+                                                                   (768,768), mode="area", antialias=False)
+
+                init_latents = vae.encode(img_lowlevel_embeddings).latent_dist.sample(generator)
+                init_latents = vae.config.scaling_factor * init_latents
+                init_latents = init_latents.repeat(recons_per_sample, 1, 1, 1)
+
+                noise = randn_tensor(shape, generator=generator, device=device, dtype=input_embedding.dtype)
+                init_latents = noise_scheduler.add_noise(init_latents, noise, latent_timestep)
+                latents = init_latents
+            else:
+                timesteps = noise_scheduler.timesteps
+                latents = randn_tensor(shape, generator=generator, device=device, dtype=input_embedding.dtype)
+                latents = latents * noise_scheduler.init_noise_sigma
+
+            # 7. Denoising loop
+            for i, t in enumerate(timesteps):
+                # expand the latents if we are doing classifier free guidance
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = noise_scheduler.scale_model_input(latent_model_input, t)
+
+                noise_pred = unet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=prompt_embeds,
+                    class_labels=image_embeds,
+                    cross_attention_kwargs=None, 
+                ).sample
+
+                # perform guidance
+                if do_classifier_free_guidance:
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
+            recons = decode_latents(latents).detach().cpu()
+
+            if embed_type == 'clip':
+                if clip_recons is None:
+                    clip_recons = recons.unsqueeze(0)
+                else:
+                    clip_recons = torch.cat((clip_recons,recons.unsqueeze(0)))
+            elif embed_type == 'brain':
+                if brain_recons is None:
+                    brain_recons = recons.unsqueeze(0)
+                else:
+                    brain_recons = torch.cat((brain_recons,recons.unsqueeze(0)))
+
+    # ensure no alpha channel
+    brain_recons = brain_recons[:,:,:3]
+
+    # compare CLIP embedding of LAION nearest neighbor to your brain reconstructions
+    best_picks = np.zeros(n_samples_save)
+    if embed_type == "brain" and (retrieve or img_lowlevel is not None):
+        for im in range(n_samples_save):            
+            # brain_clips = clip_extractor.embed_image(brain_recons[im])
+            # cos_sims_to_neighbor = batchwise_cosine_similarity(brain_clips.float(), retrieved_clip)
+            # best_picks[im] = int(torch.argmax(cos_sims_to_neighbor))
+
+            # prevent a blank image from being selected
+            for ii in range(len(brain_recons[im])):
+                if torch.all(brain_recons[im][ii]==0):
+                    brain_recons[im][ii] *= np.nan
+
+            weights = AlexNet_Weights.DEFAULT
+            model = alexnet(weights=weights).eval()
+            model.requires_grad_(False)
+            preprocess = weights.transforms()
+            for i,f in enumerate(model.features):
+                if recons_per_brain==0 and retrieve:
+                    if i>4: model.features[i] = nn.Identity() # mid
+                else:
+                    if i>1: model.features[i] = nn.Identity() # early
+            model.avgpool=nn.Identity()
+            model.classifier=nn.Identity()
+            model.to(img_lowlevel.device)
+
+            brain_recons = brain_recons.to(img_lowlevel.device)
+            with torch.cuda.amp.autocast(False): # tendency to go infinity if using half()
+                pix_dist = None
+                img_lowlevel_alex = model(preprocess(img_lowlevel[[0]]))
+                for ii in range(len(brain_recons[im])):
+                    recon_alex = model(preprocess(brain_recons[im][[ii]])) 
+                    cos_dist = pairwise_cosine_similarity(img_lowlevel_alex,recon_alex).item()
+                    if pix_dist is None:
+                        pix_dist = cos_dist
+                    else:
+                        pix_dist = np.hstack((pix_dist, cos_dist))
+                best_picks[im] = int(np.nanargmax(pix_dist))
+    best_picks = best_picks.astype(np.int8)
+
+    if recons_per_brain==0 and retrieve:
+        recon_is_laion = True
+        recons_per_brain = 1 # brain reconstruction will simply be the LAION nearest neighbor
+    else:
+        recon_is_laion = False
+                    
+    img2img_samples = 0 if img_lowlevel is None else 1
+    laion_samples = 1 if retrieve else 0
+    num_xaxis_subplots = 1+img2img_samples+laion_samples+recons_per_clip+recons_per_brain
+    if plotting:
+        fig, ax = plt.subplots(n_samples_save, num_xaxis_subplots, 
+                           figsize=(num_xaxis_subplots*3,4.5*n_samples_save),
+                           facecolor=(1, 1, 1))
+    else:
+        fig = None
+    if n_samples_save > 1:
+        for im in range(n_samples_save):
+            if plotting:
+                ax[im][0].set_title(f"Original Image")
+                ax[im][0].imshow(torch_to_Image(image[im]))
+                if img2img_samples == 1:
+                    ax[im][1].set_title(f"Img2img ({img2img_strength})")
+                    ax[im][1].imshow(torch_to_Image(img_lowlevel[im]))
+                    # ax[im][1].imshow(torch_to_Image(img2img_refs[im]))
+            for ii,i in enumerate(range(num_xaxis_subplots-laion_samples-recons_per_clip-recons_per_brain,num_xaxis_subplots-laion_samples-recons_per_brain)):
+                recon = clip_recons[im][ii]
+                if plotting:
+                    ax[im][i].set_title(f"Recon {ii+1} from orig CLIP")
+                    ax[im][i].imshow(torch_to_Image(recon))
+            for ii,i in enumerate(range(num_xaxis_subplots-laion_samples-recons_per_brain,num_xaxis_subplots-laion_samples)):
+                recon = brain_recons[im][ii]
+                if recon_is_laion:
+                    recon = brain_recons[im][best_picks[0]]
+                if plotting:
+                    if ii == best_picks[im]:
+                        ax[im][i].set_title(f"Reconstruction",fontweight='bold')
+                    else:
+                        ax[im][i].set_title(f"Recon {ii+1} from brain")
+                    ax[im][i].imshow(torch_to_Image(recon))
+            if plotting:
+                if retrieve and not recon_is_laion:
+                    ax[im][-1].set_title(f"LAION5b top neighbor")
+                    ax[im][-1].imshow(torch_to_Image(image_retrieved0))
+                for i in range(num_xaxis_subplots):
+                    ax[im][i].axis('off')
+    else:   
+        im = 0
+        if plotting:
+            ax[0].set_title(f"Original Image")
+            ax[0].imshow(torch_to_Image(image[im]))
+            if img2img_samples == 1:
+                ax[1].set_title(f"Img2img ({img2img_strength})")
+                ax[1].imshow(torch_to_Image(img_lowlevel[im]))
+                # ax[1].imshow(torch_to_Image(img2img_refs[im]))
+        for ii,i in enumerate(range(num_xaxis_subplots-laion_samples-recons_per_clip-recons_per_brain,num_xaxis_subplots-recons_per_brain-laion_samples)):
+            recon = clip_recons[im][ii]
+            if plotting:
+                ax[i].set_title(f"Recon {ii+1} from orig CLIP")
+                ax[i].imshow(torch_to_Image(recon))
+        for ii,i in enumerate(range(num_xaxis_subplots-laion_samples-recons_per_brain,num_xaxis_subplots-laion_samples)):
+            recon = brain_recons[im][ii]
+            if recon_is_laion:
+                recon = brain_recons[im][best_picks[0]]
+            if plotting:
+                if ii == best_picks[im]:
+                    ax[i].set_title(f"Reconstruction",fontweight='bold')
+                else:
+                    ax[i].set_title(f"Recon {ii+1} from brain")
+                ax[i].imshow(torch_to_Image(recon))
+        if plotting:
+            if retrieve and not recon_is_laion:
+                ax[-1].set_title(f"LAION5b top neighbor")
+                ax[-1].imshow(torch_to_Image(image_retrieved0))
+            for i in range(num_xaxis_subplots):
+                ax[i].axis('off')
+                
+    if torch.all(brain_recons[im][best_picks[im]]==0):
+        print("Reconstruction is empty image...")
+    
+    return fig, clip_recons, brain_recons, best_picks
