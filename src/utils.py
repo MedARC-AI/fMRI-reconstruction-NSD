@@ -914,6 +914,15 @@ def select_annotations(annots, random=False):
 def voxel_select(voxels):
     if voxels.ndim == 2:
         return voxels
-    weights = torch.rand(voxels.shape[1]).reshape(1, -1, 1).to(voxels.device)
-    return (weights * voxels).sum(1)/weights.sum()
+    choice = torch.rand(1)
+    # random combine
+    if choice <= 0.5:
+        weights = torch.rand(voxels.shape[0], voxels.shape[1])[:,:,None].to(voxels.device)
+        return (weights * voxels).sum(1)/weights.sum(1)
+    # mean
+    if choice <= 0.8:
+        return voxels.mean(1)
+    # random select
+    randints = torch.randint(0, voxels.shape[1], (voxels.shape[0],))
+    return voxels[torch.arange(voxels.shape[0]), randints]
 

@@ -44,7 +44,7 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
     num_devices = torch.cuda.device_count()
     num_workers = num_devices
-    num_epochs = 120  # 350 if data_commit=='avg' else 120
+    num_epochs = 240  # 350 if data_commit=='avg' else 120
     lr_scheduler = 'cycle'
     initial_lr = 1e-3 #3e-5
     max_lr = 3e-4
@@ -62,7 +62,7 @@ if __name__ == '__main__':
 
     cache_dir = 'cache'
     n_cache_recs = 0
-    mixup_pct = 0.5
+    mixup_pct = 0.25
     is_text = False
 
     use_image_aug = True
@@ -70,8 +70,8 @@ if __name__ == '__main__':
 
     use_mse = False
     n_samples_save = 4
-
-
+    
+    utils.seed_everything(seed, cudnn_deterministic=False)
     torch.backends.cuda.matmul.allow_tf32 = True
 
     try:
@@ -330,10 +330,6 @@ if __name__ == '__main__':
     voxel2clip, optimizer, train_dl, val_dl, lr_scheduler = accelerator.prepare(
         voxel2clip, optimizer, train_dl, val_dl, lr_scheduler
     )
-    
-    #-----MAIN------------------
-    # need non-deterministic CuDNN for conv3D to work
-    utils.seed_everything(seed, cudnn_deterministic=False)
 
     epoch = 0
     losses, mse_losses, val_losses, lrs = [], [], [], []
