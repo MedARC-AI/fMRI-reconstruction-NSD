@@ -79,27 +79,63 @@ class OpenClipper(torch.nn.Module):
         return self.embed_text(txt)
 
 class Clipper(torch.nn.Module):
-    def __init__(self, clip_variant, clamp_embs=False, norm_embs=False, train_transforms=None, 
-                 device=torch.device('cpu')):
+    def __init__(self, clip_variant, clamp_embs=False, norm_embs=False, refine=False, train_transforms=None, 
+                 hidden_state=False, layer=None, device=torch.device('cpu')):
         super().__init__()
-        assert clip_variant in ("RN50", "ViT-L/14", "ViT-B/32"), \
-            "clip_variant must be one of RN50, ViT-L/14, ViT-B/32"
+        assert clip_variant in ("RN50", "ViT-L/14", "ViT-B/32", "RN50x64"), \
+            "clip_variant must be one of RN50, ViT-L/14, ViT-B/32, RN50x64"
         print(clip_variant, device)
-        clip_model, _ = clip.load(clip_variant, device=device)
+        
+        if clip_variant=="ViT-L/14" and hidden_state:
+            # from transformers import CLIPVisionModelWithProjection
+            # image_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14",cache_dir="/fsx/proj-medarc/fmri/cache")
+            from transformers import CLIPVisionModelWithProjection
+            sd_cache_dir = '/fsx/proj-medarc/fmri/cache/models--shi-labs--versatile-diffusion/snapshots/2926f8e11ea526b562cd592b099fcf9c2985d0b7'
+            image_encoder = CLIPVisionModelWithProjection.from_pretrained(sd_cache_dir, subfolder='image_encoder').to(device)
+            image_encoder.eval()
+            for param in image_encoder.parameters():
+                param.requires_grad = False # dont need to calculate gradients
+            self.image_encoder = image_encoder
+        
+        clip_model, preprocess = clip.load(clip_variant, device=device)
         clip_model.eval() # dont want to train model
         for param in clip_model.parameters():
             param.requires_grad = False # dont need to calculate gradients
             
         self.clip = clip_model
+        self.clip_variant = clip_variant
+        if clip_variant == "RN50x64":
+            self.clip_size = (448,448)
+        else:
+            self.clip_size = (224,224)
+            
+        preproc = transforms.Compose([
+            transforms.Resize(size=self.clip_size[0], interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(size=self.clip_size),
+            transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
+        ])
+        self.preprocess = preproc
+        self.hidden_state = hidden_state
         self.mean = np.array([0.48145466, 0.4578275, 0.40821073])
         self.std = np.array([0.26862954, 0.26130258, 0.27577711])
         self.normalize = transforms.Normalize(self.mean, self.std)
         self.denormalize = transforms.Normalize((-self.mean / self.std).tolist(), (1.0 / self.std).tolist())
-        self.clip_size = (224,224)
         self.clamp_embs = clamp_embs
         self.norm_embs = norm_embs
         self.transforms = train_transforms
         self.device= device
+        
+        def versatile_normalize_embeddings(encoder_output):
+            embeds = encoder_output.last_hidden_state
+            if not refine:
+                embeds = image_encoder.vision_model.post_layernorm(embeds)
+                embeds = image_encoder.visual_projection(embeds)
+                if norm_embs:
+                    embeds = nn.functional.normalize(embeds,dim=-1)
+            if layer is not None:
+                embeds = embeds[:,layer]
+            return embeds
+        self.versatile_normalize_embeddings = versatile_normalize_embeddings
 
     def resize_image(self, image):
         # note: antialias should be False if planning to use Pinkney's Image Variation SD model
@@ -107,10 +143,12 @@ class Clipper(torch.nn.Module):
 
     def embed_image(self, image):
         """Expects images in -1 to 1 range"""
-        clip_emb = self.resize_image(image)
-        if self.transforms is not None:
-            clip_emb = self.transforms(clip_emb)
-        clip_emb = self.clip.encode_image(self.normalize(clip_emb))
+        clip_emb = self.preprocess(image.to(self.device))
+        if self.clip_variant=="ViT-L/14" and self.hidden_state:
+            clip_emb = self.image_encoder(clip_emb)
+            clip_emb = self.versatile_normalize_embeddings(clip_emb)
+        else:
+            clip_emb = self.clip.encode_image(clip_emb)
         # input is now in CLIP space, but mind-reader preprint further processes embeddings:
         if self.clamp_embs:
             clip_emb = torch.clamp(clip_emb, -1.5, 1.5)
@@ -147,7 +185,7 @@ class BrainNetwork(nn.Module):
         self.lin0 = nn.Sequential(
             nn.Linear(in_dim, h),
             nn.ReLU(inplace=True),
-            nn.BatchNorm1d(h),
+            nn.BatchNorm1d(h), #nn.BatchNorm1d(h),
             nn.Dropout(0.5),
         )
             
@@ -156,7 +194,7 @@ class BrainNetwork(nn.Module):
             nn.Sequential(
                 nn.Linear(h, h),
                 nn.ReLU(inplace=True),
-                nn.BatchNorm1d(h),
+                nn.BatchNorm1d(h),#nn.BatchNorm1d(h),
                 nn.Dropout(0.15)
             ) for _ in range(n_blocks)
         ])
