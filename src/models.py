@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import PIL
 import clip
+import open_clip
 
 # for prior
 from dalle2_pytorch import DiffusionPrior
@@ -85,6 +86,27 @@ class Clipper(torch.nn.Module):
                 txt = np.vstack((txt,t))
         txt = txt.flatten()
         return self.embed_text(txt)
+
+class OpenClipper(Clipper):
+    def __init__(self, clip_variant, weights_path, clamp_embs=False, norm_embs=False, train_transforms=None, device=torch.device('cpu')):
+        torch.nn.Module.__init__(self)
+        print(clip_variant, device)
+        clip_model, _, _ = open_clip.create_model_and_transforms('convnext_xxlarge', pretrained=False, device=torch.device('cuda'))
+        clip_model.load_state_dict(torch.load(weights_path))
+        clip_model.eval() # dont want to train model
+        for param in clip_model.parameters():
+            param.requires_grad = False # dont need to calculate gradients
+            
+        self.clip = clip_model
+        self.mean = np.array([0.48145466, 0.4578275, 0.40821073])
+        self.std = np.array([0.26862954, 0.26130258, 0.27577711])
+        self.normalize = transforms.Normalize(self.mean, self.std)
+        self.denormalize = transforms.Normalize((-self.mean / self.std).tolist(), (1.0 / self.std).tolist())
+        self.clip_size = (256,256) if 'convnext' in clip_variant else (224, 224)
+        self.clamp_embs = clamp_embs
+        self.norm_embs = norm_embs
+        self.transforms = train_transforms
+        self.device= device
 
 class BrainNetwork(nn.Module):
     # 133M

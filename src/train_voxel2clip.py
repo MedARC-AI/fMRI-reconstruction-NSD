@@ -2,6 +2,8 @@
 
 import os
 import sys
+import traceback
+import time
 import json
 import numpy as np
 import matplotlib.pyplot as plt
@@ -17,7 +19,7 @@ from kornia.augmentation.container import AugmentationSequential
 
 import utils
 from utils import torch_to_matplotlib, torch_to_Image
-from models import Clipper, BrainNetwork, BrainDiffusionPrior, BrainSD
+from models import Clipper, OpenClipper, BrainNetwork, BrainDiffusionPrior, BrainSD
 from model3d import SimpleVoxel3dConvEncoder
 
 import torch.distributed as dist
@@ -30,7 +32,8 @@ if __name__ == '__main__':
     model_name = "voxel2clip"
     modality = "image" # ("image", "text")
     image_var = 'images' if modality=='image' else None  # trial
-    clip_variant = "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
+    clip_variant = "ViT-L/14"  # "convnext_xxlarge"  # "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
+    weights_path = "../train_logs/models/convnext_xxlarge.bin"
     clamp_embs = False # clamp embeddings to (-1.5, 1.5)
     dim = 768
     remote_data = False
@@ -78,8 +81,9 @@ if __name__ == '__main__':
         config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
         exec(open('configurator.py').read()) # overrides from command line or config file
         config = {k: globals()[k] for k in config_keys} # will be useful for logging
+        print(config)
     except:
-        pass
+        print(traceback.format_exc())
     
     outdir = os.path.expanduser(f'../train_logs/models/{model_name}/test')
     os.makedirs(outdir, exist_ok=True)
@@ -149,8 +153,12 @@ if __name__ == '__main__':
     else:
         local_rank, device = 0, torch.device('cuda:0')
     
-    if local_rank == 0: print('Creating Clipper...')
-    clip_extractor = Clipper(clip_variant, clamp_embs=False, norm_embs=False, device=device, train_transforms=train_augs)
+    try:
+        clip_extractor = Clipper(clip_variant, clamp_embs=False, norm_embs=False, device=device, train_transforms=train_augs)
+        if local_rank == 0: print('Creating Clipper...')
+    except AssertionError:
+        clip_extractor = OpenClipper(clip_variant, weights_path, clamp_embs=False, norm_embs=False, device=device, train_transforms=train_augs)
+        if local_rank == 0: print('Creating Open Clipper...')
 
     if modality=='text':
         print('Using CLIP-text, preparing COCO annotations...')
@@ -219,21 +227,15 @@ if __name__ == '__main__':
             print("voxel.shape", voxel.shape) # voxel.shape torch.Size([300, 3, 68, 64, 47])
             break
 
-        print('Creating Clipper...')
-
-    # Don't L2 norm the extracted CLIP embeddings since we want the prior 
-    # to learn un-normed embeddings for usage with the SD image variation pipeline.
-    clip_extractor = Clipper(clip_variant, clamp_embs=False, norm_embs=False, device=device, train_transforms=train_augs)
-
     print('Creating voxel2clip...')
 
     if voxel_dims == 1: # 1D data
         # voxel2clip_kwargs = dict(out_dim=768, norm_type='bn')
-        voxel2clip_kwargs = dict(out_dim=768, norm_type='ln', act_first=False)
+        voxel2clip_kwargs = dict(out_dim=dim, norm_type='ln', act_first=False)
         voxel2clip = BrainNetwork(**voxel2clip_kwargs)
     elif voxel_dims == 3: # 3D data
         voxel2clip_kwargs = dict(
-            out_dim=768,
+            out_dim=dim,
             dims=voxel.shape[2:],
             channels=[64, 128, 256, 128],
             strides=[1, 2, 3, 3],
@@ -557,7 +559,13 @@ if __name__ == '__main__':
                             logs['val/samples'] = [wandb.Image(grid) for grid in grids]
             
             if wandb_log:
-                wandb.log(logs)
+                while True:
+                    try:
+                        wandb.log(logs)
+                        break
+                    except:
+                        print('Wandb log failed. Retrying')
+                        time.sleep(1)
 
         if distributed:
             dist.barrier()
