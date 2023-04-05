@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import PIL
 import clip
+import open_clip
 
 # for prior
 from dalle2_pytorch import DiffusionPrior
@@ -23,28 +24,119 @@ from diffusers.models.vae import Decoder
 
 # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+class OpenClipper(torch.nn.Module):
+    def __init__(self, clip_variant='ViT-H-14', train_transforms=None, device=torch.device('cpu')):
+        super().__init__()
+        print(clip_variant, device)
+        assert clip_variant == 'ViT-H-14' # not setup for other models yet
+                
+        clip_model, _, preprocess = open_clip.create_model_and_transforms('ViT-H-14', 
+                                        pretrained='laion2b_s32b_b79k', device=device)
+        clip_model.eval() # dont want to train model
+        for param in clip_model.parameters():
+            param.requires_grad = False # dont need to calculate gradients
+            
+        # overwrite preprocess to accept torch inputs instead of PIL Image
+        preprocess = transforms.Compose([
+                transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC, antialias=None),
+                transforms.CenterCrop(224),
+                transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
+        ])
+        
+        tokenizer = open_clip.get_tokenizer('ViT-H-14')
+            
+        self.clip = clip_model
+        self.preprocess = preprocess
+        self.tokenizer = tokenizer
+        self.transforms = train_transforms
+        self.device = device
+        
+    def embed_image(self, image):
+        """Expects images in -1 to 1 range"""
+        image = self.preprocess(image).to(self.device)
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            image_features = self.clip.encode_image(image)
+            #image_features /= image_features.norm(dim=-1, keepdim=True)
+        return image_features
+
+    def embed_text(self, text_samples):
+        text = self.tokenizer(text_samples).to(self.device)
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            text_features = self.clip.encode_text(text)
+            #text_features /= text_features.norm(dim=-1, keepdim=True)
+        return text_features
+
+    def embed_curated_annotations(self, annots):
+        for i,b in enumerate(annots):
+            t = ''
+            while t == '':
+                rand = torch.randint(5,(1,1))[0][0]
+                t = b[0,rand]
+            if i==0:
+                txt = np.array(t)
+            else:
+                txt = np.vstack((txt,t))
+        txt = txt.flatten()
+        return self.embed_text(txt)
 
 class Clipper(torch.nn.Module):
-    def __init__(self, clip_variant, clamp_embs=False, norm_embs=False, train_transforms=None, device=torch.device('cpu')):
+    def __init__(self, clip_variant, clamp_embs=False, norm_embs=False, refine=False, train_transforms=None, 
+                 hidden_state=False, layer=None, device=torch.device('cpu')):
         super().__init__()
-        assert clip_variant in ("RN50", "ViT-L/14", "ViT-B/32"), \
-            "clip_variant must be one of RN50, ViT-L/14, ViT-B/32"
+        assert clip_variant in ("RN50", "ViT-L/14", "ViT-B/32", "RN50x64"), \
+            "clip_variant must be one of RN50, ViT-L/14, ViT-B/32, RN50x64"
         print(clip_variant, device)
-        clip_model, _ = clip.load(clip_variant, device=device)
+        
+        if clip_variant=="ViT-L/14" and hidden_state:
+            # from transformers import CLIPVisionModelWithProjection
+            # image_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14",cache_dir="/fsx/proj-medarc/fmri/cache")
+            from transformers import CLIPVisionModelWithProjection
+            sd_cache_dir = '/fsx/proj-medarc/fmri/cache/models--shi-labs--versatile-diffusion/snapshots/2926f8e11ea526b562cd592b099fcf9c2985d0b7'
+            image_encoder = CLIPVisionModelWithProjection.from_pretrained(sd_cache_dir, subfolder='image_encoder').to(device)
+            image_encoder.eval()
+            for param in image_encoder.parameters():
+                param.requires_grad = False # dont need to calculate gradients
+            self.image_encoder = image_encoder
+        
+        clip_model, preprocess = clip.load(clip_variant, device=device)
         clip_model.eval() # dont want to train model
         for param in clip_model.parameters():
             param.requires_grad = False # dont need to calculate gradients
             
         self.clip = clip_model
+        self.clip_variant = clip_variant
+        if clip_variant == "RN50x64":
+            self.clip_size = (448,448)
+        else:
+            self.clip_size = (224,224)
+            
+        preproc = transforms.Compose([
+            transforms.Resize(size=self.clip_size[0], interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(size=self.clip_size),
+            transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
+        ])
+        self.preprocess = preproc
+        self.hidden_state = hidden_state
         self.mean = np.array([0.48145466, 0.4578275, 0.40821073])
         self.std = np.array([0.26862954, 0.26130258, 0.27577711])
         self.normalize = transforms.Normalize(self.mean, self.std)
         self.denormalize = transforms.Normalize((-self.mean / self.std).tolist(), (1.0 / self.std).tolist())
-        self.clip_size = (224,224)
         self.clamp_embs = clamp_embs
         self.norm_embs = norm_embs
         self.transforms = train_transforms
         self.device= device
+        
+        def versatile_normalize_embeddings(encoder_output):
+            embeds = encoder_output.last_hidden_state
+            if not refine:
+                embeds = image_encoder.vision_model.post_layernorm(embeds)
+                embeds = image_encoder.visual_projection(embeds)
+                if norm_embs:
+                    embeds = nn.functional.normalize(embeds,dim=-1)
+            if layer is not None:
+                embeds = embeds[:,layer]
+            return embeds
+        self.versatile_normalize_embeddings = versatile_normalize_embeddings
 
     def resize_image(self, image):
         # note: antialias should be False if planning to use Pinkney's Image Variation SD model
@@ -52,10 +144,12 @@ class Clipper(torch.nn.Module):
 
     def embed_image(self, image):
         """Expects images in -1 to 1 range"""
-        clip_emb = self.resize_image(image)
-        if self.transforms is not None:
-            clip_emb = self.transforms(clip_emb)
-        clip_emb = self.clip.encode_image(self.normalize(clip_emb))
+        clip_emb = self.preprocess(image.to(self.device))
+        if self.clip_variant=="ViT-L/14" and self.hidden_state:
+            clip_emb = self.image_encoder(clip_emb)
+            clip_emb = self.versatile_normalize_embeddings(clip_emb)
+        else:
+            clip_emb = self.clip.encode_image(clip_emb)
         # input is now in CLIP space, but mind-reader preprint further processes embeddings:
         if self.clamp_embs:
             clip_emb = torch.clamp(clip_emb, -1.5, 1.5)
@@ -293,23 +387,20 @@ class BrainDiffusionPrior(DiffusionPrior):
         # Note these keys will be missing (maybe due to an update to the code since training):
         # "net.null_text_encodings", "net.null_text_embeds", "net.null_image_embed"
         # I don't think these get used if `cond_drop_prob = 0` though (which is the default here)
-        keys = diffusion_prior.load_state_dict(ckpt, strict=False)
+        diffusion_prior.load_state_dict(ckpt, strict=False)
+        # keys = diffusion_prior.load_state_dict(ckpt, strict=False)
         # print("missing keys in prior checkpoint (probably ok)", keys.missing_keys)
 
         if voxel2clip_path:
             # load the voxel2clip weights
             checkpoint = torch.load(voxel2clip_path, map_location=torch.device('cpu'))
             
-            try:
-                diffusion_prior.voxel2clip.load_state_dict(checkpoint['model_state_dict'])
-            except:
-                # converting ddp model to non-ddp format
-                state_dict = checkpoint['model_state_dict']
-                for key in list(state_dict.keys()):
-                    if 'module.' in key:
-                        state_dict[key.replace('module.', '')] = state_dict[key]
-                        del state_dict[key]
-                diffusion_prior.voxel2clip.load_state_dict(state_dict)
+            state_dict = checkpoint['model_state_dict']
+            for key in list(state_dict.keys()):
+                if 'module.' in key:
+                    state_dict[key.replace('module.', '')] = state_dict[key]
+                    del state_dict[key]
+            diffusion_prior.voxel2clip.load_state_dict(state_dict)
         
         return diffusion_prior
 

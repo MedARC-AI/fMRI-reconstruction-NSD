@@ -2,18 +2,18 @@
 #SBATCH --account=medarc
 #SBATCH --partition=g40
 #SBATCH --nodes=1              
-#SBATCH --ntasks-per-node=2      # should = number of gpus
-#SBATCH --gres=gpu:2  
+#SBATCH --ntasks-per-node=1      # should = number of gpus
+#SBATCH --gres=gpu:1 
 #SBATCH --mem=40Gb
-#SBATCH --time=06:00:00          # total run time limit (HH:MM:SS)
+#SBATCH --time=02:30:00          # total run time limit (HH:MM:SS)
 #SBATCH --comment=medarc
-#SBATCH --exclude=ip-26-0-128-[46,48,85,93-94,101,106,111,123,136,142-143,146,168-169,175,183,189,211,215,223,231,244],ip-26-0-129-[0-1,4,6,11,45,48,60,81-82,84-85,94,105,122],ip-26-0-130-[12-13,19,116,127,132,134,147-148,150,163-164,183,193],ip-26-0-131-[4-5,38,51,77,85,89,107-108,111-112,130,143,150-152,168,182-183,188,239-240,244,247],ip-26-0-132-[7,10,21,37,93,98,107,118,130,139,141-142,149,154,184],ip-26-0-133-[67,76,81,89,111,115,126,131-133,140,145,148,151-152,159-160,226,242],ip-26-0-134-[0,26-27,43,52,61,66,76,83,90-91,105,120,134,141,157,201,219,226-227,248,254],ip-26-0-135-[1,4,22,49,55,64,67,110,118,163,173,184,186,190,192-193,204,208,219,242,255],ip-26-0-136-13,ip-26-0-137-[92,94,97,102,115-116,121,124,139,168,175-176,184,196,212,214,240],ip-26-0-138-[3,13,51,62,66,69,71,79,93,101,159,166,171,178,186,188,208,213],ip-26-0-139-[191,200,214,216,218,226,229,235,237,241,246],ip-26-0-141-[140,146,157,161,166,178,217,228,247],ip-26-0-142-[3,13,21,24,29,33,36,38,41,45,49,67,71,103,106,125,144,146,166,184,186,198,204,217,235,237,246,251,254],ip-26-0-143-[30,39,46,53,61,66,111,121,145,164,171,175,180,206,225,230,235,250]
+#SBATCH --array=6-256%10
 
-# Set to equal gres=gpu:#! Also add --multi_gpu to srun command!
-export NUM_GPUS=2 
+# Set to equal gres=gpu:#! Also add --multi_gpu to srun command if using multi-gpu!
+export NUM_GPUS=1
 
-# Make sure another job doesnt use same port!
-export MASTER_PORT=14435 
+# Make sure another job doesnt use same port, here using random number
+export MASTER_PORT=$((RANDOM % (19000 - 11000 + 1) + 11000)) 
 
 export HOSTNAMES=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
 export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
@@ -31,4 +31,39 @@ echo WORLD_SIZE=${COUNT_NODE}
 
 source /fsx/home-paulscotti/.bashrc
 cd /fsx/proj-medarc/fmri/paulscotti/fMRI-reconstruction-NSD/src
-srun accelerate launch --mixed_precision=fp16 --multi_gpu --num_machines $COUNT_NODE --num_processes $(( $NUM_GPUS * $COUNT_NODE )) --main_process_ip $MASTER_ADDR --main_process_port $MASTER_PORT --gpu_ids='all' --dynamo_backend='no' /fsx/proj-medarc/fmri/paulscotti/fMRI-reconstruction-NSD/src/CLIP_to_CLIP.py
+srun accelerate launch --mixed_precision=fp16 --num_machines $COUNT_NODE --num_processes $(( $NUM_GPUS * $COUNT_NODE )) --main_process_ip $MASTER_ADDR --main_process_port $MASTER_PORT --gpu_ids='all' --dynamo_backend='no' /fsx/proj-medarc/fmri/paulscotti/fMRI-reconstruction-NSD/src/CLIP_to_CLIP_refine.py --model_name="prior_vers_" --wandb_log --voxel2clip_path="../train_logs/v2c_vers/last.pth" --no-use_mixco --num_epochs=75 --n_samples_save=0 --batch_size=86 --no-combine_losses --layer=$SLURM_ARRAY_TASK_ID --versatile
+
+
+
+# Brain_to_CLIP.py --model_name="v2c_vers_att" --clip_variant="ViT-L/14" --wandb_log --num_epochs=200 --versatile --batch_size=300
+
+# Brain_to_CLIP.py --model_name="v2c_vers_reshape_256_mse" --clip_variant="ViT-L/14" --wandb_log --num_epochs=200 --versatile --mixup_pct=.33 --batch_size=256 --with_mse --mse_pct=.66
+
+# Brain_to_CLIP_refine.py --model_name="v2c_vers_refined_notnorm_mixco_mult100_3e-4" --clip_variant="ViT-L/14" --wandb_log --num_epochs=200 --versatile --with_mse --mixup_pct=.5 --mse_pct=0. --lr_scheduler="fixed" --initial_lr=3e-4
+
+# Brain_to_CLIP.py --model_name="v2c_vers_mse_" --clip_variant="ViT-L/14" --wandb_log --num_epochs=240 --versatile --with_mse --mixup_pct=.33 --mse_pct=.66
+
+
+# CLIP_to_CLIP.py --model_name="prior_nomixco_86_nocombinedloss_1gpu" --wandb_log --voxel2clip_path="../train_logs/v2c_avg_v0_partialFalse/best.pth" --no-use_mixco --num_epochs=160 --n_samples_save=4 --batch_size=86 --no-combine_losses
+
+
+# CLIP_to_CLIP.py --model_name="prior_nomixco_86" --wandb_log --voxel2clip_path="../train_logs/v2c_avg_v0_partialFalse/best.pth" --no-use_mixco --num_epochs=160 --n_samples_save=4 --batch_size=86
+
+
+# Brain_to_CLIP.py --model_name="v2c_H14_image_mse_mult" --clip_variant="ViT-H-14" --wandb_log --with_mse --mse_mult=4 --num_epochs=180
+
+
+# --clip_variant="ViT-H-14"
+
+
+# CLIP_to_CLIP.py --model_name="text_prior_mixco_noaug" --wandb_log --modality="text" --voxel2clip_path="../train_logs/v2c_text/last.pth"
+
+# Brain_to_CLIP.py --model_name="v2c_text" --clip_variant="ViT-L/14" --wandb_log --modality="text"
+
+# CLIP_to_CLIP.py --model_name="prior_nomixco" --wandb_log --voxel2clip_path="../train_logs/v2c_avg_v0_partialFalse/best.pth" --no-use_mixco
+
+# Brain_to_CLIP.py --model_name="v2c_RN50x64" --clip_variant="RN50x64" --wandb_log
+
+# --model_name="v2c_H14_image_nonorm_" --wandb_log=True --num_epochs=120 --mixup_pct=.5
+
+#--multi_gpu 
