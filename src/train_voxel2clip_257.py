@@ -15,7 +15,7 @@ from kornia.augmentation.container import AugmentationSequential
 
 import utils
 from utils import torch_to_matplotlib, torch_to_Image
-from models import Clipper, OpenClipper, BrainNetwork, BrainDiffusionPrior, BrainSD
+from models import Clipper, OpenClipper, BrainNetworkDETR, BrainDiffusionPrior, BrainSD
 from model3d import SimpleVoxel3dConvEncoder
 
 import torch.distributed as dist
@@ -46,12 +46,12 @@ def parse_args():
         choices=["RN50", "ViT-L/14", "ViT-B/32"],
         help='clip variant',
     )
-    parser.add_argument(
-        "--outdir",
-        type=str,
-        default=None,
-        help="output directory for logs and checkpoints",
-    )
+    # parser.add_argument(
+    #     "--outdir",
+    #     type=str,
+    #     default=None,
+    #     help="output directory for logs and checkpoints",
+    # )
     parser.add_argument(
         "--wandb_log",
         action="store_true",
@@ -92,36 +92,41 @@ def parse_args():
         action="store_true",
         help="whether to disable image augmentation (only used for modality=image)",
     )
+    parser.add_argument(
+        "--outdir",
+        type=str,
+        default=None,
+        help="output location",
+    )
     return parser.parse_args()
 
 if __name__ == '__main__':
     args = parse_args()
     print('args', args)
 
-    model_name = "voxel2clip"
-    modality = "image" # ("image", "text")
+    model_name = args.model_name
+    modality = args.modality
     image_var = 'images' if modality=='image' else None  # trial
     is_text = args.modality == "text"
-    clip_variant = "ViT-L/14"  # "convnext_xxlarge"  # "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
-    weights_path = "../train_logs/models/convnext_xxlarge.bin"
-    clamp_embs = False # clamp embeddings to (-1.5, 1.5)
-    dim = 768
-    remote_data = False
-    # data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
+    clip_variant = args.clip_variant  # "convnext_xxlarge"  # "ViT-L/14" # ("RN50", "ViT-L/14", "ViT-B/32")
+    weights_path = None
+    # weights_path = "../train_logs/models/convnext_xxlarge.bin"
+    # clamp_embs = False # clamp embeddings to (-1.5, 1.5)
+    remote_data = args.remote_data
     data_commit = 'avg'
-    voxel_dims = 1 # 1 for flattened 3 for 3d
+    voxel_dims = args.voxel_dims # 1 for flattened 3 for 3d
     # -----------------------------------------------------------------------------
     # params for all models
     seed = 0
-    batch_size = 300
+    batch_size = 300 if args.voxel_dims == 1 else 128
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
-    num_devices = torch.cuda.device_count()
-    num_workers = num_devices
-    num_epochs = 240  # 350 if data_commit=='avg' else 120
+
+    num_epochs = 250  # 350 if data_commit=='avg' else 120
     lr_scheduler = 'cycle'
     initial_lr = 1e-3 #3e-5
     max_lr = 3e-4
-    wandb_log = True
+    
+    wandb_log = args.wandb_log
     wandb_project = 'laion-fmri'
     wandb_run_name = ''
     wandb_notes = ''
@@ -135,24 +140,18 @@ if __name__ == '__main__':
 
     cache_dir = 'cache'
     n_cache_recs = 0
-    mixup_pct = 0.25
-    is_text = False
+    mixup_pct = 0.5
 
     resume_from_ckpt = False
     use_mse = False
-
-    num_epochs = 120
-    batch_size = 300 if args.voxel_dims == 1 else 128
 
     lr_scheduler = 'cycle'
     initial_lr = 5e-4 # only used if lr_scheduler is 'fixed'
     max_lr = 3e-4
 
-    ckpt_saving = True
-    ckpt_interval = 10
     if args.outdir is None:
         # outdir = os.path.expanduser(f'../train_logs/models/{model_name}/test')
-        outdir = f'../train_logs/{args.model_name}'
+        outdir = f'../train_logs/models/{args.model_name}'
     else:
         outdir = args.outdir
     os.makedirs(outdir, exist_ok=True)
@@ -171,7 +170,7 @@ if __name__ == '__main__':
         train_augs = AugmentationSequential(
             # kornia.augmentation.RandomCrop((140, 140), p=0.3),
             # kornia.augmentation.Resize((224, 224)),
-            kornia.augmentation.RandomResizedCrop((224,224), (0.5,1), p=0.3),
+            kornia.augmentation.RandomResizedCrop((224,224), (0.8, 1), p=0.3),
             kornia.augmentation.RandomHorizontalFlip(p=0.5),
             kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.3),
             kornia.augmentation.RandomGrayscale(p=0.3),
@@ -189,9 +188,7 @@ if __name__ == '__main__':
     print("device:",device)
 
     if use_mse:
-        # sd_cache_dir = '/admin/home-atom_101/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc/'
         sd_cache_dir = '/fsx/proj-medarc/fmri/atom/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc/'
-        # sd_cache_dir = '/fsx/home-paulscotti/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc'
         sd_pipe =  BrainSD.from_pretrained(
             # "lambdalabs/sd-image-variations-diffusers",
             sd_cache_dir,
@@ -216,14 +213,15 @@ if __name__ == '__main__':
         distributed = True
     
     try:
-        clip_extractor = Clipper(clip_variant, clamp_embs=False, norm_embs=False, device=device, train_transforms=train_augs)
+        clip_extractor = Clipper(clip_variant, clamp_embs=False, norm_embs=False, hidden_state=True, refine=False, 
+            device=device, train_transforms=train_augs)
         print('Creating Clipper...')
     except AssertionError:
         clip_extractor = OpenClipper(clip_variant, weights_path, clamp_embs=False, norm_embs=False, device=device, train_transforms=train_augs)
         print('Creating Open Clipper...')
     print("distributed =",distributed,"num_devices =", num_devices, "local rank =", local_rank, "world size =", world_size)
 
-    if args.modality=='text':
+    if modality=='text':
         print('Using CLIP-text, preparing COCO annotations...')
         import h5py
         # load COCO annotations curated in the same way as the mind_reader (Lin Sprague Singh) preprint
@@ -234,7 +232,7 @@ if __name__ == '__main__':
         subj01_annots = annots[subj01_order]
 
     print('Pulling NSD webdataset data...')
-    if args.remote_data:
+    if remote_data:
         # pull data directly from huggingface
         train_url, val_url = utils.get_huggingface_urls(data_commit)
         meta_url = None
@@ -252,12 +250,12 @@ if __name__ == '__main__':
         meta_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/metadata_subj{subj_id}.json"
 
     # which to use for the voxels
-    if args.voxel_dims == 1:
+    if voxel_dims == 1:
         voxels_key = 'nsdgeneral.npy'
-    elif args.voxel_dims == 3:
+    elif voxel_dims == 3:
         voxels_key = 'wholebrain_3d.npy'
     else:
-        raise Exception(f"voxel_dims must be 1 or 3, not {args.voxel_dims}")
+        raise Exception(f"voxel_dims must be 1 or 3, not {voxel_dims}")
 
     print('Prepping train and validation dataloaders...')
     train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
@@ -274,7 +272,7 @@ if __name__ == '__main__':
         local_rank=local_rank,
     )
 
-    if args.voxel_dims == 3:
+    if voxel_dims == 3:
         import nibabel as nib
         noise_ceils_path = '/fsx/proj-medarc/fmri/natural-scenes-dataset/temp_s3/nsddata_betas/ppdata/subj01/func1pt8mm/betas_fithrf_GLMdenoise_RR/ncsnr.nii.gz'
         noise_ceils = nib.load(noise_ceils_path).get_fdata()
@@ -295,12 +293,12 @@ if __name__ == '__main__':
     # size of the CLIP embedding for each variant
     clip_sizes = {"RN50": 1024, "ViT-L/14": 768, "ViT-B/32": 512}
     # output dim for voxel2clip model
-    out_dim = clip_sizes[args.clip_variant]
+    out_dim = clip_sizes[clip_variant]
 
     if voxel_dims == 1: # 1D data
         # voxel2clip_kwargs = dict(out_dim=768, norm_type='bn')
         voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False)
-        voxel2clip = BrainNetwork(**voxel2clip_kwargs)
+        voxel2clip = BrainNetworkDETR(**voxel2clip_kwargs)
     elif args.voxel_dims == 3: # 3D data
         voxel2clip_kwargs = dict(
             out_dim=out_dim,
@@ -373,7 +371,7 @@ if __name__ == '__main__':
             "disable_image_aug": args.disable_image_aug,
             "max_lr": max_lr,
             "lr_scheduler": lr_scheduler,
-            "clamp_embs": clamp_embs,
+            # "clamp_embs": clamp_embs,
             "mixup_pct": mixup_pct,
             "num_train": num_train,
             "num_val": num_val,
@@ -407,20 +405,20 @@ if __name__ == '__main__':
     voxel0 = image0 = val_voxel0 = val_image0 = None
 
     # Optionally resume from checkpoint #
-    if resume_from_ckpt:
-        print("\n---resuming from ckpt_path---\n",ckpt_path)
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        epoch = checkpoint['epoch']
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        try:
-            voxel2clip.load_state_dict(checkpoint['model_state_dict'])
-        except:
-            state_dict = checkpoint['model_state_dict']
-            for key in list(state_dict.keys()):
-                if 'module.' in key:
-                    state_dict[key.replace('module.', '')] = state_dict[key]
-                    del state_dict[key]
-            voxel2clip.load_state_dict(state_dict)
+    # if resume_from_ckpt:
+    #     print("\n---resuming from ckpt_path---\n",ckpt_path)
+    #     checkpoint = torch.load(ckpt_path, map_location=device)
+    #     epoch = checkpoint['epoch']
+    #     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    #     try:
+    #         voxel2clip.load_state_dict(checkpoint['model_state_dict'])
+    #     except:
+    #         state_dict = checkpoint['model_state_dict']
+    #         for key in list(state_dict.keys()):
+    #             if 'module.' in key:
+    #                 state_dict[key.replace('module.', '')] = state_dict[key]
+    #                 del state_dict[key]
+    #         voxel2clip.load_state_dict(state_dict)
 
     progress_bar = tqdm(range(epoch,num_epochs), disable=(local_rank!=0))
     for epoch in progress_bar:
@@ -465,14 +463,14 @@ if __name__ == '__main__':
             clip_voxels = voxel2clip(voxel)
 
             if epoch < int(mixup_pct * num_epochs):
-                loss = utils.mixco_nce(
+                loss = utils.mixco_nce_all(
                     nn.functional.normalize(clip_voxels, dim=-1), 
                     nn.functional.normalize(clip_target, dim=-1),
                     temp=0.006, perm=perm, betas=betas, select=select,
                     distributed=distributed, accelerator=accelerator, local_rank=local_rank)
             else:
                 epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
-                loss = utils.soft_clip_loss(
+                loss = utils.soft_clip_loss_all(
                     nn.functional.normalize(clip_voxels, dim=-1), 
                     nn.functional.normalize(clip_target, dim=-1),
                     temp=epoch_temp,
@@ -494,14 +492,14 @@ if __name__ == '__main__':
 
             if distributed:
                 sims_base += F.cosine_similarity(accelerator.gather(clip_target),
-                                                      accelerator.gather(clip_voxels)).mean().item()
+                                                      accelerator.gather(clip_voxels), dim=-1).mean().item()
             else:
-                sims_base += F.cosine_similarity(clip_target,clip_voxels).mean().item()
+                sims_base += F.cosine_similarity(clip_target,clip_voxels, dim=-1).mean().item()
 
             # forward and backward top 1 accuracy
             labels = torch.arange(len(clip_target)).to(device)
-            fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target, clip_voxels), labels, k=1).item()
-            bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels, clip_target), labels, k=1).item()
+            fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target.flatten(1), clip_voxels.flatten(1)), labels, k=1).item()
+            bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels.flatten(1), clip_target.flatten(1)), labels, k=1).item()
 
             accelerator.backward(loss + mse_loss)
             optimizer.step()
@@ -541,14 +539,14 @@ if __name__ == '__main__':
                     clip_voxels = voxel2clip(voxel)
 
                 if epoch < int(mixup_pct * num_epochs):
-                    val_loss = utils.mixco_nce(
+                    val_loss = utils.mixco_nce_all(
                         nn.functional.normalize(clip_voxels, dim=-1), 
                         nn.functional.normalize(clip_target, dim=-1),
                         temp=0.006, 
                         distributed=distributed, accelerator=accelerator, local_rank=local_rank)
                 else:
                     epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
-                    val_loss = utils.soft_clip_loss(
+                    val_loss = utils.soft_clip_loss_all(
                         nn.functional.normalize(clip_voxels, dim=-1), 
                         nn.functional.normalize(clip_target, dim=-1),
                         temp=epoch_temp, 
@@ -559,15 +557,15 @@ if __name__ == '__main__':
 
                 if distributed:
                     val_sims_base += F.cosine_similarity(accelerator.gather(clip_target),
-                                                          accelerator.gather(clip_voxels)).mean().item()
+                                                          accelerator.gather(clip_voxels),dim=-1).mean().item()
                 else:
-                    val_sims_base += F.cosine_similarity(clip_target,clip_voxels).mean().item()
+                    val_sims_base += F.cosine_similarity(clip_target,clip_voxels,dim=-1).mean().item()
 
                 labels = torch.arange(len(clip_target)).to(device)
                 # clip, brain
-                val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target, clip_voxels), labels, k=1).item()
+                val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target.flatten(1), clip_voxels.flatten(1)), labels, k=1).item()
                 # brain, clip
-                val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels, clip_target), labels, k=1).item()
+                val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels.flatten(1), clip_target.flatten(1)), labels, k=1).item()
 
         if local_rank == 0:
             if ckpt_saving:

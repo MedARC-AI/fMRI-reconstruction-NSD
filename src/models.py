@@ -1,4 +1,5 @@
 import os
+from functools import partial
 import numpy as np
 from torchvision import transforms
 import torch
@@ -24,60 +25,60 @@ from diffusers.models.vae import Decoder
 
 # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-class OpenClipper(torch.nn.Module):
-    def __init__(self, clip_variant='ViT-H-14', train_transforms=None, device=torch.device('cpu')):
-        super().__init__()
-        print(clip_variant, device)
-        assert clip_variant == 'ViT-H-14' # not setup for other models yet
+# class OpenClipper(torch.nn.Module):
+#     def __init__(self, clip_variant='ViT-H-14', train_transforms=None, device=torch.device('cpu')):
+#         super().__init__()
+#         print(clip_variant, device)
+#         assert clip_variant == 'ViT-H-14' # not setup for other models yet
                 
-        clip_model, _, preprocess = open_clip.create_model_and_transforms('ViT-H-14', 
-                                        pretrained='laion2b_s32b_b79k', device=device)
-        clip_model.eval() # dont want to train model
-        for param in clip_model.parameters():
-            param.requires_grad = False # dont need to calculate gradients
+#         clip_model, _, preprocess = open_clip.create_model_and_transforms('ViT-H-14', 
+#                                         pretrained='laion2b_s32b_b79k', device=device)
+#         clip_model.eval() # dont want to train model
+#         for param in clip_model.parameters():
+#             param.requires_grad = False # dont need to calculate gradients
             
-        # overwrite preprocess to accept torch inputs instead of PIL Image
-        preprocess = transforms.Compose([
-                transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC, antialias=None),
-                transforms.CenterCrop(224),
-                transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
-        ])
+#         # overwrite preprocess to accept torch inputs instead of PIL Image
+#         preprocess = transforms.Compose([
+#                 transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC, antialias=None),
+#                 transforms.CenterCrop(224),
+#                 transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
+#         ])
         
-        tokenizer = open_clip.get_tokenizer('ViT-H-14')
+#         tokenizer = open_clip.get_tokenizer('ViT-H-14')
             
-        self.clip = clip_model
-        self.preprocess = preprocess
-        self.tokenizer = tokenizer
-        self.transforms = train_transforms
-        self.device = device
+#         self.clip = clip_model
+#         self.preprocess = preprocess
+#         self.tokenizer = tokenizer
+#         self.transforms = train_transforms
+#         self.device = device
         
-    def embed_image(self, image):
-        """Expects images in -1 to 1 range"""
-        image = self.preprocess(image).to(self.device)
-        with torch.no_grad(), torch.cuda.amp.autocast():
-            image_features = self.clip.encode_image(image)
-            #image_features /= image_features.norm(dim=-1, keepdim=True)
-        return image_features
+#     def embed_image(self, image):
+#         """Expects images in -1 to 1 range"""
+#         image = self.preprocess(image).to(self.device)
+#         with torch.no_grad(), torch.cuda.amp.autocast():
+#             image_features = self.clip.encode_image(image)
+#             #image_features /= image_features.norm(dim=-1, keepdim=True)
+#         return image_features
 
-    def embed_text(self, text_samples):
-        text = self.tokenizer(text_samples).to(self.device)
-        with torch.no_grad(), torch.cuda.amp.autocast():
-            text_features = self.clip.encode_text(text)
-            #text_features /= text_features.norm(dim=-1, keepdim=True)
-        return text_features
+#     def embed_text(self, text_samples):
+#         text = self.tokenizer(text_samples).to(self.device)
+#         with torch.no_grad(), torch.cuda.amp.autocast():
+#             text_features = self.clip.encode_text(text)
+#             #text_features /= text_features.norm(dim=-1, keepdim=True)
+#         return text_features
 
-    def embed_curated_annotations(self, annots):
-        for i,b in enumerate(annots):
-            t = ''
-            while t == '':
-                rand = torch.randint(5,(1,1))[0][0]
-                t = b[0,rand]
-            if i==0:
-                txt = np.array(t)
-            else:
-                txt = np.vstack((txt,t))
-        txt = txt.flatten()
-        return self.embed_text(txt)
+#     def embed_curated_annotations(self, annots):
+#         for i,b in enumerate(annots):
+#             t = ''
+#             while t == '':
+#                 rand = torch.randint(5,(1,1))[0][0]
+#                 t = b[0,rand]
+#             if i==0:
+#                 txt = np.array(t)
+#             else:
+#                 txt = np.vstack((txt,t))
+#         txt = txt.flatten()
+#         return self.embed_text(txt)
 
 class Clipper(torch.nn.Module):
     def __init__(self, clip_variant, clamp_embs=False, norm_embs=False, refine=False, train_transforms=None, 
@@ -97,13 +98,13 @@ class Clipper(torch.nn.Module):
             for param in image_encoder.parameters():
                 param.requires_grad = False # dont need to calculate gradients
             self.image_encoder = image_encoder
+        else:
+            clip_model, preprocess = clip.load(clip_variant, device=device)
+            clip_model.eval() # dont want to train model
+            for param in clip_model.parameters():
+                param.requires_grad = False # dont need to calculate gradients        
+            self.clip = clip_model
         
-        clip_model, preprocess = clip.load(clip_variant, device=device)
-        clip_model.eval() # dont want to train model
-        for param in clip_model.parameters():
-            param.requires_grad = False # dont need to calculate gradients
-            
-        self.clip = clip_model
         self.clip_variant = clip_variant
         if clip_variant == "RN50x64":
             self.clip_size = (448,448)
@@ -179,15 +180,37 @@ class Clipper(torch.nn.Module):
         txt = txt.flatten()
         return self.embed_text(txt)
 
+class OpenClipper(Clipper):
+    def __init__(self, clip_variant, weights_path, clamp_embs=False, norm_embs=False, train_transforms=None, device=torch.device('cpu')):
+        torch.nn.Module.__init__(self)
+        print(clip_variant, device)
+        clip_model, _, _ = open_clip.create_model_and_transforms('convnext_xxlarge', pretrained=False, device=torch.device('cuda'))
+        clip_model.load_state_dict(torch.load(weights_path))
+        clip_model.eval() # dont want to train model
+        for param in clip_model.parameters():
+            param.requires_grad = False # dont need to calculate gradients
+            
+        self.clip = clip_model
+        self.mean = np.array([0.48145466, 0.4578275, 0.40821073])
+        self.std = np.array([0.26862954, 0.26130258, 0.27577711])
+        self.normalize = transforms.Normalize(self.mean, self.std)
+        self.denormalize = transforms.Normalize((-self.mean / self.std).tolist(), (1.0 / self.std).tolist())
+        self.clip_size = (256,256) if 'convnext' in clip_variant else (224, 224)
+        self.clamp_embs = clamp_embs
+        self.norm_embs = norm_embs
+        self.transforms = train_transforms
+        self.device= device
+
 class BrainNetwork(nn.Module):
     # 133M
-    def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4, norm_type='bn'):
+    def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4, norm_type='bn', act_first=True):
         super().__init__()
-        norm_func = nn.BatchNorm1d if norm_type == 'bn' else nn.LayerNorm
+        norm_func = partial(nn.BatchNorm1d, num_features=h) if norm_type == 'bn' else partial(nn.LayerNorm, normalized_shape=h)
+        act_fn = partial(nn.ReLU, inplace=True) if norm_type == 'bn' else nn.GELU
+        act_and_norm = (act_fn, norm_func) if act_first else (norm_func, act_fn)
         self.lin0 = nn.Sequential(
             nn.Linear(in_dim, h),
-            nn.ReLU(inplace=True),
-            norm_func(h),
+            *[item() for item in act_and_norm],
             nn.Dropout(0.5),
         )
             
@@ -195,13 +218,12 @@ class BrainNetwork(nn.Module):
         self.mlp = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(h, h),
-                nn.ReLU(inplace=True),
-                norm_func(h),
+                *[item() for item in act_and_norm],
                 nn.Dropout(0.15)
             ) for _ in range(n_blocks)
         ])
         
-        self.lin1 = nn.Linear(h, out_dim)
+        self.lin1 = nn.Linear(h, out_dim, bias=True)
         self.n_blocks = n_blocks
         
     def forward(self, x):
@@ -225,6 +247,36 @@ class BrainNetwork(nn.Module):
         x = x.reshape(len(x), -1)
         x = self.lin1(x)
         return x
+
+class BrainNetworkDETR(BrainNetwork):
+    # 133M
+    def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4, norm_type='bn', act_first=True, 
+                encoder_tokens=32, decoder_tokens=257):
+        # encoder
+        super().__init__(out_dim*encoder_tokens, in_dim, h, n_blocks, norm_type, act_first)
+        self.norm = nn.LayerNorm(out_dim)
+        self.encoder_tokens = encoder_tokens
+        
+        self.register_parameter('queries', nn.Parameter(torch.randn(1, decoder_tokens, out_dim)))
+        self.transformer = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(d_model=out_dim, nhead=8,
+                                        dim_feedforward=1024, 
+                                        batch_first=True, dropout=0.25),
+            num_layers=n_blocks
+        )
+        self.decoder_projector = nn.Sequential(
+            nn.LayerNorm(out_dim),
+            nn.Linear(out_dim, out_dim)
+        )
+
+
+    def forward(self, x):
+        enc = super().forward(x)
+        enc = self.norm(enc.reshape(enc.shape[0], self.encoder_tokens, -1))
+
+        dec = self.transformer(self.queries.expand(x.shape[0], -1, -1), enc)
+        dec = self.decoder_projector(dec)
+        return dec
 
 class BrainDiffusionPrior(DiffusionPrior):
     """ 

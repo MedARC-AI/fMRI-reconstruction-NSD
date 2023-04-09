@@ -24,7 +24,7 @@ import socket
 from clip_retrieval.clip_client import ClipClient
 import time 
 from torchvision.models import alexnet, AlexNet_Weights
-from image_finder import _check_whether_images_are_identical
+# from image_finder import _check_whether_images_are_identical
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -126,6 +126,17 @@ def soft_clip_loss(preds, targs, temp=0.125, distributed=False, accelerator=None
     loss = (loss1 + loss2)/2
     return loss
 
+def soft_clip_loss_all(preds, targs, temp=0.125, distributed=False, accelerator=None):
+    clip_clip = torch.bmm(targs.permute(1,0,2), targs.permute(1,2,0))/temp
+    brain_clip = torch.bmm(preds.permute(1,0,2), targs.permute(1,2,0))/temp
+    brain_clip_t = brain_clip.permute(0, 2, 1)
+
+    loss1 = -(brain_clip.log_softmax(-1) * clip_clip.softmax(-1)).sum(-1).mean()
+    loss2 = -(brain_clip_t.log_softmax(-1) * clip_clip.softmax(-1)).sum(-1).mean()
+    
+    loss = (loss1 + loss2)/2
+    return loss
+
 def soft_cont_loss(student_preds, teacher_preds, teacher_aug_preds, temp=0.125, distributed=True, accelerator=None):
     if not distributed:
         raise NotImplementedError()
@@ -182,6 +193,20 @@ def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distri
         return loss
     else:
         return F.cross_entropy(brain_clip, torch.arange(brain_clip.shape[0]).to(brain_clip.device))
+
+def mixco_nce_all(preds, targs, temp=0.1, perm=None, betas=None, select=None, distributed=False, accelerator=None, local_rank=None):
+    brain_clip = torch.bmm(preds.permute(1,0,2), targs.permute(1,2,0))/temp
+
+    if perm is not None and betas is not None and select is not None:
+        probs = torch.diag(betas)
+        probs[torch.arange(preds.shape[0]).to(preds.device), perm] = 1 - betas
+
+    
+        loss = -(brain_clip.log_softmax(-1) * probs[None]).sum(-1).mean()
+        return loss
+    else:
+        return F.cross_entropy(brain_clip, torch.arange(brain_clip.shape[1]).to(brain_clip.device)[None].expand(brain_clip.shape[0],-1))
+
 
 def dcl(preds, targs, temp=0.1):
     # adapted from https://github.com/raminnakhli/Decoupled-Contrastive-Learning/blob/main/loss/dcl.py
@@ -428,7 +453,8 @@ def sample_images(
 
     clip_extractor.eval()
     brain_net.eval()
-    diffusion_prior.eval()
+    if diffusion_prior is not None:
+        diffusion_prior.eval()
 
     if seed is not None:
         # set seed
@@ -470,18 +496,21 @@ def sample_images(
         # image_embeddings = nn.functional.normalize(image_embeddings, dim=-1) 
         # image_embeddings *= clip_emb[1].norm()/image_embeddings.norm() # note: this is cheating to equate norm scaling
 
-        image_embeddings = diffusion_prior.p_sample_loop(image_embeddings.shape, 
-                                            text_cond = dict(text_embed = image_embeddings), 
-                                            cond_scale = 1., timesteps = prior_timesteps,
-                                            generator=g_cuda
-                                            )
-        norm_post_prior = image_embeddings.norm().item()
+        if diffusion_prior is not None:
+            image_embeddings = diffusion_prior.p_sample_loop(image_embeddings.shape, 
+                                                text_cond = dict(text_embed = image_embeddings), 
+                                                cond_scale = 1., timesteps = prior_timesteps,
+                                                generator=g_cuda
+                                                )
+            norm_post_prior = image_embeddings.norm().item()
 
         if verbose:
             cos_sim = nn.functional.cosine_similarity(image_embeddings, clip_emb, dim=1).item()
             mse = nn.functional.mse_loss(image_embeddings, clip_emb).item()
             print(f"cosine sim: {cos_sim:.3f}, MSE: {mse:.5f}, norm_orig: {norm_orig:.3f}, "
-                  f"norm_pre_prior: {norm_pre_prior:.3f}, norm_post_prior: {norm_post_prior:.3f}", flush=True)
+                  f"norm_pre_prior: {norm_pre_prior:.3f}" + \
+                  f", norm_post_prior: {norm_post_prior:.3f}" if diffusion_prior is not None else "",
+                  flush=True)
 
         # duplicate the embedding to serve classifier free guidance
         image_embeddings = image_embeddings.repeat(num_per_sample, 1)
@@ -1139,8 +1168,17 @@ def select_annotations(annots, random=False):
 def voxel_select(voxels):
     if voxels.ndim == 2:
         return voxels
-    weights = torch.rand(voxels.shape[1]).reshape(1, -1, 1).to(voxels.device)
-    return (weights * voxels).sum(1)/weights.sum()
+    choice = torch.rand(1)
+    # random combine
+    if choice <= 0.5:
+        weights = torch.rand(voxels.shape[0], voxels.shape[1])[:,:,None].to(voxels.device)
+        return (weights * voxels).sum(1)/weights.sum(1)
+    # mean
+    if choice <= 0.8:
+        return voxels.mean(1)
+    # random select
+    randints = torch.randint(0, voxels.shape[1], (voxels.shape[0],))
+    return voxels[torch.arange(voxels.shape[0]), randints]
 
 # def soft_cont_loss(student_preds, teacher_preds, teacher_aug_preds, temp=0.125, distributed=True):
 #     # if not distributed:
