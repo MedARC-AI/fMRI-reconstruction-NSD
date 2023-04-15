@@ -386,13 +386,14 @@ def get_dataloaders(
     if cache_dir is not None and not os.path.exists(cache_dir):
         os.makedirs(cache_dir,exist_ok=True)
     
-    train_data = wds.WebDataset(train_url, resampled=True, cache_dir=cache_dir, nodesplitter=wds.split_by_node)\
-        .shuffle(500, initial=500, rng=random.Random(42))\
-        .decode("torch")\
-        .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy", coco="coco73k.npy", reps="num_uniques.npy")\
-        .to_tuple(*to_tuple)\
-        .batched(batch_size, partial=True)\
-        .with_epoch(num_worker_batches)
+    train_data = (wds.WebDataset(train_url, resampled=True, cache_dir=cache_dir, nodesplitter=wds.split_by_node)
+        .shuffle(500, initial=500, rng=random.Random(42))
+        .decode("torch")
+        .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy", coco="coco73k.npy", reps="num_uniques.npy")
+        # .rename(images="jpg;png", voxels=voxels_key)
+        .to_tuple(*to_tuple)
+        .batched(batch_size, partial=True)
+        .with_epoch(num_worker_batches))
     
     if n_cache_recs > 0:
         train_data = train_data.compose(wds.DBCache, os.path.join(cache_dir, "cache-train.db"),  n_cache_recs)
@@ -407,11 +408,12 @@ def get_dataloaders(
     if local_rank==0: print("val_batch_size",val_batch_size)
     if local_rank==0: print("val_num_workers",val_num_workers)
     
-    val_data = wds.WebDataset(val_url, resampled=False, cache_dir=cache_dir, nodesplitter=wds.split_by_node)\
-        .decode("torch")\
-        .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy", coco="coco73k.npy", reps="num_uniques.npy")\
-        .to_tuple(*to_tuple)\
-        .batched(val_batch_size, partial=False)
+    val_data = (wds.WebDataset(val_url, resampled=False, cache_dir=cache_dir, nodesplitter=wds.split_by_node)
+        .decode("torch")
+        .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy", coco="coco73k.npy", reps="num_uniques.npy")
+        # .rename(images="jpg;png", voxels=voxels_key)
+        .to_tuple(*to_tuple)
+        .batched(val_batch_size, partial=False))
     
     val_dl = torch.utils.data.DataLoader(val_data, batch_size=None, num_workers=val_num_workers, shuffle=False)
 

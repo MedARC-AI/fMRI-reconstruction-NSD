@@ -17,6 +17,9 @@ import random
 import json
 from dalle2_pytorch.train_configs import DiffusionPriorNetworkConfig
 
+# FOr VD prior
+from dalle2_pytorch.dalle2_pytorch import RotaryEmbedding, CausalTransformer, SinusoidalPosEmb, MLP, Rearrange, repeat, rearrange, prob_mask_like
+
 # for pipeline
 from diffusers import StableDiffusionImageVariationPipeline
 from typing import Callable, List, Optional, Union
@@ -277,6 +280,131 @@ class BrainNetworkDETR(BrainNetwork):
         dec = self.transformer(self.queries.expand(x.shape[0], -1, -1), enc)
         dec = self.decoder_projector(dec)
         return dec
+
+class VersatileDiffusionPriorNetwork(nn.Module):
+    def __init__(
+        self,
+        dim,
+        num_timesteps = None,
+        num_time_embeds = 1,
+        # num_image_embeds = 1,
+        # num_brain_embeds = 1,
+        num_tokens = 257,
+        self_cond = False,
+        **kwargs
+    ):
+        super().__init__()
+        self.dim = dim
+
+        self.num_time_embeds = num_time_embeds
+
+        self.continuous_embedded_time = not exists(num_timesteps)
+
+        self.to_time_embeds = nn.Sequential(
+            nn.Embedding(num_timesteps, dim * num_time_embeds) if exists(num_timesteps) else nn.Sequential(SinusoidalPosEmb(dim), MLP(dim, dim * num_time_embeds)), # also offer a continuous version of timestep embeddings, with a 2 layer MLP
+            Rearrange('b (n d) -> b n d', n = num_time_embeds)
+        )
+
+        self.learned_query = nn.Parameter(torch.randn(num_tokens, dim))
+        self.causal_transformer = CausalTransformer(dim = dim, **kwargs)
+
+        self.null_brain_embeds = nn.Parameter(torch.randn(num_tokens, dim))
+        self.null_image_embed = nn.Parameter(torch.randn(num_tokens, dim))
+
+        # whether to use self conditioning, Hinton's group's new ddpm technique
+
+        self.self_cond = self_cond
+        self.num_tokens = num_tokens
+
+    def forward_with_cond_scale(
+        self,
+        *args,
+        cond_scale = 1.,
+        **kwargs
+    ):
+        logits = self.forward(*args, **kwargs)
+
+        if cond_scale == 1:
+            return logits
+
+        null_logits = self.forward(*args, brain_cond_drop_prob = 1., image_cond_drop_prob = 1, **kwargs)
+        return null_logits + (logits - null_logits) * cond_scale
+
+    def forward(
+        self,
+        image_embed,
+        diffusion_timesteps,
+        *,
+        brain_embed=None,
+        text_embed=None,
+        self_cond = None,
+        brain_cond_drop_prob = 0.,
+        text_cond_drop_prob = None,
+        image_cond_drop_prob = 0.
+    ):
+        if text_embed is not None:
+            brain_embed = text_embed
+        if text_cond_drop_prob is not None:
+            brain_cond_drop_prob = text_cond_drop_prob
+        
+        batch, _, dim, device, dtype = *image_embed.shape, image_embed.device, image_embed.dtype
+        # num_time_embeds, num_image_embeds, num_brain_embeds = self.num_time_embeds, self.num_image_embeds, self.num_brain_embeds
+
+        # setup self conditioning
+        if self.self_cond:
+            self_cond = default(self_cond, lambda: torch.zeros(batch, self.num_tokens, self.dim, device = device, dtype = dtype))
+        
+        # classifier free guidance masks
+        brain_keep_mask = prob_mask_like((batch,), 1 - brain_cond_drop_prob, device = device)
+        brain_keep_mask = rearrange(brain_keep_mask, 'b -> b 1 1')
+
+        image_keep_mask = prob_mask_like((batch,), 1 - image_cond_drop_prob, device = device)
+        image_keep_mask = rearrange(image_keep_mask, 'b -> b 1 1')
+
+        # mask out brain embeddings with null brain embeddings
+
+        # import pdb; pdb.set_trace()
+        null_brain_embeds = self.null_brain_embeds.to(brain_embed.dtype)
+        brain_embed = torch.where(
+            brain_keep_mask,
+            brain_embed,
+            null_brain_embeds[None]
+        )
+
+        # mask out image embeddings with null image embeddings
+        null_image_embed = self.null_image_embed.to(image_embed.dtype)
+        image_embed = torch.where(
+            image_keep_mask,
+            image_embed,
+            null_image_embed[None]
+        )
+
+        # whether brain embedding is used for conditioning depends on whether brain encodings are available for attention (for classifier free guidance, even though it seems from the paper it was not used in the prior ddpm, as the objective is different)
+        # but let's just do it right
+        if self.continuous_embedded_time:
+            # if continuous cast to flat, else keep int for indexing embeddings
+            diffusion_timesteps = diffusion_timesteps.type(dtype)
+        time_embed = self.to_time_embeds(diffusion_timesteps)
+
+        learned_queries = repeat(self.learned_query, 'n d -> b n d', b = batch)
+
+        if self.self_cond:
+            learned_queries = torch.cat((self_cond, learned_queries), dim = -2)
+
+        tokens = torch.cat((
+            brain_embed,  # 257
+            time_embed,  # 1
+            image_embed,  # 257
+            learned_queries  # 257
+        ), dim = -2)
+
+        # attend
+        tokens = self.causal_transformer(tokens)
+
+        # get learned query, which should predict the image embedding (per DDPM timestep)
+        pred_image_embed = tokens[..., -257:, :]
+
+        return pred_image_embed
 
 class BrainDiffusionPrior(DiffusionPrior):
     """ 
