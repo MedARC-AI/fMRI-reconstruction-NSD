@@ -136,7 +136,9 @@ class Clipper(torch.nn.Module):
                 embeds = image_encoder.vision_model.post_layernorm(embeds)
                 embeds = image_encoder.visual_projection(embeds)
                 if norm_embs:
-                    embeds = nn.functional.normalize(embeds,dim=-1)
+                    # normalize all tokens by cls token's norm
+                    norm = torch.norm(embeds[:, 0], dim=-1).reshape(-1, 1, 1)
+                    embeds = embeds/norm
             if layer is not None:
                 embeds = embeds[:,layer]
             return embeds
