@@ -88,6 +88,12 @@ def batchwise_cosine_similarity(Z,B):
     cosine_similarity = ((Z @ B) / (Z_norm @ B_norm)).T
     return cosine_similarity
 
+def batchwise_cosine_similarity_all(Z,B):
+    Z, B = F.normalize(Z, dim=-1), F.normalize(B, dim=-1)
+    cosine_similarity = torch.bmm(Z.permute(1,0,2), B.permute(1,2,0)).mean(0)
+    return cosine_similarity
+
+
 def get_non_diagonals(a):
     a = torch.triu(a,diagonal=1)+torch.tril(a,diagonal=-1)
     # make diagonals -1

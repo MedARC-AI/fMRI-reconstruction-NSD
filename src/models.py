@@ -21,7 +21,7 @@ from dalle2_pytorch.train_configs import DiffusionPriorNetworkConfig
 from dalle2_pytorch.dalle2_pytorch import RotaryEmbedding, CausalTransformer, SinusoidalPosEmb, MLP, Rearrange, repeat, rearrange, prob_mask_like
 
 # for pipeline
-from diffusers import StableDiffusionImageVariationPipeline
+from diffusers import StableDiffusionImageVariationPipeline, VersatileDiffusionDualGuidedPipeline
 from typing import Callable, List, Optional, Union
 
 from diffusers.models.vae import Decoder
@@ -85,7 +85,7 @@ from diffusers.models.vae import Decoder
 
 class Clipper(torch.nn.Module):
     def __init__(self, clip_variant, clamp_embs=False, norm_embs=False, refine=False, train_transforms=None, 
-                 hidden_state=False, layer=None, device=torch.device('cpu')):
+                 hidden_state=False, token_idx=None, device=torch.device('cpu')):
         super().__init__()
         assert clip_variant in ("RN50", "ViT-L/14", "ViT-B/32", "RN50x64"), \
             "clip_variant must be one of RN50, ViT-L/14, ViT-B/32, RN50x64"
@@ -101,6 +101,8 @@ class Clipper(torch.nn.Module):
             for param in image_encoder.parameters():
                 param.requires_grad = False # dont need to calculate gradients
             self.image_encoder = image_encoder
+            self.refine = refine
+            self.token_idx = token_idx
         else:
             clip_model, preprocess = clip.load(clip_variant, device=device)
             clip_model.eval() # dont want to train model
@@ -114,48 +116,51 @@ class Clipper(torch.nn.Module):
         else:
             self.clip_size = (224,224)
             
-        preproc = transforms.Compose([
-            transforms.Resize(size=self.clip_size[0], interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(size=self.clip_size),
-            transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
-        ])
-        self.preprocess = preproc
-        self.hidden_state = hidden_state
         self.mean = np.array([0.48145466, 0.4578275, 0.40821073])
         self.std = np.array([0.26862954, 0.26130258, 0.27577711])
         self.normalize = transforms.Normalize(self.mean, self.std)
         self.denormalize = transforms.Normalize((-self.mean / self.std).tolist(), (1.0 / self.std).tolist())
+
+        self.hidden_state = hidden_state
         self.clamp_embs = clamp_embs
         self.norm_embs = norm_embs
         self.transforms = train_transforms
         self.device= device
         
-        def versatile_normalize_embeddings(encoder_output):
-            embeds = encoder_output.last_hidden_state
-            if not refine:
-                embeds = image_encoder.vision_model.post_layernorm(embeds)
-                embeds = image_encoder.visual_projection(embeds)
-                if norm_embs:
-                    # normalize all tokens by cls token's norm
-                    norm = torch.norm(embeds[:, 0], dim=-1).reshape(-1, 1, 1)
-                    embeds = embeds/norm
-            if layer is not None:
-                embeds = embeds[:,layer]
-            return embeds
-        self.versatile_normalize_embeddings = versatile_normalize_embeddings
+    def versatile_process_embeddings(self, encoder_output):
+        embeds = encoder_output.last_hidden_state
+        if not self.refine:
+            embeds = self.image_encoder.vision_model.post_layernorm(embeds)
+            embeds = self.image_encoder.visual_projection(embeds)
+            if self.norm_embs:
+                # normalize all tokens by cls token's norm
+                norm = torch.norm(embeds[:, 0], dim=-1).reshape(-1, 1, 1)
+                embeds = embeds/norm
+        if self.token_idx is not None:
+            embeds = embeds[:,self.token_idx]
+        return embeds
 
     def resize_image(self, image):
         # note: antialias should be False if planning to use Pinkney's Image Variation SD model
-        return nn.functional.interpolate(image.to(self.device), self.clip_size, mode="area", antialias=False)
+        return nn.functional.interpolate(image.to(self.device), self.clip_size, mode="bilinear", 
+            align_corners=False, antialias=True
+        )
 
-    def embed_image(self, image):
+    def embed_image(self, image, training=True):
         """Expects images in -1 to 1 range"""
-        clip_emb = self.preprocess(image.to(self.device))
+        if self.transforms is not None and training:
+            clip_emb = self.transforms(image)
+        else:
+            clip_emb = image
+        clip_emb = self.resize_image(clip_emb)
+        clip_emb = self.normalize(clip_emb)
+        
         if self.clip_variant=="ViT-L/14" and self.hidden_state:
             clip_emb = self.image_encoder(clip_emb)
-            clip_emb = self.versatile_normalize_embeddings(clip_emb)
-        else:
-            clip_emb = self.clip.encode_image(clip_emb)
+            clip_emb = self.versatile_process_embeddings(clip_emb)
+            return clip_emb
+        
+        clip_emb = self.clip.encode_image(clip_emb)
         # input is now in CLIP space, but mind-reader preprint further processes embeddings:
         if self.clamp_embs:
             clip_emb = torch.clamp(clip_emb, -1.5, 1.5)
@@ -254,7 +259,7 @@ class BrainNetwork(nn.Module):
         return x
 
 class BrainNetworkDETR(BrainNetwork):
-    # 133M
+    # 250M
     def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4, norm_type='bn', act_first=True, 
                 encoder_tokens=32, decoder_tokens=257):
         # encoder
@@ -282,6 +287,68 @@ class BrainNetworkDETR(BrainNetwork):
         dec = self.transformer(self.queries.expand(x.shape[0], -1, -1), enc)
         dec = self.decoder_projector(dec)
         return dec
+
+class BrainNetworkDETR2(BrainNetwork):
+    # 182M
+    def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4, norm_type='bn', act_first=True, 
+                encoder_tokens=8, decoder_tokens=257):
+        # encoder
+        super().__init__(out_dim*encoder_tokens, in_dim, h, n_blocks, norm_type, act_first)
+        self.norm = nn.LayerNorm(out_dim)
+        self.encoder_tokens = encoder_tokens
+        
+        self.register_parameter('queries', nn.Parameter(torch.randn(1, decoder_tokens, out_dim)))
+        self.transformer = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(d_model=out_dim, nhead=8,
+                                       dim_feedforward=1024, norm_first=True,
+                                       activation='gelu',batch_first=True, 
+                                       dropout=0.25),
+            num_layers=n_blocks
+        )
+        self.decoder_projector = nn.Sequential(
+            nn.LayerNorm(out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim)
+        )
+
+
+    def forward(self, x):
+        enc = super().forward(x)
+        enc = self.norm(enc.reshape(enc.shape[0], self.encoder_tokens, -1))
+
+        dec = self.transformer(self.queries.expand(x.shape[0], -1, -1), enc)
+        dec = self.decoder_projector(dec)
+        return dec
+
+class BrainNetworkNoDETR(BrainNetwork):
+    # 950M
+    def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4, norm_type='bn', act_first=True, 
+                encoder_tokens=257, decoder_tokens=257):
+        # encoder
+        super().__init__(out_dim*encoder_tokens, in_dim, h, n_blocks, norm_type, act_first)
+        # self.norm = nn.LayerNorm(out_dim)
+        self.encoder_tokens = encoder_tokens
+        
+        # self.register_parameter('queries', nn.Parameter(torch.randn(1, decoder_tokens, out_dim)))
+        # self.transformer = nn.TransformerDecoder(
+        #     nn.TransformerDecoderLayer(d_model=out_dim, nhead=8,
+        #                                dim_feedforward=1024, norm_first=True,
+        #                                activation='gelu',batch_first=True, 
+        #                                dropout=0.25),
+        #     num_layers=n_blocks
+        # )
+        # self.decoder_projector = nn.Sequential(
+        #     nn.LayerNorm(out_dim),
+        #     nn.GELU(),
+        #     nn.Linear(out_dim, out_dim)
+        # )
+
+
+    def forward(self, x):
+        enc = super().forward(x)
+        enc = enc.reshape(enc.shape[0], self.encoder_tokens, -1)
+        return enc
+
 
 class VersatileDiffusionPriorNetwork(nn.Module):
     def __init__(
@@ -585,6 +652,160 @@ class BrainDiffusionPrior(DiffusionPrior):
             diffusion_prior.voxel2clip.load_state_dict(state_dict)
         
         return diffusion_prior
+
+class BrainVD(VersatileDiffusionDualGuidedPipeline):
+    """ 
+    Differences from original:
+    - Keep generated images on GPU and return tensors
+    - No NSFW checker
+    - Can pass in image or image_embedding to generate a variation
+    NOTE: requires latest version of diffusers to avoid the latent dims not being correct.
+    """
+
+    def decode_latents(self, latents):
+        latents = 1 / self.vae.config.scaling_factor * latents
+        image = self.vae.decode(latents).sample
+        image = (image / 2 + 0.5).clamp(0, 1)
+        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
+        # image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+        return image
+
+    def check_inputs(self, prompt, image, height, width, callback_steps):
+        if prompt is not None and not isinstance(prompt, str) and not isinstance(prompt, list):
+            raise ValueError(f"`prompt` has to be of type None, `str` or `list` but is {type(prompt)}")
+        if image is not None and not isinstance(image, PIL.Image.Image) and not isinstance(image, list):
+            raise ValueError(f"`image` has to be of type None, `PIL.Image` or `list` but is {type(image)}")
+
+        if height % 8 != 0 or width % 8 != 0:
+            raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
+
+        if (callback_steps is None) or (
+            callback_steps is not None and (not isinstance(callback_steps, int) or callback_steps <= 0)
+        ):
+            raise ValueError(
+                f"`callback_steps` has to be a positive integer but is {callback_steps} of type"
+                f" {type(callback_steps)}."
+            )
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        prompt: Union[PIL.Image.Image, List[PIL.Image.Image]] = None,
+        image: Union[str, List[str]] = None,
+        text_to_image_strength: float = 0.5,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        callback_steps: Optional[int] = 1,
+        image_embeddings: Optional[torch.FloatTensor] = None,
+        prompt_embeddings: Optional[torch.FloatTensor] = None,
+        **kwargs,
+    ):
+
+        height = height or self.image_unet.config.sample_size * self.vae_scale_factor
+        width = width or self.image_unet.config.sample_size * self.vae_scale_factor
+
+        self.check_inputs(prompt, image, height, width, callback_steps)
+
+        prompt = [prompt] if prompt is not None and not isinstance(prompt, list) else prompt
+        image = [image] if image is not None and not isinstance(image, list) else image
+        device = self._execution_device
+        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # corresponds to doing no classifier free guidance.
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+
+        # 3. Encode input prompt
+        if image_embeddings is None:
+            if image is not None:
+                image_embeddings = self._encode_image_prompt(
+                    image, device, num_images_per_prompt, do_classifier_free_guidance
+                )
+                batch_size = len(image)
+            else:
+                image_embeddings = None
+        
+        if prompt_embeddings is None:
+            if prompt is not None:
+                prompt_embeddings = self._encode_text_prompt(
+                    prompt, device, num_images_per_prompt, do_classifier_free_guidance
+                )
+                batch_size = len(prompt)
+            else:
+                prompt_embeddings = None
+        if image_embeddings is not None:
+            batch_size = image_embeddings.shape[0] // 2
+        elif prompt_embeddings is not None:
+            batch_size = prompt_embeddings.shape[0] // 2
+        
+        if image_embeddings is not None and prompt_embeddings is not None:
+            dual_prompt_embeddings = torch.cat([prompt_embeddings, image_embeddings], dim=1)
+        elif image_embeddings is None:
+            dual_prompt_embeddings = prompt_embeddings
+            text_to_image_strength = 1.
+        elif prompt_embeddings is None:
+            dual_prompt_embeddings = image_embeddings
+            text_to_image_strength = 0.
+        else:
+            raise ValueError()
+
+        # 4. Prepare timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+
+        # 5. Prepare latent variables
+        num_channels_latents = self.image_unet.in_channels
+        latents = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            dual_prompt_embeddings.dtype,
+            device,
+            generator,
+            latents,
+        )
+
+        # 6. Prepare extra step kwargs.
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+
+        # 7. Combine the attention blocks of the image and text UNets
+        self.set_transformer_params(text_to_image_strength, ("text", "image"))
+
+        # 8. Denoising loop
+        for i, t in enumerate(self.progress_bar(timesteps)):
+            # expand the latents if we are doing classifier free guidance
+            latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+            # predict the noise residual
+            noise_pred = self.image_unet(latent_model_input, t, encoder_hidden_states=dual_prompt_embeddings).sample
+
+            # perform guidance
+            if do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+            # compute the previous noisy sample x_t -> x_t-1
+            latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+
+            # call the callback, if provided
+            if callback is not None and i % callback_steps == 0:
+                callback(i, t, latents)
+
+        # 8. Post-processing
+        image = self.decode_latents(latents)
+
+        return image
 
 class BrainSD(StableDiffusionImageVariationPipeline):
     """ 

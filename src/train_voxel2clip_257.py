@@ -15,7 +15,7 @@ from kornia.augmentation.container import AugmentationSequential
 
 import utils
 from utils import torch_to_matplotlib, torch_to_Image
-from models import Clipper, OpenClipper, BrainNetworkDETR, BrainDiffusionPrior, BrainSD
+from models import Clipper, OpenClipper, BrainNetworkDETR2, BrainNetworkNoDETR, BrainDiffusionPrior, BrainSD, BrainVD
 from model3d import SimpleVoxel3dConvEncoder
 
 import torch.distributed as dist
@@ -121,7 +121,7 @@ if __name__ == '__main__':
     batch_size = 300 if args.voxel_dims == 1 else 128
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
 
-    num_epochs = 250  # 350 if data_commit=='avg' else 120
+    num_epochs = 120  # 400  # 250  # 350 if data_commit=='avg' else 120
     lr_scheduler = 'cycle'
     initial_lr = 1e-3 #3e-5
     max_lr = 3e-4
@@ -132,7 +132,7 @@ if __name__ == '__main__':
     wandb_notes = ''
     first_batch = False
     ckpt_saving = True
-    ckpt_interval = 10
+    ckpt_interval = 25  # 10
     use_mp = False
     distributed = False
     save_at_end = False
@@ -167,6 +167,7 @@ if __name__ == '__main__':
     num_workers = num_devices * 4
 
     if not args.disable_image_aug:
+        # [color augs, spartial_augs]
         train_augs = AugmentationSequential(
             # kornia.augmentation.RandomCrop((140, 140), p=0.3),
             # kornia.augmentation.Resize((224, 224)),
@@ -188,17 +189,16 @@ if __name__ == '__main__':
     print("device:",device)
 
     if use_mse:
-        sd_cache_dir = '/fsx/proj-medarc/fmri/atom/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc/'
-        sd_pipe =  BrainSD.from_pretrained(
+        vd_cache_dir = '/fsx/proj-medarc/fmri/cache/models--shi-labs--versatile-diffusion/snapshots/2926f8e11ea526b562cd592b099fcf9c2985d0b7'
+        vd_pipe =  BrainVD.from_pretrained(
             # "lambdalabs/sd-image-variations-diffusers",
-            sd_cache_dir,
-            revision="v2.0",
+            vd_cache_dir,
             safety_checker=None,
             requires_safety_checker=False,
             torch_dtype=torch.float16, # fp16 is fine if we're not training this
         ).to(device)
     else:
-        sd_pipe = None
+        vd_pipe = None
 
     num_devices = torch.cuda.device_count()
     if num_devices==0: num_devices = 1
@@ -297,8 +297,9 @@ if __name__ == '__main__':
 
     if voxel_dims == 1: # 1D data
         # voxel2clip_kwargs = dict(out_dim=768, norm_type='bn')
-        voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False)
-        voxel2clip = BrainNetworkDETR(**voxel2clip_kwargs)
+        voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=64)
+        voxel2clip = BrainNetworkDETR2(**voxel2clip_kwargs)
+        # voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
     elif args.voxel_dims == 3: # 3D data
         voxel2clip_kwargs = dict(
             out_dim=out_dim,
@@ -477,10 +478,11 @@ if __name__ == '__main__':
                     distributed=distributed, accelerator=accelerator)
             if use_mse:
                 if epoch < int(mixup_pct * num_epochs):
-                    clip_target_mse = clip_extractor.clip.encode_image(clip_extractor.normalize(clip_extractor.resize_image(image[~select])))
+                    # apply mse to non-mixed voxels only
+                    clip_target_mse = clip_extractor.embed_image(image[~select], training=False).float()
                     mse_loss = F.mse_loss(clip_voxels[~select], clip_target_mse.float())
                 else:
-                    clip_target_mse = clip_extractor.clip.encode_image(clip_extractor.normalize(clip_extractor.resize_image(image)))
+                    clip_target_mse = clip_extractor.embed_image(image, training=False).float()
                     mse_loss = F.mse_loss(clip_voxels, clip_target_mse.float())
                 mse_losses.append(mse_loss.item())
             else:
@@ -498,8 +500,8 @@ if __name__ == '__main__':
 
             # forward and backward top 1 accuracy
             labels = torch.arange(len(clip_target)).to(device)
-            fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target.flatten(1), clip_voxels.flatten(1)), labels, k=1).item()
-            bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels.flatten(1), clip_target.flatten(1)), labels, k=1).item()
+            fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_target, clip_voxels), labels, k=1).item()
+            bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_voxels, clip_target), labels, k=1).item()
 
             accelerator.backward(loss + mse_loss)
             optimizer.step()
@@ -510,8 +512,6 @@ if __name__ == '__main__':
         voxel2clip.eval()
         for val_i, (voxel, image, trial) in enumerate(val_dl): 
             with torch.no_grad():
-                repeat_index = val_i % 3
-
                 image = image.float()
                 voxel = voxel.float()
                 if voxel_dims == 1 and data_commit == 'avg':
@@ -530,7 +530,8 @@ if __name__ == '__main__':
                     annots = utils.select_annotations(subj01_annots[trial], random=False)
                     clip_target = clip_extractor.embed_text(annots).float()
                 else:
-                    clip_target = clip_extractor.embed_image(image).float()
+                    # turn off augmentations during validation
+                    clip_target = clip_extractor.embed_image(image, training=False).float()
                 clip_target.to(voxel.dtype)
 
                 if distributed:
@@ -563,9 +564,9 @@ if __name__ == '__main__':
 
                 labels = torch.arange(len(clip_target)).to(device)
                 # clip, brain
-                val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target.flatten(1), clip_voxels.flatten(1)), labels, k=1).item()
+                val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_target, clip_voxels), labels, k=1).item()
                 # brain, clip
-                val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels.flatten(1), clip_target.flatten(1)), labels, k=1).item()
+                val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_voxels, clip_target), labels, k=1).item()
 
         if local_rank == 0:
             if ckpt_saving:
@@ -603,12 +604,12 @@ if __name__ == '__main__':
             progress_bar.set_postfix(**logs)
 
             # sample some images
-            if sd_pipe is not None:
+            if vd_pipe is not None:
                 if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
                     if (not save_at_end and n_samples_save > 0) or (save_at_end and epoch == num_epochs - 1):
                         # training
-                        grids,_ = utils.sample_images(
-                            clip_extractor, voxel2clip, sd_pipe, None,
+                        grids,_ = utils.vd_sample_images(
+                            clip_extractor, voxel2clip, vd_pipe, None,
                             voxel0[:n_samples_save], image0[:n_samples_save], seed=42,
                         )
                         for i, grid in enumerate(grids):
@@ -617,8 +618,8 @@ if __name__ == '__main__':
                             logs['train/samples'] = [wandb.Image(grid) for grid in grids]
 
                         # validation
-                        grids,_ = utils.sample_images(
-                            clip_extractor, voxel2clip, sd_pipe, None,
+                        grids,_ = utils.vd_sample_images(
+                            clip_extractor, voxel2clip, vd_pipe, None,
                             val_voxel0[:n_samples_save], val_image0[:n_samples_save], seed=42,
                         )
                         for i, grid in enumerate(grids):
