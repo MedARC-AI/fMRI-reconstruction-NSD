@@ -134,7 +134,7 @@ class Clipper(torch.nn.Module):
             embeds = self.image_encoder.visual_projection(embeds)
             if self.norm_embs:
                 # normalize all tokens by cls token's norm
-                norm = torch.norm(embeds[:, 0], dim=-1).reshape(-1, 1, 1)
+                norm = torch.norm(embeds[:, 0], dim=-1).reshape(-1, 1, 1) + 1e-6
                 embeds = embeds/norm
         if self.token_idx is not None:
             embeds = embeds[:,self.token_idx]
@@ -146,10 +146,15 @@ class Clipper(torch.nn.Module):
             align_corners=False, antialias=True
         )
 
-    def embed_image(self, image, training=True):
+    def embed_image(self, image, apply_transforms=True, apply_spatial_transforms=True):
         """Expects images in -1 to 1 range"""
-        if self.transforms is not None and training:
-            clip_emb = self.transforms(image)
+        if self.transforms is not None and apply_transforms:
+            if isinstance(self.transforms, list):
+                clip_emb = self.transforms[0](image)
+                if apply_spatial_transforms:
+                    clip_emb = self.transforms[1](clip_emb)
+            else:
+                clip_emb = self.transforms(image)
         else:
             clip_emb = image
         clip_emb = self.resize_image(clip_emb)

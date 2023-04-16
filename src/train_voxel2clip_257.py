@@ -98,6 +98,18 @@ def parse_args():
         default=None,
         help="output location",
     )
+    parser.add_argument(
+        "--use_mse",
+        action="store_true",
+        help="use mse loss",
+    )
+    parser.add_argument(
+        "--cont_loss_type",
+        type=str,
+        default="all",
+        choices=["all", "flatten"],
+        help="output location",
+    )
     return parser.parse_args()
 
 if __name__ == '__main__':
@@ -121,7 +133,7 @@ if __name__ == '__main__':
     batch_size = 300 if args.voxel_dims == 1 else 128
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
 
-    num_epochs = 120  # 400  # 250  # 350 if data_commit=='avg' else 120
+    num_epochs = 400  # 400  # 250  # 350 if data_commit=='avg' else 120
     lr_scheduler = 'cycle'
     initial_lr = 1e-3 #3e-5
     max_lr = 3e-4
@@ -140,10 +152,12 @@ if __name__ == '__main__':
 
     cache_dir = 'cache'
     n_cache_recs = 0
-    mixup_pct = 0.5
+    mixup_pct = 0.25
 
     resume_from_ckpt = False
-    use_mse = False
+    use_mse = args.use_mse
+    normed_mse = True
+    loss_type = args.cont_loss_type
 
     lr_scheduler = 'cycle'
     initial_lr = 5e-4 # only used if lr_scheduler is 'fixed'
@@ -168,16 +182,21 @@ if __name__ == '__main__':
 
     if not args.disable_image_aug:
         # [color augs, spartial_augs]
-        train_augs = AugmentationSequential(
-            # kornia.augmentation.RandomCrop((140, 140), p=0.3),
-            # kornia.augmentation.Resize((224, 224)),
-            kornia.augmentation.RandomResizedCrop((224,224), (0.8, 1), p=0.3),
-            kornia.augmentation.RandomHorizontalFlip(p=0.5),
-            kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.3),
-            kornia.augmentation.RandomGrayscale(p=0.3),
-            data_keys=["input"],
-            # random_apply = (1,4)
-        )
+        train_augs = [
+            AugmentationSequential(
+                kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
+                kornia.augmentation.RandomSolarize(p=0.2),
+                kornia.augmentation.RandomGrayscale(p=0.2),
+                data_keys=["input"],
+                # random_apply = (1,4)
+            ),
+            AugmentationSequential(
+                kornia.augmentation.RandomResizedCrop((224,224), (0.5, 1), p=0.5),
+                kornia.augmentation.RandomHorizontalFlip(p=0.5),
+                data_keys=["input"],
+                # random_apply = (1,4)
+            )
+        ]
     else:
         train_augs = None
 
@@ -196,7 +215,7 @@ if __name__ == '__main__':
             safety_checker=None,
             requires_safety_checker=False,
             torch_dtype=torch.float16, # fp16 is fine if we're not training this
-        ).to(device)
+        ).to("cpu")
     else:
         vd_pipe = None
 
@@ -297,9 +316,10 @@ if __name__ == '__main__':
 
     if voxel_dims == 1: # 1D data
         # voxel2clip_kwargs = dict(out_dim=768, norm_type='bn')
-        voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=64)
-        voxel2clip = BrainNetworkDETR2(**voxel2clip_kwargs)
-        # voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
+        # voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=64)
+        # voxel2clip = BrainNetworkDETR2(**voxel2clip_kwargs)
+        voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=257)
+        voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
     elif args.voxel_dims == 3: # 3D data
         voxel2clip_kwargs = dict(
             out_dim=out_dim,
@@ -457,32 +477,62 @@ if __name__ == '__main__':
                 trial = trial.cpu().numpy()
                 annots = utils.select_annotations(subj01_annots[trial], random=True)
                 clip_target = clip_extractor.embed_text(annots).float()
-            else:
-                clip_target = clip_extractor.embed_image(image).float()
-            clip_target.to(voxel.dtype)
-
             clip_voxels = voxel2clip(voxel)
 
             if epoch < int(mixup_pct * num_epochs):
-                loss = utils.mixco_nce_all(
-                    nn.functional.normalize(clip_voxels, dim=-1), 
-                    nn.functional.normalize(clip_target, dim=-1),
-                    temp=0.006, perm=perm, betas=betas, select=select,
-                    distributed=distributed, accelerator=accelerator, local_rank=local_rank)
+                if not is_text:
+                    clip_target = clip_extractor.embed_image(image, apply_transforms=True, apply_spatial_transforms=False).float()
+                clip_target.to(voxel.dtype)
+                if loss_type == 'all':
+                    loss = utils.mixco_nce_all(
+                        nn.functional.normalize(clip_voxels, dim=-1), 
+                        nn.functional.normalize(clip_target, dim=-1),
+                        temp=0.006, perm=perm, betas=betas, select=select,
+                        distributed=distributed, accelerator=accelerator, local_rank=local_rank)
+                else:
+                    loss = utils.mixco_nce(
+                        nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                        nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                        temp=0.006, perm=perm, betas=betas, select=select,
+                        distributed=distributed, accelerator=accelerator, local_rank=local_rank)
             else:
+                if not is_text:
+                    clip_target = clip_extractor.embed_image(image, apply_transforms=False).float()
+                    clip_trans = clip_extractor.embed_image(image, apply_transforms=True, apply_spatial_transforms=True).float()
+
                 epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
-                loss = utils.soft_clip_loss_all(
-                    nn.functional.normalize(clip_voxels, dim=-1), 
-                    nn.functional.normalize(clip_target, dim=-1),
-                    temp=epoch_temp,
-                    distributed=distributed, accelerator=accelerator)
+                if loss_type == 'all':
+                    loss = utils.soft_cont_loss_all(
+                        nn.functional.normalize(clip_voxels, dim=-1), 
+                        nn.functional.normalize(clip_target, dim=-1),
+                        nn.functional.normalize(clip_trans, dim=-1),
+                        temp=epoch_temp,
+                        distributed=distributed, accelerator=accelerator)
+                    # loss = utils.soft_clip_loss_all(
+                    #     nn.functional.normalize(clip_voxels, dim=-1), 
+                    #     nn.functional.normalize(clip_target, dim=-1),
+                    #     temp=epoch_temp,
+                    #     distributed=distributed, accelerator=accelerator)
+                else:
+                    loss = utils.soft_cont_loss(
+                        nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                        nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                        nn.functional.normalize(clip_trans.flatten(1), dim=-1),
+                        temp=epoch_temp,
+                        distributed=distributed, accelerator=accelerator)
+                
+
             if use_mse:
                 if epoch < int(mixup_pct * num_epochs):
                     # apply mse to non-mixed voxels only
-                    clip_target_mse = clip_extractor.embed_image(image[~select], training=False).float()
+                    clip_target_mse = clip_extractor.embed_image(image[~select], apply_transforms=False).float()
+                    if normed_mse:
+                        clip_target_mse = clip_target_mse/(clip_target_mse[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
                     mse_loss = F.mse_loss(clip_voxels[~select], clip_target_mse.float())
                 else:
-                    clip_target_mse = clip_extractor.embed_image(image, training=False).float()
+                    clip_target_mse = clip_target
+                    if normed_mse:
+                        clip_target_mse = clip_target_mse/(clip_target_mse[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
                     mse_loss = F.mse_loss(clip_voxels, clip_target_mse.float())
                 mse_losses.append(mse_loss.item())
             else:
@@ -531,7 +581,7 @@ if __name__ == '__main__':
                     clip_target = clip_extractor.embed_text(annots).float()
                 else:
                     # turn off augmentations during validation
-                    clip_target = clip_extractor.embed_image(image, training=False).float()
+                    clip_target = clip_extractor.embed_image(image, apply_transforms=False).float()
                 clip_target.to(voxel.dtype)
 
                 if distributed:
@@ -540,18 +590,32 @@ if __name__ == '__main__':
                     clip_voxels = voxel2clip(voxel)
 
                 if epoch < int(mixup_pct * num_epochs):
-                    val_loss = utils.mixco_nce_all(
-                        nn.functional.normalize(clip_voxels, dim=-1), 
-                        nn.functional.normalize(clip_target, dim=-1),
-                        temp=0.006, 
-                        distributed=distributed, accelerator=accelerator, local_rank=local_rank)
+                    if loss_type == 'all':
+                        val_loss = utils.mixco_nce_all(
+                            nn.functional.normalize(clip_voxels, dim=-1), 
+                            nn.functional.normalize(clip_target, dim=-1),
+                            temp=0.006, 
+                            distributed=distributed, accelerator=accelerator, local_rank=local_rank)
+                    else:
+                        val_loss = utils.mixco_nce(
+                            nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                            nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                            temp=0.006, 
+                            distributed=distributed, accelerator=accelerator, local_rank=local_rank)
                 else:
                     epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
-                    val_loss = utils.soft_clip_loss_all(
-                        nn.functional.normalize(clip_voxels, dim=-1), 
-                        nn.functional.normalize(clip_target, dim=-1),
-                        temp=epoch_temp, 
-                        distributed=distributed, accelerator=accelerator)
+                    if loss_type == 'all':
+                        val_loss = utils.soft_clip_loss_all(
+                            nn.functional.normalize(clip_voxels, dim=-1), 
+                            nn.functional.normalize(clip_target, dim=-1),
+                            temp=epoch_temp, 
+                            distributed=distributed, accelerator=accelerator)
+                    else:
+                        val_loss = utils.soft_clip_loss(
+                            nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                            nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                            temp=epoch_temp, 
+                            distributed=distributed, accelerator=accelerator)
                 utils.check_loss(val_loss)
 
                 val_losses.append(val_loss.item())
@@ -607,6 +671,7 @@ if __name__ == '__main__':
             if vd_pipe is not None:
                 if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
                     if (not save_at_end and n_samples_save > 0) or (save_at_end and epoch == num_epochs - 1):
+                        vd_pipe.to(device)
                         # training
                         grids,_ = utils.vd_sample_images(
                             clip_extractor, voxel2clip, vd_pipe, None,
@@ -626,6 +691,10 @@ if __name__ == '__main__':
                             grid.save(os.path.join(outdir, f'samples-val-{i:03d}.png'))
                         if wandb_log:
                             logs['val/samples'] = [wandb.Image(grid) for grid in grids]
+                    
+                        del grids
+                        vd_pipe.to('cpu')
+                        
             
             if args.wandb_log:
                 while True:
@@ -635,6 +704,9 @@ if __name__ == '__main__':
                     except:
                         print('Wandb log failed. Retrying')
                         time.sleep(1)
+            
+            del clip_voxels, clip_target, image, voxel
+            torch.cuda.empty_cache()
 
     if args.wandb_log and local_rank==0:
         wandb.finish()

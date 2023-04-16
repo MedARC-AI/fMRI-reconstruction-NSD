@@ -145,7 +145,10 @@ def soft_clip_loss_all(preds, targs, temp=0.125, distributed=False, accelerator=
 
 def soft_cont_loss(student_preds, teacher_preds, teacher_aug_preds, temp=0.125, distributed=True, accelerator=None):
     if not distributed:
-        raise NotImplementedError()
+        teacher_teacher_aug = (teacher_preds @ teacher_aug_preds.T)/temp
+        teacher_teacher_aug_t = teacher_teacher_aug.T
+        student_teacher_aug = (student_preds @ teacher_aug_preds.T)/temp
+        student_teacher_aug_t = student_teacher_aug.T
     else:
         all_student_preds, all_teacher_preds = gather_features(student_preds, teacher_preds, accelerator)
         all_teacher_aug_preds = gather_features(teacher_aug_preds, None, accelerator)
@@ -155,6 +158,19 @@ def soft_cont_loss(student_preds, teacher_preds, teacher_aug_preds, temp=0.125, 
         student_teacher_aug = (student_preds @ all_teacher_aug_preds.T)/temp
         student_teacher_aug_t = (teacher_aug_preds @ all_student_preds.T)/temp
     
+    loss1 = -(student_teacher_aug.log_softmax(-1) * teacher_teacher_aug.softmax(-1)).sum(-1).mean()
+    loss2 = -(student_teacher_aug_t.log_softmax(-1) * teacher_teacher_aug_t.softmax(-1)).sum(-1).mean()
+    
+    loss = (loss1 + loss2)/2
+    return loss
+
+def soft_cont_loss_all(student_preds, teacher_preds, teacher_aug_preds, temp=0.125, distributed=True, accelerator=None):
+    teacher_teacher_aug = torch.bmm(teacher_preds.permute(1,0,2), teacher_aug_preds.permute(1,2,0))/temp
+    teacher_teacher_aug_t = teacher_teacher_aug.permute(0, 2, 1)
+    student_teacher_aug = torch.bmm(student_preds.permute(1,0,2), teacher_aug_preds.permute(1,2,0))/temp
+    student_teacher_aug_t = student_teacher_aug.permute(0, 2, 1)
+
+
     loss1 = -(student_teacher_aug.log_softmax(-1) * teacher_teacher_aug.softmax(-1)).sum(-1).mean()
     loss2 = -(student_teacher_aug_t.log_softmax(-1) * teacher_teacher_aug_t.softmax(-1)).sum(-1).mean()
     
@@ -427,6 +443,145 @@ def get_dataloaders(
         val_data = val_data.compose(wds.DBCache, os.path.join(cache_dir, "cache-val.db"),  n_cache_recs)
 
     return train_dl, val_dl, num_train, num_val
+
+@torch.no_grad()
+def vd_sample_images(
+    clip_extractor, brain_net, vd_pipe, diffusion_prior, voxel, img_input, 
+    annotations=None,
+    num_inference_steps=50,
+    clip_guidance_scale=7.5,
+    vox_guidance_scale=7.5,
+    num_per_sample=4,
+    prior_timesteps=None,
+    seed=None,
+    verbose=True,
+    device='cuda',
+):
+
+    def null_sync(t, *args, **kwargs):
+        return [t]
+    
+    assert voxel.shape[0] == img_input.shape[0], 'batch dim must be the same for voxels and images'
+    n_examples = voxel.shape[0]
+
+    clip_extractor.eval()
+    brain_net.eval()
+    if diffusion_prior is not None:
+        diffusion_prior.eval()
+
+    if seed is not None:
+        # set seed
+        g_cuda = torch.Generator(device=device)
+        g_cuda.manual_seed(seed)
+
+    # for brain guided images (specific to 512 x 512 generation size)
+    latents = torch.randn([num_per_sample, 4, 64, 64], device=device, generator=g_cuda)
+    
+    # use the same latent as the first brain guided image for max similarity
+    # clip_latents = torch.randn([1, 4, 64, 64], device=device, generator=g_cuda)
+    clip_latents = latents[0].unsqueeze(0).clone()
+
+    grids = []
+
+    for idx in range(n_examples):
+        print('sampling for image', idx+1, 'of', n_examples, flush=True)
+
+        img_orig = img_input[[idx]]
+        image = clip_extractor.resize_image(img_orig)
+
+        # Original clip embedding: 
+        clip_image_emb = clip_extractor.embed_image(image, apply_transforms=False)
+        uncond_image = torch.zeros_like(image) + 0.5
+        uncond_image = clip_extractor.embed_image(uncond_image)
+        # uncond_image = torch.zeros_like(clip_image_emb)
+        if annotations is not None:
+            # @todo implement versatile's embed text from 
+            # https://github.com/huggingface/diffusers/blob/716286f19ddd9eb417113e064b538706884c8e73/src/diffusers/pipelines/versatile_diffusion/pipeline_versatile_diffusion_dual_guided.py#L184
+            print('Sampling with CLIP text guidance')
+            annots = select_annotations(annotations[[idx]], random=False)
+            clip_text_emb = clip_extractor.embed_text(annots)
+            # uncond_tokens = ""
+            # uncond_text = clip_extractor.embed_text(annots)
+            uncond_text = torch.zeros_like(clip_text_emb)
+        else:
+            clip_text_emb = torch.randn(1, 77, 768).to(clip_image_emb.device)
+            uncond_text = torch.zeros_like(clip_text_emb)
+
+        # Encode voxels to CLIP space
+        image_embeddings = brain_net(voxel[[idx]].to(device).float())
+        
+        # image_embeddings = nn.functional.normalize(image_embeddings, dim=-1) 
+        # image_embeddings *= clip_emb[1].norm()/image_embeddings.norm() # note: this is cheating to equate norm scaling
+
+        if diffusion_prior is not None:
+            image_embeddings = diffusion_prior.p_sample_loop(image_embeddings.shape, 
+                                                text_cond = dict(text_embed = image_embeddings), 
+                                                cond_scale = 1., timesteps = prior_timesteps,
+                                                generator=g_cuda
+                                                )
+        
+        # cls token norming
+        clip_image_emb = clip_image_emb/(clip_image_emb[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
+        image_embeddings = image_embeddings/(image_embeddings[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
+        uncond_image = uncond_image/(uncond_image[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
+
+        # duplicate the embedding to serve classifier free guidance
+        image_embeddings = image_embeddings.repeat(num_per_sample, 1, 1)
+        image_embeddings = torch.cat([uncond_image.repeat(num_per_sample, 1, 1), image_embeddings]).to(device)  # 8,257,768
+
+        # duplicate the embedding to serve classifier free guidance
+        clip_image_emb = torch.cat([uncond_image, clip_image_emb]).to(device).float()  # 2,257,768
+        if clip_text_emb is not None:
+            clip_text_emb = torch.cat([uncond_text, clip_text_emb]).to(device).float()
+
+        # TODO: passing sizes doesn't seem to work, so we're using None for now
+        # width, height = 256, 256
+        width, height = None, None
+
+        with torch.inference_mode(), torch.autocast(device):
+            # [1, 3, 512, 512]
+            img_clip = vd_pipe(
+                image_embeddings=clip_image_emb,
+                prompt_embeddings=clip_text_emb,
+                text_to_image_strength = 0.,
+                num_inference_steps=num_inference_steps,
+                num_images_per_prompt=1,
+                guidance_scale=clip_guidance_scale, 
+                latents=clip_latents,
+                width=width,
+                height=height,
+                generator=g_cuda,
+            )
+
+            # [4, 3, 512, 512]
+            imgs_brain = vd_pipe(
+                image_embeddings=image_embeddings,
+                prompt_embeddings=clip_text_emb.repeat(num_per_sample, 1, 1),
+                text_to_image_strength = 0.,
+                num_inference_steps=num_inference_steps,
+                num_images_per_prompt=num_per_sample,
+                guidance_scale=vox_guidance_scale,
+                latents=latents,
+                width=width,
+                height=height,
+                generator=g_cuda,
+            )
+
+            # print('img_clip.shape', img_clip.shape)
+            # print('imgs_brain.shape', imgs_brain.shape)
+        
+        # resizing for now since passing target sizes into sd_pipe doesn't work
+        size = (256, 256)
+        img_clip = nn.functional.interpolate(img_clip, size, mode="area", antialias=False)
+        imgs_brain = nn.functional.interpolate(imgs_brain, size, mode="area", antialias=False)
+        
+        imgs_all = torch.cat((img_orig.to(device), img_clip, imgs_brain), 0)
+        grid = torch_to_Image(
+            make_grid(imgs_all, nrow=2+4, padding=10).detach()
+        )
+        grids.append(grid)
+
+    return grids, None
 
 @torch.no_grad()
 def sample_images(
