@@ -15,7 +15,7 @@ from kornia.augmentation.container import AugmentationSequential
 
 import utils
 from utils import torch_to_matplotlib, torch_to_Image
-from models import Clipper, OpenClipper, BrainNetworkDETR, BrainDiffusionPrior, BrainSD, VersatileDiffusionPriorNetwork
+from models import Clipper, OpenClipper, BrainNetworkDETR2, BrainNetworkNoDETR, BrainDiffusionPrior, BrainVD, VersatileDiffusionPriorNetwork
 from model3d import SimpleVoxel3dConvEncoder
 
 import torch.distributed as dist
@@ -128,7 +128,7 @@ if __name__ == '__main__':
     batch_size = 32 if args.voxel_dims == 1 else 16
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
 
-    num_epochs = 250  # 350 if data_commit=='avg' else 120
+    num_epochs = 120  # 350 if data_commit=='avg' else 120
     lr_scheduler = 'cycle'
     initial_lr = 1e-3 #3e-5
     max_lr = 3e-4
@@ -147,7 +147,7 @@ if __name__ == '__main__':
 
     cache_dir = 'cache'
     n_cache_recs = 0
-    mixup_pct = 0.5
+    mixup_pct = 0.25
 
     resume_from_ckpt = False
     use_mse = False
@@ -155,7 +155,7 @@ if __name__ == '__main__':
     lr_scheduler = 'cycle'
     initial_lr = 5e-4 # only used if lr_scheduler is 'fixed'
     max_lr = 3e-4
-    alpha = 0.01
+    alpha = 30  # 100
 
     if args.outdir is None:
         # outdir = os.path.expanduser(f'../train_logs/models/{model_name}/test')
@@ -175,34 +175,43 @@ if __name__ == '__main__':
     num_workers = num_devices * 4
 
     if not args.disable_image_aug:
-        train_augs = AugmentationSequential(
-            # kornia.augmentation.RandomCrop((140, 140), p=0.3),
-            # kornia.augmentation.Resize((224, 224)),
-            kornia.augmentation.RandomResizedCrop((224,224), (0.8, 1), p=0.3),
-            kornia.augmentation.RandomHorizontalFlip(p=0.5),
-            kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.3),
-            kornia.augmentation.RandomGrayscale(p=0.3),
-            data_keys=["input"],
-            # random_apply = (1,4)
-        )
+        train_augs = [
+            AugmentationSequential(
+                kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
+                kornia.augmentation.RandomSolarize(p=0.2),
+                kornia.augmentation.RandomGrayscale(p=0.2),
+                data_keys=["input"],
+                # random_apply = (1,4)
+            ),
+            AugmentationSequential(
+                kornia.augmentation.RandomResizedCrop((224,224), (0.5, 1), p=0.5),
+                kornia.augmentation.RandomHorizontalFlip(p=0.5),
+                data_keys=["input"],
+                # random_apply = (1,4)
+            )
+        ]
     else:
         train_augs = None
 
-    sd_cache_dir = '/fsx/proj-medarc/fmri/atom/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc/'
-    sd_pipe =  BrainSD.from_pretrained(
+    vd_cache_dir = '/fsx/proj-medarc/fmri/cache/models--shi-labs--versatile-diffusion/snapshots/2926f8e11ea526b562cd592b099fcf9c2985d0b7'
+    vd_pipe =  BrainVD.from_pretrained(
         # "lambdalabs/sd-image-variations-diffusers",
-        sd_cache_dir,
-        revision="v2.0",
+        vd_cache_dir,
         safety_checker=None,
         requires_safety_checker=False,
-        torch_dtype=torch.float16, # fp16 is fine if we're not training this
-    ).to(device)
+        torch_dtype=torch.float32, # fp16 is fine if we're not training this
+    ).to("cpu")
 
-    assert sd_pipe.image_encoder.training == False
-    sd_pipe.unet.eval()
-    sd_pipe.unet.requires_grad_(False)
-    sd_pipe.vae.eval()
-    sd_pipe.vae.requires_grad_(False)
+    vd_pipe.text_encoder.eval()
+    vd_pipe.text_encoder.requires_grad_(False)
+    vd_pipe.image_encoder.eval()
+    vd_pipe.image_encoder.requires_grad_(False)
+    vd_pipe.text_unet.eval()
+    vd_pipe.text_unet.requires_grad_(False)
+    vd_pipe.image_unet.eval()
+    vd_pipe.image_unet.requires_grad_(False)
+    vd_pipe.vae.eval()
+    vd_pipe.vae.requires_grad_(False)
 
     num_devices = torch.cuda.device_count()
     if num_devices==0: num_devices = 1
@@ -301,8 +310,10 @@ if __name__ == '__main__':
 
     if voxel_dims == 1: # 1D data
         # voxel2clip_kwargs = dict(out_dim=768, norm_type='bn')
-        voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False)
-        voxel2clip = BrainNetworkDETR(**voxel2clip_kwargs)
+        # voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False)
+        # voxel2clip = BrainNetworkDETR(**voxel2clip_kwargs)
+        voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=257, use_projector=False)
+        voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
     elif args.voxel_dims == 3: # 3D data
         voxel2clip_kwargs = dict(
             out_dim=out_dim,
@@ -328,7 +339,9 @@ if __name__ == '__main__':
         dim=out_dim,
         depth=depth,
         dim_head=dim_head,
-        heads=heads
+        heads=heads,
+        causal=False,
+        use_learned_queries=False
     ).to(device)
 
     # custom version that can fix seeds
@@ -488,8 +501,12 @@ if __name__ == '__main__':
                 annots = utils.select_annotations(subj01_annots[trial], random=True)
                 clip_target = clip_extractor.embed_text(annots).float()
             else:
-                clip_target = clip_extractor.embed_image(image).float()
+                clip_target = clip_extractor.embed_image(image, apply_transforms=False).float()
+                apply_spatial_transforms = epoch >= int(mixup_pct * num_epochs)
+                clip_trans = clip_extractor.embed_image(image, apply_transforms=True, 
+                    apply_spatial_transforms=apply_spatial_transforms).float()
             clip_target.to(voxel.dtype)
+            clip_trans.to(voxel.dtype)
 
             # mixup diffusion targets as well
             if epoch < int(mixup_pct * num_epochs):
@@ -497,20 +514,22 @@ if __name__ == '__main__':
                 clip_target_prior = clip_target * betas.reshape(*betas_shape) + clip_target[perm] * (1-betas.reshape(*betas_shape))
             else:
                 clip_target_prior = clip_target
+            clip_target_prior = clip_target_prior/(clip_target_prior[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
             loss, pred, clip_voxels = diffusion_prior(image_embed=clip_target_prior, voxel=voxel)
 
             # distributed is not implemented for _all loss functions
             if epoch < int(mixup_pct * num_epochs):
-                loss_nce = utils.mixco_nce_all(
-                    nn.functional.normalize(clip_voxels, dim=-1), 
-                    nn.functional.normalize(clip_target, dim=-1),
+                loss_nce = utils.mixco_nce(
+                    nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                    nn.functional.normalize(clip_trans.flatten(1), dim=-1),
                     temp=0.006, perm=perm, betas=betas, select=select,
                     distributed=distributed, accelerator=accelerator, local_rank=local_rank)
             else:
                 epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
-                loss_nce = utils.soft_clip_loss_all(
-                    nn.functional.normalize(clip_voxels, dim=-1), 
-                    nn.functional.normalize(clip_target, dim=-1),
+                loss_nce = utils.soft_cont_loss(
+                    nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                    nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                    nn.functional.normalize(clip_trans.flatten(1), dim=-1),
                     temp=epoch_temp,
                     distributed=distributed, accelerator=accelerator)
 
@@ -519,7 +538,7 @@ if __name__ == '__main__':
             
             # MSE and NCE are weighted equally at the beginning,
             # with alpha=0.01 we'll have something like .01*300 + .99*3 = 3 + 3
-            loss = alpha * loss + (1-alpha) * loss_nce
+            loss = alpha * loss + loss_nce
             utils.check_loss(loss)
             losses.append(loss.item())
             lrs.append(optimizer.param_groups[0]['lr'])
@@ -563,24 +582,29 @@ if __name__ == '__main__':
                         annots = utils.select_annotations(subj01_annots[trial], random=False)
                         clip_target = clip_extractor.embed_text(annots).float()
                     else:
-                        clip_target = clip_extractor.embed_image(image).float()
+                        clip_target = clip_extractor.embed_image(image, apply_transforms=False).float()
                     clip_target.to(voxel.dtype)
-                    loss, pred, clip_voxels = diffusion_prior(image_embed=clip_target, voxel=voxel)
+                    loss, pred, clip_voxels = diffusion_prior(
+                        image_embed=clip_target/(clip_target[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6),
+                        voxel=voxel
+                    )
                     if epoch < int(mixup_pct * num_epochs):
-                        loss_nce = utils.mixco_nce_all(
-                            nn.functional.normalize(clip_voxels, dim=-1), 
-                            nn.functional.normalize(clip_target, dim=-1),
-                            temp=0.006, distributed=False, accelerator=accelerator, local_rank=local_rank)
+                        loss_nce = utils.mixco_nce(
+                            nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                            nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                            temp=0.006, 
+                            distributed=distributed, accelerator=accelerator, local_rank=local_rank)
                     else:
                         epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
-                        loss_nce = utils.soft_clip_loss_all(
-                            nn.functional.normalize(clip_voxels, dim=-1), 
-                            nn.functional.normalize(clip_target, dim=-1),
-                            temp=epoch_temp, distributed=False, accelerator=accelerator)
+                        loss_nce = utils.soft_clip_loss(
+                            nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                            nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                            temp=epoch_temp, 
+                            distributed=distributed, accelerator=accelerator)
 
                     val_loss_nce_sum += loss_nce.item()
                     val_loss_prior_sum += loss.item()
-                    val_loss = alpha * loss + (1-alpha) * loss_nce
+                    val_loss = alpha * loss + loss_nce
                     val_losses.append(val_loss.item())
 
                     if distributed:
@@ -594,7 +618,6 @@ if __name__ == '__main__':
                     val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target.flatten(1), clip_voxels.flatten(1)), labels, k=1).item()
                     # brain, clip
                     val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels.flatten(1), clip_target.flatten(1)), labels, k=1).item()
-
             if ckpt_saving:
                 # save best model
                 val_loss = np.mean(val_losses[-(val_i+1):])
@@ -626,20 +649,23 @@ if __name__ == '__main__':
                     "val/val_fwd_pct_correct": val_fwd_percent_correct / (val_i + 1),
                     "val/val_bwd_pct_correct": val_bwd_percent_correct / (val_i + 1),
                     "train/loss_nce": loss_nce_sum / (train_i + 1),
-                    "train/loss_prior": loss_prior_sum / (train_i + 1),
+                    "train/mse_loss": loss_prior_sum / (train_i + 1),
                     "val/loss_nce": val_loss_nce_sum / (val_i + 1),
-                    "val/loss_prior": val_loss_prior_sum / (val_i + 1),
-                    "train/alpha": alpha,
+                    "val/mse_loss": val_loss_prior_sum / (val_i + 1),
+                    # "train/alpha": alpha,
                 }
             progress_bar.set_postfix(**logs)
 
             # sample some images
-            if sd_pipe is not None:
+            if vd_pipe is not None:
                 if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
                     if (not save_at_end and n_samples_save > 0) or (save_at_end and epoch == num_epochs - 1):
                         # training
-                        grids,_ = utils.sample_images(
-                            clip_extractor, diffusion_prior.voxel2clip, sd_pipe, diffusion_prior,
+                        vd_pipe.to(device)
+                        vd_pipe.to(torch.float16)
+                        # training
+                        grids,_ = utils.vd_sample_images(
+                            clip_extractor, diffusion_prior.voxel2clip, vd_pipe, diffusion_prior,
                             voxel0[:n_samples_save], image0[:n_samples_save], seed=42,
                         )
                         for i, grid in enumerate(grids):
@@ -648,14 +674,18 @@ if __name__ == '__main__':
                             logs['train/samples'] = [wandb.Image(grid) for grid in grids]
 
                         # validation
-                        grids,_ = utils.sample_images(
-                            clip_extractor, diffusion_prior.voxel2clip, sd_pipe, diffusion_prior,
+                        grids,_ = utils.vd_sample_images(
+                            clip_extractor, diffusion_prior.voxel2clip, vd_pipe, diffusion_prior,
                             val_voxel0[:n_samples_save], val_image0[:n_samples_save], seed=42,
                         )
                         for i, grid in enumerate(grids):
                             grid.save(os.path.join(outdir, f'samples-val-{i:03d}.png'))
                         if wandb_log:
                             logs['val/samples'] = [wandb.Image(grid) for grid in grids]
+                    
+                        del grids
+                        vd_pipe.to(torch.float32)
+                        vd_pipe.to('cpu')
             
             if args.wandb_log:
                 while True:
@@ -665,6 +695,9 @@ if __name__ == '__main__':
                     except:
                         print('Wandb log failed. Retrying')
                         time.sleep(1)
+            
+            del clip_voxels, clip_target, image, voxel
+            torch.cuda.empty_cache()
 
     if args.wandb_log and local_rank==0:
         wandb.finish()

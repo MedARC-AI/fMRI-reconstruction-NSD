@@ -221,7 +221,7 @@ if __name__ == '__main__':
             vd_cache_dir,
             safety_checker=None,
             requires_safety_checker=False,
-            torch_dtype=torch.float16, # fp16 is fine if we're not training this
+            torch_dtype=torch.float32, # fp16 is fine if we're not training this
         ).to("cpu")
 
         vd_pipe.text_encoder.eval()
@@ -708,6 +708,7 @@ if __name__ == '__main__':
                 if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
                     if (not save_at_end and n_samples_save > 0) or (save_at_end and epoch == num_epochs - 1):
                         vd_pipe.to(device)
+                        vd_pipe.to(torch.float16)
                         # training
                         grids,_ = utils.vd_sample_images(
                             clip_extractor, module, vd_pipe, None,
@@ -729,6 +730,7 @@ if __name__ == '__main__':
                             logs['val/samples'] = [wandb.Image(grid) for grid in grids]
                     
                         del grids
+                        vd_pipe.to(torch.float32)
                         vd_pipe.to('cpu')
                         
             
