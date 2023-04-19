@@ -108,11 +108,17 @@ def parse_args():
         type=str,
         default="all",
         choices=["all", "flatten"],
-        help="output location",
+        help="loss type",
+    )
+    parser.add_argument(
+        "--ckpt_path",
+        type=str,
+        default=None
     )
     return parser.parse_args()
 
 if __name__ == '__main__':
+    # raise ValueError()
     args = parse_args()
     print('args', args)
 
@@ -133,7 +139,7 @@ if __name__ == '__main__':
     batch_size = 300 if args.voxel_dims == 1 else 128
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
 
-    num_epochs = 400  # 400  # 250  # 350 if data_commit=='avg' else 120
+    num_epochs = 240  # 400  # 250  # 350 if data_commit=='avg' else 120
     lr_scheduler = 'cycle'
     initial_lr = 1e-3 #3e-5
     max_lr = 3e-4
@@ -154,8 +160,9 @@ if __name__ == '__main__':
     n_cache_recs = 0
     mixup_pct = 0.25
 
-    resume_from_ckpt = False
+    resume_from_ckpt = args.ckpt_path is not None
     use_mse = args.use_mse
+    use_projector = False  # True
     normed_mse = True
     loss_type = args.cont_loss_type
 
@@ -216,6 +223,17 @@ if __name__ == '__main__':
             requires_safety_checker=False,
             torch_dtype=torch.float16, # fp16 is fine if we're not training this
         ).to("cpu")
+
+        vd_pipe.text_encoder.eval()
+        vd_pipe.text_encoder.requires_grad_(False)
+        vd_pipe.image_encoder.eval()
+        vd_pipe.image_encoder.requires_grad_(False)
+        vd_pipe.text_unet.eval()
+        vd_pipe.text_unet.requires_grad_(False)
+        vd_pipe.image_unet.eval()
+        vd_pipe.image_unet.requires_grad_(False)
+        vd_pipe.vae.eval()
+        vd_pipe.vae.requires_grad_(False)
     else:
         vd_pipe = None
 
@@ -318,7 +336,7 @@ if __name__ == '__main__':
         # voxel2clip_kwargs = dict(out_dim=768, norm_type='bn')
         # voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=64)
         # voxel2clip = BrainNetworkDETR2(**voxel2clip_kwargs)
-        voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=257)
+        voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=257, use_projector=use_mse and use_projector)
         voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
     elif args.voxel_dims == 3: # 3D data
         voxel2clip_kwargs = dict(
@@ -426,20 +444,26 @@ if __name__ == '__main__':
     voxel0 = image0 = val_voxel0 = val_image0 = None
 
     # Optionally resume from checkpoint #
-    # if resume_from_ckpt:
-    #     print("\n---resuming from ckpt_path---\n",ckpt_path)
-    #     checkpoint = torch.load(ckpt_path, map_location=device)
-    #     epoch = checkpoint['epoch']
-    #     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    #     try:
-    #         voxel2clip.load_state_dict(checkpoint['model_state_dict'])
-    #     except:
-    #         state_dict = checkpoint['model_state_dict']
-    #         for key in list(state_dict.keys()):
-    #             if 'module.' in key:
-    #                 state_dict[key.replace('module.', '')] = state_dict[key]
-    #                 del state_dict[key]
-    #         voxel2clip.load_state_dict(state_dict)
+    if resume_from_ckpt:
+        print("\n---resuming from ckpt_path---\n",args.ckpt_path)
+        checkpoint = torch.load(args.ckpt_path, map_location=device)
+        epoch = checkpoint['epoch']+1
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        try:
+            voxel2clip.load_state_dict(checkpoint['model_state_dict'])
+        except:
+            state_dict = checkpoint['model_state_dict']
+            for key in list(state_dict.keys()):
+                if 'module.' in key:
+                    state_dict[key.replace('module.', '')] = state_dict[key]
+                    del state_dict[key]
+            voxel2clip.load_state_dict(state_dict)
+        global_batch_size = batch_size * num_devices
+        total_steps_done = epoch*(num_train//global_batch_size)
+        for _ in range(total_steps_done):
+            lr_scheduler.step()
+        del checkpoint
+        torch.cuda.empty_cache()
 
     progress_bar = tqdm(range(epoch,num_epochs), disable=(local_rank!=0))
     for epoch in progress_bar:
@@ -477,7 +501,12 @@ if __name__ == '__main__':
                 trial = trial.cpu().numpy()
                 annots = utils.select_annotations(subj01_annots[trial], random=True)
                 clip_target = clip_extractor.embed_text(annots).float()
-            clip_voxels = voxel2clip(voxel)
+            
+            if voxel2clip.use_projector:
+                clip_voxels_mse, clip_voxels = voxel2clip(voxel)
+            else:
+                clip_voxels = voxel2clip(voxel)
+                clip_voxels_mse = clip_voxels
 
             if epoch < int(mixup_pct * num_epochs):
                 if not is_text:
@@ -528,12 +557,14 @@ if __name__ == '__main__':
                     clip_target_mse = clip_extractor.embed_image(image[~select], apply_transforms=False).float()
                     if normed_mse:
                         clip_target_mse = clip_target_mse/(clip_target_mse[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
-                    mse_loss = F.mse_loss(clip_voxels[~select], clip_target_mse.float())
+                        # clip_voxels_mse = clip_voxels_mse/(clip_voxels_mse[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
+                    mse_loss = F.mse_loss(clip_voxels_mse[~select], clip_target_mse.float()) * (3000 if normed_mse else 30)
                 else:
                     clip_target_mse = clip_target
                     if normed_mse:
                         clip_target_mse = clip_target_mse/(clip_target_mse[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
-                    mse_loss = F.mse_loss(clip_voxels, clip_target_mse.float())
+                        # clip_voxels_mse = clip_voxels_mse/(clip_voxels_mse[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
+                    mse_loss = F.mse_loss(clip_voxels_mse, clip_target_mse.float()) * (3000 if normed_mse else 30)
                 mse_losses.append(mse_loss.item())
             else:
                 mse_loss = 0
@@ -585,9 +616,14 @@ if __name__ == '__main__':
                 clip_target.to(voxel.dtype)
 
                 if distributed:
-                    clip_voxels = voxel2clip.module(voxel)
+                    module = voxel2clip.module
                 else:
-                    clip_voxels = voxel2clip(voxel)
+                    module = voxel2clip
+                
+                if module.use_projector:
+                    _, clip_voxels = module(voxel)
+                else:
+                    clip_voxels = module(voxel)
 
                 if epoch < int(mixup_pct * num_epochs):
                     if loss_type == 'all':
@@ -674,7 +710,7 @@ if __name__ == '__main__':
                         vd_pipe.to(device)
                         # training
                         grids,_ = utils.vd_sample_images(
-                            clip_extractor, voxel2clip, vd_pipe, None,
+                            clip_extractor, module, vd_pipe, None,
                             voxel0[:n_samples_save], image0[:n_samples_save], seed=42,
                         )
                         for i, grid in enumerate(grids):
@@ -684,7 +720,7 @@ if __name__ == '__main__':
 
                         # validation
                         grids,_ = utils.vd_sample_images(
-                            clip_extractor, voxel2clip, vd_pipe, None,
+                            clip_extractor, module, vd_pipe, None,
                             val_voxel0[:n_samples_save], val_image0[:n_samples_save], seed=42,
                         )
                         for i, grid in enumerate(grids):

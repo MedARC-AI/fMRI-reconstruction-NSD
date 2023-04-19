@@ -492,7 +492,7 @@ def vd_sample_images(
         # Original clip embedding: 
         clip_image_emb = clip_extractor.embed_image(image, apply_transforms=False)
         uncond_image = torch.zeros_like(image) + 0.5
-        uncond_image = clip_extractor.embed_image(uncond_image)
+        uncond_image = clip_extractor.embed_image(uncond_image, apply_transforms=False)
         # uncond_image = torch.zeros_like(clip_image_emb)
         if annotations is not None:
             # @todo implement versatile's embed text from 
@@ -509,10 +509,13 @@ def vd_sample_images(
 
         # Encode voxels to CLIP space
         image_embeddings = brain_net(voxel[[idx]].to(device).float())
+        if brain_net.use_projector:
+            # tuple of mse embeds and contrastive embeds
+            image_embeddings = image_embeddings[0]
+        
         
         # image_embeddings = nn.functional.normalize(image_embeddings, dim=-1) 
         # image_embeddings *= clip_emb[1].norm()/image_embeddings.norm() # note: this is cheating to equate norm scaling
-
         if diffusion_prior is not None:
             image_embeddings = diffusion_prior.p_sample_loop(image_embeddings.shape, 
                                                 text_cond = dict(text_embed = image_embeddings), 

@@ -18,7 +18,7 @@ import json
 from dalle2_pytorch.train_configs import DiffusionPriorNetworkConfig
 
 # FOr VD prior
-from dalle2_pytorch.dalle2_pytorch import RotaryEmbedding, CausalTransformer, SinusoidalPosEmb, MLP, Rearrange, repeat, rearrange, prob_mask_like
+from dalle2_pytorch.dalle2_pytorch import RotaryEmbedding, CausalTransformer, SinusoidalPosEmb, MLP, Rearrange, repeat, rearrange, prob_mask_like, LayerNorm, RelPosBias, Attention, FeedForward
 
 # for pipeline
 from diffusers import StableDiffusionImageVariationPipeline, VersatileDiffusionDualGuidedPipeline
@@ -150,14 +150,16 @@ class Clipper(torch.nn.Module):
         """Expects images in -1 to 1 range"""
         if self.transforms is not None and apply_transforms:
             if isinstance(self.transforms, list):
+                # clip_emb = self.transforms[0](image.cpu())
                 clip_emb = self.transforms[0](image)
                 if apply_spatial_transforms:
+                    # clip_emb = self.transforms[1](clip_emb.cpu())
                     clip_emb = self.transforms[1](clip_emb)
             else:
                 clip_emb = self.transforms(image)
         else:
             clip_emb = image
-        clip_emb = self.resize_image(clip_emb)
+        clip_emb = self.resize_image(clip_emb.to(self.device))
         clip_emb = self.normalize(clip_emb)
         
         if self.clip_variant=="ViT-L/14" and self.hidden_state:
@@ -296,7 +298,7 @@ class BrainNetworkDETR(BrainNetwork):
 class BrainNetworkDETR2(BrainNetwork):
     # 182M
     def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4, norm_type='bn', act_first=True, 
-                encoder_tokens=8, decoder_tokens=257):
+                encoder_tokens=8, decoder_tokens=257, use_projector=False):
         # encoder
         super().__init__(out_dim*encoder_tokens, in_dim, h, n_blocks, norm_type, act_first)
         self.norm = nn.LayerNorm(out_dim)
@@ -315,6 +317,19 @@ class BrainNetworkDETR2(BrainNetwork):
             nn.GELU(),
             nn.Linear(out_dim, out_dim)
         )
+        self.use_projector = use_projector
+        if use_projector:
+            self.projector = nn.Sequential(
+                nn.LayerNorm(out_dim),
+                nn.GELU(),
+                nn.Linear(out_dim, 2048),
+                nn.LayerNorm(2048),
+                nn.GELU(),
+                nn.Linear(2048, 2048),
+                nn.LayerNorm(2048),
+                nn.GELU(),
+                nn.Linear(2048, out_dim)
+            )
 
 
     def forward(self, x):
@@ -323,12 +338,14 @@ class BrainNetworkDETR2(BrainNetwork):
 
         dec = self.transformer(self.queries.expand(x.shape[0], -1, -1), enc)
         dec = self.decoder_projector(dec)
+        if self.use_projector:
+            return dec, self.projector(dec)
         return dec
 
 class BrainNetworkNoDETR(BrainNetwork):
     # 950M
     def __init__(self, out_dim=768, in_dim=15724, h=4096, n_blocks=4, norm_type='bn', act_first=True, 
-                encoder_tokens=257, decoder_tokens=257):
+                encoder_tokens=257, decoder_tokens=257, use_projector=False):
         # encoder
         super().__init__(out_dim*encoder_tokens, in_dim, h, n_blocks, norm_type, act_first)
         # self.norm = nn.LayerNorm(out_dim)
@@ -347,13 +364,77 @@ class BrainNetworkNoDETR(BrainNetwork):
         #     nn.GELU(),
         #     nn.Linear(out_dim, out_dim)
         # )
+        self.use_projector = use_projector
+        if use_projector:
+            self.projector = nn.Sequential(
+                nn.LayerNorm(out_dim),
+                nn.GELU(),
+                nn.Linear(out_dim, 2048),
+                nn.LayerNorm(2048),
+                nn.GELU(),
+                nn.Linear(2048, 2048),
+                nn.LayerNorm(2048),
+                nn.GELU(),
+                nn.Linear(2048, out_dim)
+            )
+
 
 
     def forward(self, x):
         enc = super().forward(x)
         enc = enc.reshape(enc.shape[0], self.encoder_tokens, -1)
+        if self.use_projector:
+            return enc, self.projector(enc)
         return enc
 
+class FlaggedCausalTransformer(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        depth,
+        dim_head = 64,
+        heads = 8,
+        ff_mult = 4,
+        norm_in = False,
+        norm_out = True,
+        attn_dropout = 0.,
+        ff_dropout = 0.,
+        final_proj = True,
+        normformer = False,
+        rotary_emb = True,
+        causal=True
+    ):
+        super().__init__()
+        self.init_norm = LayerNorm(dim) if norm_in else nn.Identity() # from latest BLOOM model and Yandex's YaLM
+
+        self.rel_pos_bias = RelPosBias(heads = heads)
+
+        rotary_emb = RotaryEmbedding(dim = min(32, dim_head)) if rotary_emb else None
+
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                Attention(dim = dim, causal = causal, dim_head = dim_head, heads = heads, dropout = attn_dropout, rotary_emb = rotary_emb),
+                FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout, post_activation_norm = normformer)
+            ]))
+
+        self.norm = LayerNorm(dim, stable = True) if norm_out else nn.Identity()  # unclear in paper whether they projected after the classic layer norm for the final denoised image embedding, or just had the transformer output it directly: plan on offering both options
+        self.project_out = nn.Linear(dim, dim, bias = False) if final_proj else nn.Identity()
+
+    def forward(self, x):
+        n, device = x.shape[1], x.device
+
+        x = self.init_norm(x)
+
+        attn_bias = self.rel_pos_bias(n, n + 1, device = device)
+
+        for attn, ff in self.layers:
+            x = attn(x, attn_bias = attn_bias) + x
+            x = ff(x) + x
+
+        out = self.norm(x)
+        return self.project_out(out)
 
 class VersatileDiffusionPriorNetwork(nn.Module):
     def __init__(
@@ -365,22 +446,24 @@ class VersatileDiffusionPriorNetwork(nn.Module):
         # num_brain_embeds = 1,
         num_tokens = 257,
         self_cond = False,
+        causal = True,
+        use_learned_queries = True,
         **kwargs
     ):
         super().__init__()
         self.dim = dim
-
         self.num_time_embeds = num_time_embeds
-
         self.continuous_embedded_time = not exists(num_timesteps)
+        self.use_learned_queries = use_learned_queries
 
         self.to_time_embeds = nn.Sequential(
             nn.Embedding(num_timesteps, dim * num_time_embeds) if exists(num_timesteps) else nn.Sequential(SinusoidalPosEmb(dim), MLP(dim, dim * num_time_embeds)), # also offer a continuous version of timestep embeddings, with a 2 layer MLP
             Rearrange('b (n d) -> b n d', n = num_time_embeds)
         )
 
-        self.learned_query = nn.Parameter(torch.randn(num_tokens, dim))
-        self.causal_transformer = CausalTransformer(dim = dim, **kwargs)
+        if self.use_learned_queries:
+            self.learned_query = nn.Parameter(torch.randn(num_tokens, dim))
+        self.causal_transformer = FlaggedCausalTransformer(dim = dim, causal=causal, **kwargs)
 
         self.null_brain_embeds = nn.Parameter(torch.randn(num_tokens, dim))
         self.null_image_embed = nn.Parameter(torch.randn(num_tokens, dim))
@@ -460,11 +543,12 @@ class VersatileDiffusionPriorNetwork(nn.Module):
             diffusion_timesteps = diffusion_timesteps.type(dtype)
         time_embed = self.to_time_embeds(diffusion_timesteps)
 
-        learned_queries = repeat(self.learned_query, 'n d -> b n d', b = batch)
-
-        if self.self_cond:
-            learned_queries = torch.cat((self_cond, learned_queries), dim = -2)
-
+        if self.use_learned_queries:
+            learned_queries = repeat(self.learned_query, 'n d -> b n d', b = batch)
+            if self.self_cond:
+                learned_queries = torch.cat((self_cond, learned_queries), dim = -2)
+        else:
+            learned_queries = torch.empty((batch, 0, dim), device=brain_embed.device)
         tokens = torch.cat((
             brain_embed,  # 257
             time_embed,  # 1
@@ -476,7 +560,7 @@ class VersatileDiffusionPriorNetwork(nn.Module):
         tokens = self.causal_transformer(tokens)
 
         # get learned query, which should predict the image embedding (per DDPM timestep)
-        pred_image_embed = tokens[..., -257:, :]
+        pred_image_embed = tokens[..., -self.num_tokens:, :]
 
         return pred_image_embed
 
