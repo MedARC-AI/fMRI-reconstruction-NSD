@@ -146,6 +146,7 @@ class Clipper(torch.nn.Module):
             align_corners=False, antialias=True
         )
 
+    @torch.no_grad()
     def embed_image(self, image, apply_transforms=True, apply_spatial_transforms=True):
         """Expects images in -1 to 1 range"""
         if self.transforms is not None and apply_transforms:
@@ -445,33 +446,36 @@ class VersatileDiffusionPriorNetwork(nn.Module):
         # num_image_embeds = 1,
         # num_brain_embeds = 1,
         num_tokens = 257,
-        self_cond = False,
         causal = True,
-        use_learned_queries = True,
+        learned_query_mode = 'none',
         **kwargs
     ):
         super().__init__()
         self.dim = dim
         self.num_time_embeds = num_time_embeds
         self.continuous_embedded_time = not exists(num_timesteps)
-        self.use_learned_queries = use_learned_queries
+        self.learned_query_mode = learned_query_mode
 
         self.to_time_embeds = nn.Sequential(
             nn.Embedding(num_timesteps, dim * num_time_embeds) if exists(num_timesteps) else nn.Sequential(SinusoidalPosEmb(dim), MLP(dim, dim * num_time_embeds)), # also offer a continuous version of timestep embeddings, with a 2 layer MLP
             Rearrange('b (n d) -> b n d', n = num_time_embeds)
         )
 
-        if self.use_learned_queries:
+        if self.learned_query_mode == 'token':
             self.learned_query = nn.Parameter(torch.randn(num_tokens, dim))
+        if self.learned_query_mode == 'pos_emb':
+            scale = dim ** -0.5
+            self.learned_query = nn.Parameter(torch.randn(num_tokens, dim) * scale)
+        if self.learned_query_mode == 'all_pos_emb':
+            scale = dim ** -0.5
+            self.learned_query = nn.Parameter(torch.randn(num_tokens*2+1, dim) * scale)
         self.causal_transformer = FlaggedCausalTransformer(dim = dim, causal=causal, **kwargs)
 
         self.null_brain_embeds = nn.Parameter(torch.randn(num_tokens, dim))
         self.null_image_embed = nn.Parameter(torch.randn(num_tokens, dim))
 
-        # whether to use self conditioning, Hinton's group's new ddpm technique
-
-        self.self_cond = self_cond
         self.num_tokens = num_tokens
+        self.self_cond = False
 
     def forward_with_cond_scale(
         self,
@@ -492,9 +496,9 @@ class VersatileDiffusionPriorNetwork(nn.Module):
         image_embed,
         diffusion_timesteps,
         *,
+        self_cond=None,
         brain_embed=None,
         text_embed=None,
-        self_cond = None,
         brain_cond_drop_prob = 0.,
         text_cond_drop_prob = None,
         image_cond_drop_prob = 0.
@@ -506,10 +510,6 @@ class VersatileDiffusionPriorNetwork(nn.Module):
         
         batch, _, dim, device, dtype = *image_embed.shape, image_embed.device, image_embed.dtype
         # num_time_embeds, num_image_embeds, num_brain_embeds = self.num_time_embeds, self.num_image_embeds, self.num_brain_embeds
-
-        # setup self conditioning
-        if self.self_cond:
-            self_cond = default(self_cond, lambda: torch.zeros(batch, self.num_tokens, self.dim, device = device, dtype = dtype))
         
         # classifier free guidance masks
         brain_keep_mask = prob_mask_like((batch,), 1 - brain_cond_drop_prob, device = device)
@@ -543,18 +543,26 @@ class VersatileDiffusionPriorNetwork(nn.Module):
             diffusion_timesteps = diffusion_timesteps.type(dtype)
         time_embed = self.to_time_embeds(diffusion_timesteps)
 
-        if self.use_learned_queries:
+        if self.learned_query_mode == 'token':
             learned_queries = repeat(self.learned_query, 'n d -> b n d', b = batch)
-            if self.self_cond:
-                learned_queries = torch.cat((self_cond, learned_queries), dim = -2)
+        elif self.learned_query_mode == 'pos_emb':
+            pos_embs = repeat(self.learned_query, 'n d -> b n d', b = batch)
+            image_embed = image_embed + pos_embs
+            learned_queries = torch.empty((batch, 0, dim), device=brain_embed.device)
+        elif self.learned_query_mode == 'all_pos_emb':
+            pos_embs = repeat(self.learned_query, 'n d -> b n d', b = batch)
+            learned_queries = torch.empty((batch, 0, dim), device=brain_embed.device)
         else:
             learned_queries = torch.empty((batch, 0, dim), device=brain_embed.device)
+        
         tokens = torch.cat((
             brain_embed,  # 257
             time_embed,  # 1
             image_embed,  # 257
             learned_queries  # 257
         ), dim = -2)
+        if self.learned_query_mode == 'all_pos_emb':
+            tokens = tokens + pos_embs
 
         # attend
         tokens = self.causal_transformer(tokens)
@@ -667,7 +675,13 @@ class BrainDiffusionPrior(DiffusionPrior):
         if exists(voxel):
             assert exists(self.voxel2clip), 'voxel2clip must be trained if you wish to pass in voxels'
             assert not exists(text_embed), 'cannot pass in both text and voxels'
-            text_embed = self.voxel2clip(voxel)
+            if self.voxel2clip.use_projector:
+                clip_voxels_mse, clip_voxels = self.voxel2clip(voxel)
+                text_embed = clip_voxels_mse
+            else:
+                clip_voxels = self.voxel2clip(voxel)
+                text_embed = clip_voxels_mse = clip_voxels
+            # text_embed = self.voxel2clip(voxel)
 
         if exists(image):
             image_embed, _ = self.clip.embed_image(image)
@@ -696,7 +710,7 @@ class BrainDiffusionPrior(DiffusionPrior):
 
         loss, pred = self.p_losses(image_embed, times, text_cond = text_cond, *args, **kwargs)
 
-        return loss, pred, text_embed
+        return loss, pred, (clip_voxels_mse, clip_voxels)
    
     @staticmethod
     def from_pretrained(net_kwargs={}, prior_kwargs={}, voxel2clip_path=None, ckpt_dir='./checkpoints'):

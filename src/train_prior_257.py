@@ -98,6 +98,45 @@ def parse_args():
         default=None,
         help="output location",
     )
+    parser.add_argument(
+        "--learned_query_mode",
+        type=str,
+        default="pos_emb",
+        choices=["none", "token", "pos_emb", "all_pos_emb"],
+        help="output location",
+    )
+    parser.add_argument(
+        "--no_normed_mse",
+        action="store_true",
+        help="output location",
+    )
+    parser.add_argument(
+        "--cont_loss_type",
+        type=str,
+        default="flatten",
+        choices=["all", "flatten"],
+        help="loss type",
+    )
+    parser.add_argument(
+        "--full_train_set",
+        action="store_true",
+        help="whether to disable image augmentation (only used for modality=image)",
+    )
+    parser.add_argument(
+        "--v2c_projector",
+        action="store_true",
+        help="whether to disable image augmentation (only used for modality=image)",
+    )
+    parser.add_argument(
+        "--pretrained_v2c",
+        action="store_true",
+        help="whether to disable image augmentation (only used for modality=image)",
+    )
+    parser.add_argument(
+        "--ckpt_path",
+        type=str,
+        default=None
+    )
     return parser.parse_args()
 
 if __name__ == '__main__':
@@ -147,15 +186,24 @@ if __name__ == '__main__':
 
     cache_dir = 'cache'
     n_cache_recs = 0
-    mixup_pct = 0.25
+    mixup_pct = 0.25 if num_epochs == 120 else 0.125
+    loss_type = args.cont_loss_type
+    
+    normed_mse = not args.no_normed_mse
+    learned_query_mode = args.learned_query_mode
+    pretrained_v2c = args.pretrained_v2c
+    use_projector = args.v2c_projector  # True
+    use_full_trainset = args.full_train_set
 
-    resume_from_ckpt = False
-    use_mse = False
+    resume_from_ckpt = args.ckpt_path is not None
 
     lr_scheduler = 'cycle'
     initial_lr = 5e-4 # only used if lr_scheduler is 'fixed'
     max_lr = 3e-4
-    alpha = 30  # 100
+    if normed_mse:
+        alpha = 30  # 100
+    else:
+        alpha = 3  # 0.1
 
     if args.outdir is None:
         # outdir = os.path.expanduser(f'../train_logs/models/{model_name}/test')
@@ -254,6 +302,10 @@ if __name__ == '__main__':
         if data_commit == 'avg':
             train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj{subj_id}_{{0..17}}.tar"
             val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj{subj_id}_0.tar"
+            if pretrained_v2c or use_full_trainset:
+                train_url = "{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj01_{0..17}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj01_0.tar}"
+                val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/test/test_subj01_{0..1}.tar"
+                meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/metadata_subj01.json"
         elif data_commit == 'indiv':
             train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/train/train_subj{subj_id}_{{0..49}}.tar"
             val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/val/val_subj{subj_id}_0.tar"
@@ -284,6 +336,10 @@ if __name__ == '__main__':
         voxels_key=voxels_key,
         local_rank=local_rank,
     )
+    if pretrained_v2c or use_full_trainset:
+        # combines train and val so meta is not valid anymore
+        num_train = 8559 + 300
+        num_val = 982
 
     if voxel_dims == 3:
         import nibabel as nib
@@ -310,10 +366,24 @@ if __name__ == '__main__':
 
     if voxel_dims == 1: # 1D data
         # voxel2clip_kwargs = dict(out_dim=768, norm_type='bn')
-        # voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False)
-        # voxel2clip = BrainNetworkDETR(**voxel2clip_kwargs)
-        voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=257, use_projector=False)
-        voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
+        if pretrained_v2c:
+            voxel2clip_kwargs = dict(out_dim=out_dim, encoder_tokens=257)
+            voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
+        else:
+            voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=257, use_projector=use_projector)
+            voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
+
+        if pretrained_v2c:
+            checkpoint = torch.load(
+                "/fsx/proj-medarc/fmri/paulscotti/fMRI-reconstruction-NSD/train_logs/v2c_v2/last.pth", 
+                map_location=device
+            )
+            try:
+                voxel2clip.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            except:
+                print(traceback.format_exc())
+            del checkpoint
+
     elif args.voxel_dims == 3: # 3D data
         voxel2clip_kwargs = dict(
             out_dim=out_dim,
@@ -341,7 +411,7 @@ if __name__ == '__main__':
         dim_head=dim_head,
         heads=heads,
         causal=False,
-        use_learned_queries=False
+        learned_query_mode=learned_query_mode
     ).to(device)
 
     # custom version that can fix seeds
@@ -356,10 +426,18 @@ if __name__ == '__main__':
     ).to(device)
     
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-    opt_grouped_parameters = [
-        {'params': [p for n, p in diffusion_prior.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 1e-2},
-        {'params': [p for n, p in diffusion_prior.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-    ]
+    if pretrained_v2c:
+        opt_grouped_parameters = [
+            {'params': [p for n, p in diffusion_prior.net.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 1e-2},
+            {'params': [p for n, p in diffusion_prior.net.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0},
+            {'params': [p for n, p in diffusion_prior.voxel2clip.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 1e-2},
+            {'params': [p for n, p in diffusion_prior.voxel2clip.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+        ]
+    else:
+        opt_grouped_parameters = [
+            {'params': [p for n, p in diffusion_prior.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 1e-2},
+            {'params': [p for n, p in diffusion_prior.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+        ]
     optimizer = torch.optim.AdamW(opt_grouped_parameters, lr=initial_lr) # lr doesnt get used if lr_scheduler='cycle'
 
     if lr_scheduler == 'fixed':
@@ -369,7 +447,7 @@ if __name__ == '__main__':
         total_steps = num_epochs*(num_train//global_batch_size)
         lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, 
-            max_lr=max_lr,
+            max_lr=[max_lr, max_lr, max_lr/5, max_lr/5] if pretrained_v2c else max_lr,
             total_steps=total_steps,
             final_div_factor=1000,
             last_epoch=-1, pct_start=2/num_epochs
@@ -445,20 +523,18 @@ if __name__ == '__main__':
     voxel0 = image0 = val_voxel0 = val_image0 = None
 
     # Optionally resume from checkpoint #
-    # if resume_from_ckpt:
-    #     print("\n---resuming from ckpt_path---\n",ckpt_path)
-    #     checkpoint = torch.load(ckpt_path, map_location=device)
-    #     epoch = checkpoint['epoch']
-    #     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    #     try:
-    #         voxel2clip.load_state_dict(checkpoint['model_state_dict'])
-    #     except:
-    #         state_dict = checkpoint['model_state_dict']
-    #         for key in list(state_dict.keys()):
-    #             if 'module.' in key:
-    #                 state_dict[key.replace('module.', '')] = state_dict[key]
-    #                 del state_dict[key]
-    #         voxel2clip.load_state_dict(state_dict)
+    if resume_from_ckpt:
+        print("\n---resuming from ckpt_path---\n",args.ckpt_path)
+        checkpoint = torch.load(args.ckpt_path, map_location=device)
+        epoch = checkpoint['epoch']+1
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])        
+        diffusion_prior.load_state_dict(checkpoint['model_state_dict'])
+        global_batch_size = batch_size * num_devices
+        total_steps_done = epoch*(num_train//global_batch_size)
+        for _ in range(total_steps_done):
+            lr_scheduler.step()
+        del checkpoint
+        torch.cuda.empty_cache()
 
     progress_bar = tqdm(range(epoch,num_epochs), disable=(local_rank!=0))
     for epoch in progress_bar:
@@ -514,25 +590,40 @@ if __name__ == '__main__':
                 clip_target_prior = clip_target * betas.reshape(*betas_shape) + clip_target[perm] * (1-betas.reshape(*betas_shape))
             else:
                 clip_target_prior = clip_target
-            clip_target_prior = clip_target_prior/(clip_target_prior[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
-            loss, pred, clip_voxels = diffusion_prior(image_embed=clip_target_prior, voxel=voxel)
+            if normed_mse:
+                clip_target_prior = clip_target_prior/(clip_target_prior[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
+            loss, pred, (clip_voxels_mse, clip_voxels) = diffusion_prior(image_embed=clip_target_prior, voxel=voxel)
 
             # distributed is not implemented for _all loss functions
             if epoch < int(mixup_pct * num_epochs):
-                loss_nce = utils.mixco_nce(
-                    nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
-                    nn.functional.normalize(clip_trans.flatten(1), dim=-1),
-                    temp=0.006, perm=perm, betas=betas, select=select,
-                    distributed=distributed, accelerator=accelerator, local_rank=local_rank)
+                if loss_type == 'all':
+                    loss_nce = utils.mixco_nce_all(
+                        nn.functional.normalize(clip_voxels, dim=-1), 
+                        nn.functional.normalize(clip_target, dim=-1),
+                        temp=0.006, perm=perm, betas=betas, select=select,
+                        distributed=distributed, accelerator=accelerator, local_rank=local_rank)
+                else:
+                    loss_nce = utils.mixco_nce(
+                        nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                        nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                        temp=0.006, perm=perm, betas=betas, select=select,
+                        distributed=distributed, accelerator=accelerator, local_rank=local_rank)
             else:
                 epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
-                loss_nce = utils.soft_cont_loss(
-                    nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
-                    nn.functional.normalize(clip_target.flatten(1), dim=-1),
-                    nn.functional.normalize(clip_trans.flatten(1), dim=-1),
-                    temp=epoch_temp,
-                    distributed=distributed, accelerator=accelerator)
-
+                if loss_type == 'all':
+                    loss_nce = utils.soft_cont_loss_all(
+                        nn.functional.normalize(clip_voxels, dim=-1), 
+                        nn.functional.normalize(clip_target, dim=-1),
+                        nn.functional.normalize(clip_trans, dim=-1),
+                        temp=epoch_temp,
+                        distributed=distributed, accelerator=accelerator)
+                else:
+                    loss_nce = utils.soft_cont_loss(
+                        nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                        nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                        nn.functional.normalize(clip_trans.flatten(1), dim=-1),
+                        temp=epoch_temp,
+                        distributed=distributed, accelerator=accelerator)
             loss_nce_sum += loss_nce.item()
             loss_prior_sum += loss.item()
             
@@ -551,8 +642,12 @@ if __name__ == '__main__':
 
             # forward and backward top 1 accuracy
             labels = torch.arange(len(clip_target)).to(device)
-            fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target.flatten(1), clip_voxels.flatten(1)), labels, k=1).item()
-            bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels.flatten(1), clip_target.flatten(1)), labels, k=1).item()
+            if loss_type == 'all':
+                fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_target, clip_voxels), labels, k=1).item()
+                bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_voxels, clip_target), labels, k=1).item()
+            else:
+                fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target.flatten(1), clip_voxels.flatten(1)), labels, k=1).item()
+                bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels.flatten(1), clip_target.flatten(1)), labels, k=1).item()
 
             accelerator.backward(loss)
             optimizer.step()
@@ -584,23 +679,43 @@ if __name__ == '__main__':
                     else:
                         clip_target = clip_extractor.embed_image(image, apply_transforms=False).float()
                     clip_target.to(voxel.dtype)
-                    loss, pred, clip_voxels = diffusion_prior(
-                        image_embed=clip_target/(clip_target[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6),
+                    if normed_mse:
+                        clip_target_prior = clip_target/(clip_target[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
+                    else:
+                        clip_target_prior = clip_target
+                    loss, pred, (clip_voxels_mse, clip_voxels) = diffusion_prior(
+                        image_embed=clip_target_prior,
                         voxel=voxel
                     )
                     if epoch < int(mixup_pct * num_epochs):
-                        loss_nce = utils.mixco_nce(
-                            nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
-                            nn.functional.normalize(clip_target.flatten(1), dim=-1),
-                            temp=0.006, 
-                            distributed=distributed, accelerator=accelerator, local_rank=local_rank)
+                        if loss_type == 'all':
+                            loss_nce = utils.mixco_nce_all(
+                                nn.functional.normalize(clip_voxels, dim=-1), 
+                                nn.functional.normalize(clip_target, dim=-1),
+                                temp=0.006,
+                                distributed=distributed, accelerator=accelerator, local_rank=local_rank)
+                        else:
+                            loss_nce = utils.mixco_nce(
+                                nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                                nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                                temp=0.006,
+                                distributed=distributed, accelerator=accelerator, local_rank=local_rank)
                     else:
                         epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
-                        loss_nce = utils.soft_clip_loss(
-                            nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
-                            nn.functional.normalize(clip_target.flatten(1), dim=-1),
-                            temp=epoch_temp, 
-                            distributed=distributed, accelerator=accelerator)
+                        if loss_type == 'all':
+                            loss_nce = utils.soft_cont_loss_all(
+                                nn.functional.normalize(clip_voxels, dim=-1), 
+                                nn.functional.normalize(clip_target, dim=-1),
+                                nn.functional.normalize(clip_trans, dim=-1),
+                                temp=epoch_temp,
+                                distributed=distributed, accelerator=accelerator)
+                        else:
+                            loss_nce = utils.soft_cont_loss(
+                                nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                                nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                                nn.functional.normalize(clip_trans.flatten(1), dim=-1),
+                                temp=epoch_temp,
+                                distributed=distributed, accelerator=accelerator)
 
                     val_loss_nce_sum += loss_nce.item()
                     val_loss_prior_sum += loss.item()
@@ -614,10 +729,12 @@ if __name__ == '__main__':
                         val_sims_base += F.cosine_similarity(clip_target,clip_voxels,dim=-1).mean().item()
 
                     labels = torch.arange(len(clip_target)).to(device)
-                    # clip, brain
-                    val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target.flatten(1), clip_voxels.flatten(1)), labels, k=1).item()
-                    # brain, clip
-                    val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels.flatten(1), clip_target.flatten(1)), labels, k=1).item()
+                    if loss_type == 'all':
+                        val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_target, clip_voxels), labels, k=1).item()
+                        val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_voxels, clip_target), labels, k=1).item()
+                    else:
+                        val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target.flatten(1), clip_voxels.flatten(1)), labels, k=1).item()
+                        val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels.flatten(1), clip_target.flatten(1)), labels, k=1).item()
             if ckpt_saving:
                 # save best model
                 val_loss = np.mean(val_losses[-(val_i+1):])
@@ -661,6 +778,8 @@ if __name__ == '__main__':
                 if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
                     if (not save_at_end and n_samples_save > 0) or (save_at_end and epoch == num_epochs - 1):
                         # training
+                        del clip_voxels, clip_voxels_mse, clip_target, image, voxel, pred, clip_target_prior
+                        torch.cuda.empty_cache()
                         vd_pipe.to(device)
                         vd_pipe.to(torch.float16)
                         # training
@@ -696,7 +815,10 @@ if __name__ == '__main__':
                         print('Wandb log failed. Retrying')
                         time.sleep(1)
             
-            del clip_voxels, clip_target, image, voxel
+            try:
+                del clip_voxels, clip_voxels_mse, clip_target, image, voxel, pred, clip_target_prior
+            except:
+                pass
             torch.cuda.empty_cache()
 
     if args.wandb_log and local_rank==0:
