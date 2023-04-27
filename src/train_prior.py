@@ -38,7 +38,7 @@ if __name__ == '__main__':
     image_embed_scale = None
     # image_embed_scale = 1.0
     condition_on_text_encodings = False
-    clip_aug_mode = 'x' #  ('x', 'y', 'n')
+    clip_aug_mode = 'n' #  ('x', 'y', 'n')
     clip_aug_prob = 0.3
     # how many samples from train and val to save
     n_samples_save = 8
@@ -51,7 +51,7 @@ if __name__ == '__main__':
     # -----------------------------------------------------------------------------
     # params for all models
     seed = 0
-    batch_size = 128
+    batch_size = 12
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
     num_devices = torch.cuda.device_count()
     num_workers = num_devices
@@ -59,7 +59,7 @@ if __name__ == '__main__':
     lr_scheduler = 'cycle'
     initial_lr = 1e-3 #3e-5
     max_lr = 3e-4
-    wandb_log = True
+    wandb_log = False
     wandb_project = 'laion-fmri'
     wandb_run_name = ''
     wandb_notes = ''
@@ -80,7 +80,7 @@ if __name__ == '__main__':
     utils.seed_everything(seed)
 
     assert clip_aug_mode in ('x', 'y', 'n')
-    assert n_aug_save <= batch_size
+    # assert n_aug_save <= batch_size
     
     if modality == "text":
         image_var = "trial"
@@ -103,8 +103,10 @@ if __name__ == '__main__':
         json.dump(config, f, indent=2)
 
     # load SD image variation pipeline
+    sd_cache_dir = '/fsx/proj-medarc/fmri/atom/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc/'
     sd_pipe = BrainSD.from_pretrained(
-        "lambdalabs/sd-image-variations-diffusers", 
+        # "lambdalabs/sd-image-variations-diffusers", 
+        sd_cache_dir,
         revision="v2.0",
         safety_checker=None,
         requires_safety_checker=False,
@@ -118,7 +120,7 @@ if __name__ == '__main__':
 
     # load clipper - don't L2 norm the extracted CLIP embeddings since we want the prior 
     # to learn un-normed embeddings for usage with the SD image variation pipeline
-    clip_extractor = Clipper(clip_variant, clamp_embs=clamp_embs, norm_embs=False)
+    clip_extractor = Clipper(clip_variant, clamp_embs=clamp_embs, norm_embs=False, device=device)
 
     # # load COCO annotations curated in the same way as the mind_reader (Lin Sprague Singh) preprint
     # f = h5py.File('/scratch/gpfs/KNORMAN/nsdgeneral_hdf5/COCO_73k_subj_indices.hdf5', 'r')
@@ -132,14 +134,15 @@ if __name__ == '__main__':
         train_url, val_url = utils.get_huggingface_urls(data_commit)
     else:
         # local paths
-        train_url = "/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/train/train_subj01_{0..49}.tar"
-        val_url = "/scratch/gpfs/KNORMAN/webdataset_nsd/webdataset_split/val/val_subj01_0.tar"
+        train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_train/train_subj01_{{0..49}}.tar"
+        val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_val/val_subj01_0.tar"
 
-    train_dl, val_dl = utils.get_dataloaders(
+    train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
         batch_size, image_var, 
         num_workers=num_workers,
         train_url=train_url,
         val_url=val_url,
+        to_tuple=["voxels", "images"]
     )
 
     # get first batches
@@ -157,12 +160,12 @@ if __name__ == '__main__':
         brain_net = brain_net.to(device)
 
     # Loading checkpoint
-    print("ckpt_path", ckpt_path)
-    checkpoint = torch.load(ckpt_path, map_location=device)    
-    if 'model_state_dict' in checkpoint:
-        brain_net.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        brain_net.load_state_dict(checkpoint)
+    # print("ckpt_path", ckpt_path)
+    # checkpoint = torch.load(ckpt_path, map_location=device)    
+    # if 'model_state_dict' in checkpoint:
+    #     brain_net.load_state_dict(checkpoint['model_state_dict'])
+    # else:
+    #     brain_net.load_state_dict(checkpoint)
         
     brain_net.eval()
     brain_net.requires_grad_(False)
@@ -279,11 +282,13 @@ if __name__ == '__main__':
         loss_on_aug, loss_off_aug = [], []
         image_aug = None
 
+        # import pdb; pdb.set_trace()
         for train_i, (voxel, image) in enumerate(train_dl):
             optimizer.zero_grad()
             image = image.to(device)
             clip_embed = brain_net(voxel.to(device).float())
             image_clip = clip_extractor.embed_image(image).float()
+            # image_clip = 
 
             if clip_aug_mode == 'x':
                 # the target y is fixed, and we will change the input x
@@ -326,7 +331,7 @@ if __name__ == '__main__':
                     loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
                     loss_off_aug.append(loss.item())
             else:
-                loss, pred = diffusion_prior(text_embed=clip_embed, image_embed=image_clip)
+                loss, pred = diffusion_prior(text_embed=clip_embed[:, None].expand(-1, 257, -1).clone(), image_embed=image_clip[:, None].expand(-1, 257, -1).clone())
 
             loss.backward()
             optimizer.step()
@@ -337,7 +342,8 @@ if __name__ == '__main__':
             lrs.append(optimizer.param_groups[0]['lr'])
             sims.append(F.cosine_similarity(image_clip, pred).mean().item())
             sims_base.append(F.cosine_similarity(image_clip, clip_embed).mean().item())
-            
+            break
+        import pdb; pdb.set_trace()
         diffusion_prior.eval()
         for val_i, (val_voxel, val_image) in enumerate(val_dl):    
             with torch.no_grad(): 

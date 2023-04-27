@@ -137,7 +137,65 @@ def parse_args():
         type=str,
         default=None
     )
+    parser.add_argument(
+        "--cont_loss_cands",
+        choices=["none", "v2c", "prior", "v2c_prior"],
+        default=None
+    )
+    parser.add_argument(
+        "--mse_loss_cands",
+        choices=["prior", "v2c_prior"],
+        default=None
+    )
     return parser.parse_args()
+
+def do_contrastive_loss(clip_voxels, clip_target, temp, mixco, training, loss_type,
+                        perm=None, betas=None, select=None, distributed=False, accelerator=None, 
+                        local_rank=0, clip_trans=None):
+    if mixco:
+        if loss_type == 'all':
+            loss_nce = utils.mixco_nce_all(
+                nn.functional.normalize(clip_voxels, dim=-1), 
+                nn.functional.normalize(clip_target, dim=-1),
+                temp=temp, perm=perm, betas=betas, select=select,
+                distributed=distributed, accelerator=accelerator, local_rank=local_rank)
+        else:
+            loss_nce = utils.mixco_nce(
+                nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                temp=temp, perm=perm, betas=betas, select=select,
+                distributed=distributed, accelerator=accelerator, local_rank=local_rank)
+    else:
+        if loss_type == 'all':
+            if training:
+                 loss_nce = utils.soft_cont_loss_all(
+                    nn.functional.normalize(clip_voxels, dim=-1), 
+                    nn.functional.normalize(clip_target, dim=-1),
+                    nn.functional.normalize(clip_trans, dim=-1),
+                    temp=temp,
+                    distributed=distributed, accelerator=accelerator)
+            else:
+                loss_nce = utils.soft_clip_loss_all(
+                    nn.functional.normalize(clip_voxels, dim=-1), 
+                    nn.functional.normalize(clip_target, dim=-1),
+                    temp=temp,
+                    distributed=distributed, accelerator=accelerator)
+        else:
+            if training:
+                loss_nce = utils.soft_cont_loss(
+                    nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                    nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                    nn.functional.normalize(clip_trans.flatten(1), dim=-1),
+                    temp=temp,
+                    distributed=distributed, accelerator=accelerator)
+            else:
+                loss_nce = utils.soft_clip_loss(
+                    nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                    nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                    temp=temp,
+                    distributed=distributed, accelerator=accelerator)
+    return loss_nce
+
 
 if __name__ == '__main__':
     # Multi-GPU config #
@@ -594,41 +652,54 @@ if __name__ == '__main__':
                 clip_target_prior = clip_target_prior/(clip_target_prior[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
             loss, pred, (clip_voxels_mse, clip_voxels) = diffusion_prior(image_embed=clip_target_prior, voxel=voxel)
 
-            # distributed is not implemented for _all loss functions
+            # distributed is not implemented for "_all" loss functions
             if epoch < int(mixup_pct * num_epochs):
-                if loss_type == 'all':
-                    loss_nce = utils.mixco_nce_all(
-                        nn.functional.normalize(clip_voxels, dim=-1), 
-                        nn.functional.normalize(clip_target, dim=-1),
-                        temp=0.006, perm=perm, betas=betas, select=select,
-                        distributed=distributed, accelerator=accelerator, local_rank=local_rank)
-                else:
-                    loss_nce = utils.mixco_nce(
-                        nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
-                        nn.functional.normalize(clip_target.flatten(1), dim=-1),
-                        temp=0.006, perm=perm, betas=betas, select=select,
-                        distributed=distributed, accelerator=accelerator, local_rank=local_rank)
+                loss_nce = torch.tensor(0.).to(device)
+                if 'v2c' in args.cont_loss_cands:
+                    loss_nce += do_contrastive_loss(
+                        clip_voxels, clip_trans, 0.006, mixco=True, training=True, 
+                        loss_type=loss_type,
+                        perm=perm, betas=betas, select=select, 
+                        distributed=distributed, accelerator=accelerator, 
+                        local_rank=local_rank, clip_trans=None
+                    )
+                if 'prior' in args.cont_loss_cands:
+                    loss_nce += do_contrastive_loss(
+                        pred, clip_trans, 0.006, mixco=True, training=True, 
+                        loss_type=loss_type,
+                        perm=perm, betas=betas, select=select, 
+                        distributed=distributed, accelerator=accelerator, 
+                        local_rank=local_rank, clip_trans=None
+                    )
             else:
                 epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
-                if loss_type == 'all':
-                    loss_nce = utils.soft_cont_loss_all(
-                        nn.functional.normalize(clip_voxels, dim=-1), 
-                        nn.functional.normalize(clip_target, dim=-1),
-                        nn.functional.normalize(clip_trans, dim=-1),
-                        temp=epoch_temp,
-                        distributed=distributed, accelerator=accelerator)
-                else:
-                    loss_nce = utils.soft_cont_loss(
-                        nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
-                        nn.functional.normalize(clip_target.flatten(1), dim=-1),
-                        nn.functional.normalize(clip_trans.flatten(1), dim=-1),
-                        temp=epoch_temp,
-                        distributed=distributed, accelerator=accelerator)
+                loss_nce = torch.tensor(0.).to(device)
+                if 'v2c' in args.cont_loss_cands:
+                    loss_nce += do_contrastive_loss(
+                        clip_voxels, clip_target, epoch_temp, mixco=False, training=True, 
+                        loss_type=loss_type,
+                        perm=None, betas=None, select=None, 
+                        distributed=distributed, accelerator=accelerator, 
+                        local_rank=local_rank, clip_trans=clip_trans
+                    )
+                if 'prior' in args.cont_loss_cands:
+                    loss_nce += do_contrastive_loss(
+                        pred, clip_target, epoch_temp, mixco=False, training=True, 
+                        loss_type=loss_type,
+                        perm=None, betas=None, select=None, 
+                        distributed=distributed, accelerator=accelerator, 
+                        local_rank=local_rank, clip_trans=clip_trans
+                    )
+
+            if 'v2c' in args.mse_loss_cands:
+                loss += 1000 * F.mse_loss(
+                    clip_voxels_mse,
+                    clip_target/(clip_target[:, 0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
+                )
+
             loss_nce_sum += loss_nce.item()
             loss_prior_sum += loss.item()
             
-            # MSE and NCE are weighted equally at the beginning,
-            # with alpha=0.01 we'll have something like .01*300 + .99*3 = 3 + 3
             loss = alpha * loss + loss_nce
             utils.check_loss(loss)
             losses.append(loss.item())
@@ -688,35 +759,43 @@ if __name__ == '__main__':
                         voxel=voxel
                     )
                     if epoch < int(mixup_pct * num_epochs):
-                        if loss_type == 'all':
-                            loss_nce = utils.mixco_nce_all(
-                                nn.functional.normalize(clip_voxels, dim=-1), 
-                                nn.functional.normalize(clip_target, dim=-1),
-                                temp=0.006,
-                                distributed=distributed, accelerator=accelerator, local_rank=local_rank)
-                        else:
-                            loss_nce = utils.mixco_nce(
-                                nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
-                                nn.functional.normalize(clip_target.flatten(1), dim=-1),
-                                temp=0.006,
-                                distributed=distributed, accelerator=accelerator, local_rank=local_rank)
+                        loss_nce = torch.tensor(0.).to(device)
+                        if 'v2c' in args.cont_loss_cands:
+                            loss_nce += do_contrastive_loss(
+                                clip_voxels, clip_target, 0.006, mixco=True, training=False,
+                                loss_type=loss_type,
+                                perm=None, betas=None, select=None, 
+                                distributed=distributed, accelerator=accelerator, 
+                                local_rank=local_rank, clip_trans=None
+                            )
+                        if 'prior' in args.cont_loss_cands:
+                            loss_nce += do_contrastive_loss(
+                                pred, clip_target, 0.006, mixco=True, training=False,
+                                loss_type=loss_type,
+                                perm=None, betas=None, select=None, 
+                                distributed=distributed, accelerator=accelerator, 
+                                local_rank=local_rank, clip_trans=None
+                            )
                     else:
                         epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
-                        if loss_type == 'all':
-                            loss_nce = utils.soft_cont_loss_all(
-                                nn.functional.normalize(clip_voxels, dim=-1), 
-                                nn.functional.normalize(clip_target, dim=-1),
-                                nn.functional.normalize(clip_trans, dim=-1),
-                                temp=epoch_temp,
-                                distributed=distributed, accelerator=accelerator)
-                        else:
-                            loss_nce = utils.soft_cont_loss(
-                                nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
-                                nn.functional.normalize(clip_target.flatten(1), dim=-1),
-                                nn.functional.normalize(clip_trans.flatten(1), dim=-1),
-                                temp=epoch_temp,
-                                distributed=distributed, accelerator=accelerator)
-
+                        loss_nce = torch.tensor(0.).to(device)
+                        if 'v2c' in args.cont_loss_cands:
+                            loss_nce += do_contrastive_loss(
+                                clip_voxels, clip_target, epoch_temp, mixco=False, training=False,
+                                loss_type=loss_type,
+                                perm=None, betas=None, select=None, 
+                                distributed=distributed, accelerator=accelerator, 
+                                local_rank=local_rank, clip_trans=None
+                            )
+                        if 'prior' in args.cont_loss_cands:
+                            loss_nce += do_contrastive_loss(
+                                pred, clip_target, epoch_temp, mixco=False, training=False,
+                                loss_type=loss_type,
+                                perm=None, betas=None, select=None, 
+                                distributed=distributed, accelerator=accelerator, 
+                                local_rank=local_rank, clip_trans=None
+                            )
+                    
                     val_loss_nce_sum += loss_nce.item()
                     val_loss_prior_sum += loss.item()
                     val_loss = alpha * loss + loss_nce

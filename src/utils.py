@@ -108,12 +108,18 @@ def topk(similarities,labels,k=5):
         topsum += torch.sum(torch.argsort(similarities,axis=1)[:,-(i+1)] == labels)/len(labels)
     return topsum
 
-def gather_features(image_features, voxel_features, accelerator):  
-    all_image_features = accelerator.gather(image_features)
-    if voxel_features is not None:
-        all_voxel_features = accelerator.gather(voxel_features)
-        return all_image_features, all_voxel_features
-    return all_image_features
+def gather_features(image_features, voxel_features, accelerator):
+    if accelerator is not None:  
+        all_image_features = accelerator.gather(image_features)
+        if voxel_features is not None:
+            all_voxel_features = accelerator.gather(voxel_features)
+            return all_image_features, all_voxel_features
+    else:
+        all_image_features = torch.cat(torch.distributed.nn.all_gather(image_features), dim=0)
+        if voxel_features is not None:
+            all_voxel_features = torch.cat(torch.distributed.nn.all_gather(voxel_features), dim=0)
+            return all_image_features, all_voxel_features
+        return all_image_features
 
 def soft_clip_loss(preds, targs, temp=0.125, distributed=False, accelerator=None):
     if not distributed:

@@ -710,7 +710,8 @@ class BrainDiffusionPrior(DiffusionPrior):
 
         loss, pred = self.p_losses(image_embed, times, text_cond = text_cond, *args, **kwargs)
 
-        return loss, pred, (clip_voxels_mse, clip_voxels)
+        # return denormalized pred, diff model learns to predict normalized pred
+        return loss, pred/self.image_embed_scale, (clip_voxels_mse, clip_voxels)
    
     @staticmethod
     def from_pretrained(net_kwargs={}, prior_kwargs={}, voxel2clip_path=None, ckpt_dir='./checkpoints'):

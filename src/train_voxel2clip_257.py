@@ -139,7 +139,7 @@ if __name__ == '__main__':
     batch_size = 300 if args.voxel_dims == 1 else 128
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
 
-    num_epochs = 240  # 400  # 250  # 350 if data_commit=='avg' else 120
+    num_epochs = 120  # 400  # 250  # 350 if data_commit=='avg' else 120
     lr_scheduler = 'cycle'
     initial_lr = 1e-3 #3e-5
     max_lr = 3e-4
@@ -150,7 +150,7 @@ if __name__ == '__main__':
     wandb_notes = ''
     first_batch = False
     ckpt_saving = True
-    ckpt_interval = 25  # 10
+    ckpt_interval = 10  # 10
     use_mp = False
     distributed = False
     save_at_end = False
@@ -158,7 +158,8 @@ if __name__ == '__main__':
 
     cache_dir = 'cache'
     n_cache_recs = 0
-    mixup_pct = 0.25
+    mixup_pct = 0.5
+    use_full_trainset = True
 
     resume_from_ckpt = args.ckpt_path is not None
     use_mse = args.use_mse
@@ -278,6 +279,10 @@ if __name__ == '__main__':
         if data_commit == 'avg':
             train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj{subj_id}_{{0..17}}.tar"
             val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj{subj_id}_0.tar"
+            if use_full_trainset:
+                train_url = "{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj01_{0..17}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj01_0.tar}"
+                val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/test/test_subj01_{0..1}.tar"
+                meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/metadata_subj01.json"
         elif data_commit == 'indiv':
             train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/train/train_subj{subj_id}_{{0..49}}.tar"
             val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/val/val_subj{subj_id}_0.tar"
@@ -308,6 +313,10 @@ if __name__ == '__main__':
         voxels_key=voxels_key,
         local_rank=local_rank,
     )
+    if use_full_trainset:
+        # combines train and val so meta is not valid anymore
+        num_train = 8559 + 300
+        num_val = 982
 
     if voxel_dims == 3:
         import nibabel as nib
@@ -666,10 +675,12 @@ if __name__ == '__main__':
                     val_sims_base += F.cosine_similarity(clip_target,clip_voxels,dim=-1).mean().item()
 
                 labels = torch.arange(len(clip_target)).to(device)
-                # clip, brain
-                val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_target, clip_voxels), labels, k=1).item()
-                # brain, clip
-                val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_voxels, clip_target), labels, k=1).item()
+                if loss_type == 'all':
+                    fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_target, clip_voxels), labels, k=1).item()
+                    bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_voxels, clip_target), labels, k=1).item()
+                else:
+                    fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target.flatten(1), clip_voxels.flatten(1)), labels, k=1).item()
+                    bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels.flatten(1), clip_target.flatten(1)), labels, k=1).item()
 
         if local_rank == 0:
             if ckpt_saving:
