@@ -115,6 +115,16 @@ def parse_args():
         type=str,
         default=None
     )
+    parser.add_argument(
+        "--mixup_pct",
+        type=float,
+        default=0.5
+    )
+    parser.add_argument(
+        "--bidir_mixco",
+        action="store_true",
+        help="make mixco bidirectional"
+    )
     return parser.parse_args()
 
 if __name__ == '__main__':
@@ -158,7 +168,8 @@ if __name__ == '__main__':
 
     cache_dir = 'cache'
     n_cache_recs = 0
-    mixup_pct = 0.5
+    mixup_pct = args.mixup_pct  # 0.5
+    bidir_mixco = args.bidir_mixco
     use_full_trainset = True
 
     resume_from_ckpt = args.ckpt_path is not None
@@ -190,21 +201,31 @@ if __name__ == '__main__':
 
     if not args.disable_image_aug:
         # [color augs, spartial_augs]
-        train_augs = [
-            AugmentationSequential(
-                kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
-                kornia.augmentation.RandomSolarize(p=0.2),
-                kornia.augmentation.RandomGrayscale(p=0.2),
-                data_keys=["input"],
-                # random_apply = (1,4)
-            ),
-            AugmentationSequential(
-                kornia.augmentation.RandomResizedCrop((224,224), (0.5, 1), p=0.5),
-                kornia.augmentation.RandomHorizontalFlip(p=0.5),
-                data_keys=["input"],
-                # random_apply = (1,4)
-            )
-        ]
+        # train_augs = [
+        #     AugmentationSequential(
+        #         kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
+        #         kornia.augmentation.RandomSolarize(p=0.2),
+        #         kornia.augmentation.RandomGrayscale(p=0.2),
+        #         data_keys=["input"],
+        #         # random_apply = (1,4)
+        #     ),
+        #     AugmentationSequential(
+        #         kornia.augmentation.RandomResizedCrop((224,224), (0.5, 1), p=0.5),
+        #         kornia.augmentation.RandomHorizontalFlip(p=0.5),
+        #         data_keys=["input"],
+        #         # random_apply = (1,4)
+        #     )
+        # ]
+        train_augs = AugmentationSequential(
+            # kornia.augmentation.RandomCrop((140, 140), p=0.3),
+            # kornia.augmentation.Resize((224, 224)),
+            kornia.augmentation.RandomResizedCrop((224,224), (0.5,1), p=0.3),
+            kornia.augmentation.RandomHorizontalFlip(p=0.5),
+            kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.3),
+            kornia.augmentation.RandomGrayscale(p=0.3),
+            data_keys=["input"],
+            # random_apply = (1,4)
+        )
     else:
         train_augs = None
 
@@ -300,6 +321,13 @@ if __name__ == '__main__':
         raise Exception(f"voxel_dims must be 1 or 3, not {voxel_dims}")
 
     print('Prepping train and validation dataloaders...')
+    if use_full_trainset:
+        # combines train and val so meta is not valid anymore
+        num_train = 8559 + 300
+        num_val = 982
+    else:
+        num_train = None
+        num_val = None
     train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
         batch_size,
         num_devices=num_devices,
@@ -312,11 +340,9 @@ if __name__ == '__main__':
         seed=seed,
         voxels_key=voxels_key,
         local_rank=local_rank,
+        num_train=num_train,
+        num_val=num_val
     )
-    if use_full_trainset:
-        # combines train and val so meta is not valid anymore
-        num_train = 8559 + 300
-        num_val = 982
 
     if voxel_dims == 3:
         import nibabel as nib
@@ -532,30 +558,37 @@ if __name__ == '__main__':
                         nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
                         nn.functional.normalize(clip_target.flatten(1), dim=-1),
                         temp=0.006, perm=perm, betas=betas, select=select,
-                        distributed=distributed, accelerator=accelerator, local_rank=local_rank)
+                        distributed=distributed, accelerator=accelerator, local_rank=local_rank,
+                        bidirectional=bidir_mixco)
             else:
                 if not is_text:
-                    clip_target = clip_extractor.embed_image(image, apply_transforms=False).float()
-                    clip_trans = clip_extractor.embed_image(image, apply_transforms=True, apply_spatial_transforms=True).float()
+                    # clip_target = clip_extractor.embed_image(image, apply_transforms=False).float()
+                    # clip_trans = clip_extractor.embed_image(image, apply_transforms=True, apply_spatial_transforms=True).float()
+                    clip_target = clip_extractor.embed_image(image, apply_transforms=True, apply_spatial_transforms=True).float()
 
                 epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
                 if loss_type == 'all':
-                    loss = utils.soft_cont_loss_all(
-                        nn.functional.normalize(clip_voxels, dim=-1), 
-                        nn.functional.normalize(clip_target, dim=-1),
-                        nn.functional.normalize(clip_trans, dim=-1),
-                        temp=epoch_temp,
-                        distributed=distributed, accelerator=accelerator)
-                    # loss = utils.soft_clip_loss_all(
+                    # loss = utils.soft_cont_loss_all(
                     #     nn.functional.normalize(clip_voxels, dim=-1), 
                     #     nn.functional.normalize(clip_target, dim=-1),
+                    #     nn.functional.normalize(clip_trans, dim=-1),
                     #     temp=epoch_temp,
                     #     distributed=distributed, accelerator=accelerator)
+                    loss = utils.soft_clip_loss_all(
+                        nn.functional.normalize(clip_voxels, dim=-1), 
+                        nn.functional.normalize(clip_target, dim=-1),
+                        temp=epoch_temp,
+                        distributed=distributed, accelerator=accelerator)
                 else:
-                    loss = utils.soft_cont_loss(
+                    # loss = utils.soft_cont_loss(
+                    #     nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                    #     nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                    #     nn.functional.normalize(clip_trans.flatten(1), dim=-1),
+                    #     temp=epoch_temp,
+                    #     distributed=distributed, accelerator=accelerator)
+                    loss = utils.soft_clip_loss(
                         nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
                         nn.functional.normalize(clip_target.flatten(1), dim=-1),
-                        nn.functional.normalize(clip_trans.flatten(1), dim=-1),
                         temp=epoch_temp,
                         distributed=distributed, accelerator=accelerator)
                 
@@ -649,7 +682,8 @@ if __name__ == '__main__':
                             nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
                             nn.functional.normalize(clip_target.flatten(1), dim=-1),
                             temp=0.006, 
-                            distributed=distributed, accelerator=accelerator, local_rank=local_rank)
+                            distributed=distributed, accelerator=accelerator, local_rank=local_rank,
+                            bidirectional=bidir_mixco)
                 else:
                     epoch_temp = soft_loss_temps[epoch-int(mixup_pct*num_epochs)]
                     if loss_type == 'all':
@@ -676,11 +710,11 @@ if __name__ == '__main__':
 
                 labels = torch.arange(len(clip_target)).to(device)
                 if loss_type == 'all':
-                    fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_target, clip_voxels), labels, k=1).item()
-                    bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_voxels, clip_target), labels, k=1).item()
+                    val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_target, clip_voxels), labels, k=1).item()
+                    val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity_all(clip_voxels, clip_target), labels, k=1).item()
                 else:
-                    fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target.flatten(1), clip_voxels.flatten(1)), labels, k=1).item()
-                    bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels.flatten(1), clip_target.flatten(1)), labels, k=1).item()
+                    val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target.flatten(1), clip_voxels.flatten(1)), labels, k=1).item()
+                    val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels.flatten(1), clip_target.flatten(1)), labels, k=1).item()
 
         if local_rank == 0:
             if ckpt_saving:

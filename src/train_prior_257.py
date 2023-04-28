@@ -381,6 +381,14 @@ if __name__ == '__main__':
         raise Exception(f"voxel_dims must be 1 or 3, not {voxel_dims}")
 
     print('Prepping train and validation dataloaders...')
+    if pretrained_v2c or use_full_trainset:
+        # combines train and val so meta is not valid anymore
+        num_train = 8559 + 300
+        num_val = 982
+    else:
+        num_train = None
+        num_val = None
+
     train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
         batch_size,
         num_devices=num_devices,
@@ -393,11 +401,10 @@ if __name__ == '__main__':
         seed=seed,
         voxels_key=voxels_key,
         local_rank=local_rank,
+        num_train=num_train,
+        num_val=num_val
     )
-    if pretrained_v2c or use_full_trainset:
-        # combines train and val so meta is not valid anymore
-        num_train = 8559 + 300
-        num_val = 982
+    
 
     if voxel_dims == 3:
         import nibabel as nib

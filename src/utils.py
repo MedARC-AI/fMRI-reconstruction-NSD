@@ -200,7 +200,8 @@ def mixco_clip_target(clip_target, perm, select, betas):
         clip_target_shuffle[select] * (1 - betas[select]).reshape(-1, 1)
     return clip_target
 
-def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distributed=False, accelerator=None, local_rank=None):
+def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distributed=False, 
+              accelerator=None, local_rank=None, bidirectional=False):
     if distributed:
         all_targs = gather_features(targs, None, accelerator)
         brain_clip = (preds @ all_targs.T)/temp
@@ -217,10 +218,17 @@ def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distri
             probs = probs_all
 
         loss = -(brain_clip.log_softmax(-1) * probs).sum(-1).mean()
+        if bidirectional:
+            loss2 = -(brain_clip.T.log_softmax(-1) * probs).sum(-1).mean()
+            loss = (loss + loss2)/2
         #print('mixco loss: ', loss.item())
         return loss
     else:
-        return F.cross_entropy(brain_clip, torch.arange(brain_clip.shape[0]).to(brain_clip.device))
+        loss =  F.cross_entropy(brain_clip, torch.arange(brain_clip.shape[0]).to(brain_clip.device))
+        if bidirectional:
+            loss2 = F.cross_entropy(brain_clip.T, torch.arange(brain_clip.shape[0]).to(brain_clip.device))
+            loss = (loss + loss2)/2
+        return loss
 
 def mixco_nce_all(preds, targs, temp=0.1, perm=None, betas=None, select=None, distributed=False, accelerator=None, local_rank=None):
     brain_clip = torch.bmm(preds.permute(1,0,2), targs.permute(1,2,0))/temp
@@ -391,6 +399,7 @@ def get_dataloaders(
             num_train = metadata['totals']['train']
         if num_val is None:
             num_val = metadata['totals']['val']
+        
 
     if val_batch_size is None:
         val_batch_size = batch_size
