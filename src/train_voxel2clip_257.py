@@ -1,6 +1,7 @@
 # # Import packages & functions
 
 import os
+import shutil
 import sys
 import traceback
 import time
@@ -106,7 +107,7 @@ def parse_args():
     parser.add_argument(
         "--cont_loss_type",
         type=str,
-        default="all",
+        default="flatten",
         choices=["all", "flatten"],
         help="loss type",
     )
@@ -124,6 +125,16 @@ def parse_args():
         "--bidir_mixco",
         action="store_true",
         help="make mixco bidirectional"
+    )
+    parser.add_argument(
+        "--num_epochs",
+        type=int,
+        default=120
+    )
+    parser.add_argument(
+        "--mixco_sel_thresh",
+        type=float,
+        default=0.5
     )
     return parser.parse_args()
 
@@ -149,7 +160,7 @@ if __name__ == '__main__':
     batch_size = 300 if args.voxel_dims == 1 else 128
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
 
-    num_epochs = 120  # 400  # 250  # 350 if data_commit=='avg' else 120
+    num_epochs = args.num_epochs  # 400  # 250  # 350 if data_commit=='avg' else 120
     lr_scheduler = 'cycle'
     initial_lr = 1e-3 #3e-5
     max_lr = 3e-4
@@ -173,6 +184,7 @@ if __name__ == '__main__':
     use_full_trainset = True
 
     resume_from_ckpt = args.ckpt_path is not None
+    ckpt_path = args.ckpt_path
     use_mse = args.use_mse
     use_projector = False  # True
     normed_mse = True
@@ -217,14 +229,11 @@ if __name__ == '__main__':
         #     )
         # ]
         train_augs = AugmentationSequential(
-            # kornia.augmentation.RandomCrop((140, 140), p=0.3),
-            # kornia.augmentation.Resize((224, 224)),
-            kornia.augmentation.RandomResizedCrop((224,224), (0.5,1), p=0.3),
-            kornia.augmentation.RandomHorizontalFlip(p=0.5),
-            kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.3),
-            kornia.augmentation.RandomGrayscale(p=0.3),
-            data_keys=["input"],
-            # random_apply = (1,4)
+            kornia.augmentation.RandomResizedCrop((240,240), (0.6,1), p=0.3),
+            kornia.augmentation.Resize((224, 224)),
+            kornia.augmentation.RandomGaussianBlur(kernel_size=(7,7), sigma=(5,5), p=0.3), #MedianBlur is better but computationally inefficient
+            # kornia.augmentation.RandomHorizontalFlip(p=0.5),
+            kornia.augmentation.ColorJiggle(brightness=0.2, contrast=0.2, saturation=0.3, hue=0., p=0.3),
         )
     else:
         train_augs = None
@@ -235,6 +244,11 @@ if __name__ == '__main__':
 
     device = accelerator.device
     print("device:",device)
+
+    if os.path.exists(os.path.join(outdir, 'last.pth')):
+        ckpt_path = os.path.join(outdir, 'last.pth')
+        resume_from_ckpt = True
+
 
     if use_mse:
         vd_cache_dir = '/fsx/proj-medarc/fmri/cache/models--shi-labs--versatile-diffusion/snapshots/2926f8e11ea526b562cd592b099fcf9c2985d0b7'
@@ -410,6 +424,9 @@ if __name__ == '__main__':
         )
 
     def save_ckpt(tag):
+        if tag == "last":
+            if os.path.exists(os.path.join(outdir, f'{tag}.pth')):
+                shutil.copyfile(os.path.join(outdir, f'{tag}.pth'), os.path.join(outdir, f'{tag}_old.pth'))
         ckpt_path = os.path.join(outdir, f'{tag}.pth')
         print(f'saving {ckpt_path}',flush=True)
         torch.save({
@@ -424,6 +441,8 @@ if __name__ == '__main__':
             'val_bwd_percent_correct': val_bwd_percent_correct,
             'lrs': lrs,
             }, ckpt_path)
+        if tag == "last":
+            os.remove(os.path.join(outdir, f'{tag}_old.pth'))
 
     print("\nDone with model preparations!")
     
@@ -480,8 +499,8 @@ if __name__ == '__main__':
 
     # Optionally resume from checkpoint #
     if resume_from_ckpt:
-        print("\n---resuming from ckpt_path---\n",args.ckpt_path)
-        checkpoint = torch.load(args.ckpt_path, map_location=device)
+        print("\n---resuming from ckpt_path---\n",ckpt_path)
+        checkpoint = torch.load(ckpt_path, map_location=device)
         epoch = checkpoint['epoch']+1
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         try:
@@ -530,7 +549,7 @@ if __name__ == '__main__':
                 voxel0 = voxel.clone()
 
             if epoch < int(mixup_pct * num_epochs):
-                voxel, perm, betas, select = utils.mixco(voxel)
+                voxel, perm, betas, select = utils.mixco(voxel, s_thresh=args.mixco_sel_thresh)
 
             if is_text:
                 trial = trial.cpu().numpy()
@@ -732,7 +751,8 @@ if __name__ == '__main__':
             # Save model checkpoint every `ckpt_interval`` epochs or on the last epoch
             if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
                 try:
-                    save_ckpt(f'epoch{epoch:03d}')
+                    # save_ckpt(f'epoch{epoch:03d}')
+                    save_ckpt(f'last')
                 except:
                     pass
 

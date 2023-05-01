@@ -22,12 +22,17 @@ from kornia.augmentation.container import AugmentationSequential
 from pytorch_msssim import ssim
 
 import ddp_config
-_, local_rank, device = ddp_config.set_ddp()
 
 import utils
 from models import Voxel2StableDiffusionModel
 from convnext import ConvnextXL
 
+
+# _, local_rank, device = ddp_config.set_ddp()
+# distributed = True
+local_rank = 0
+device = torch.device("cuda:0")
+distributed = False
 
 from diffusers.models import AutoencoderKL
 autoenc = AutoencoderKL(
@@ -51,7 +56,7 @@ clamp_embs = False # clamp embeddings to (-1.5, 1.5)
 voxel_dims = 1 # 1 for flattened 3 for 3d
 n_samples_save = 4 # how many SD samples from train and val to save
 
-use_reconst = True
+use_reconst = False
 if use_reconst:
     batch_size = 8
 else:
@@ -67,10 +72,10 @@ save_at_end = False
 use_mp = False
 remote_data = False
 data_commit = "avg"  # '9947586218b6b7c8cab804009ddca5045249a38d'
-mixup_pct = 0.0
+mixup_pct = -1
 use_cont = True
-use_sobel_loss = True
-use_blurred_training = True
+use_sobel_loss = False
+use_blurred_training = False
 
 use_full_trainset = True
 subj_id = "01"
@@ -80,7 +85,6 @@ ckpt_path = None
 
 # need non-deterministic CuDNN for conv3D to work
 utils.seed_everything(seed+local_rank, cudnn_deterministic=False)
-
 torch.backends.cuda.matmul.allow_tf32 = True
 
 # if running command line, read in args or config file values and override above params
@@ -109,9 +113,14 @@ if use_cont:
         data_keys=["input"],
     )
 
-outdir = f'../train_logs/models/{model_name}/test'
+outdir = f'../train_logs/models/{model_name}/'
 if local_rank==0:
     os.makedirs(outdir, exist_ok=True)
+
+
+if os.path.exists(os.path.join(outdir, 'last.pth')):
+    ckpt_path = os.path.join(outdir, 'last.pth')
+    resume_from_ckpt = True
 
 num_devices = torch.cuda.device_count()
 if num_devices==0: num_devices = 1
@@ -158,7 +167,7 @@ voxel2sd = torch.nn.SyncBatchNorm.convert_sync_batchnorm(voxel2sd)
 #     )
 # except:
 #     pass
-voxel2sd = DDP(voxel2sd, device_ids=[local_rank])
+# voxel2sd = DDP(voxel2sd, device_ids=[local_rank])
 
 try:
     utils.count_params(voxel2sd)
@@ -195,6 +204,13 @@ else:
     raise Exception(f"voxel_dims must be 1 or 3, not {voxel_dims}")
 
 if local_rank == 0: print('Prepping train and validation dataloaders...')
+if use_full_trainset:
+    # combines train and val so meta is not valid anymore
+    num_train = 8559 + 300
+    num_val = 982
+else:
+    num_train = None
+    num_val = None
 train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
     batch_size,
     num_devices=num_devices,
@@ -202,16 +218,15 @@ train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
     train_url=train_url,
     val_url=val_url,
     meta_url=meta_url,
-    val_batch_size=16,
+    val_batch_size=32,
     cache_dir='/tmp/wds-cache',
     seed=seed+local_rank,
     voxels_key=voxels_key,
     local_rank=local_rank,
+    num_train=num_train,
+    num_val=num_val
 )
-if use_full_trainset:
-    # combines train and val so meta is not valid anymore
-    num_train = 8559 + 300
-    num_val = 982
+
 
 no_decay = ['bias']
 opt_grouped_parameters = [
@@ -332,7 +347,7 @@ for epoch in progress_bar:
                     F.normalize(cnx_embeds.reshape(-1, cnx_embeds.shape[-1]), dim=-1),
                     F.normalize(cnx_aug_embeds.reshape(-1, cnx_embeds.shape[-1]), dim=-1),
                     temp=0.075,
-                    distributed=True
+                    distributed=distributed
                 )
                 del image_aug, cnx_embeds, transformer_feats
             else:
@@ -366,6 +381,7 @@ for epoch in progress_bar:
                     sobel_loss = torch.tensor(0)
             else:
                 reconst_loss = torch.tensor(0)
+                sobel_loss = torch.tensor(0)
             
 
             loss = mse_loss/0.18215 + 2*reconst_loss + cont_loss + 16*sobel_loss
@@ -407,7 +423,10 @@ for epoch in progress_bar:
                 
                 with torch.cuda.amp.autocast(enabled=use_mp):
                     image_enc = autoenc.encode(2*image-1).latent_dist.mode() * 0.18215
-                    image_enc_pred = voxel2sd.module(voxel)
+                    if hasattr(voxel2sd, 'module'):
+                        image_enc_pred = voxel2sd.module(voxel)
+                    else:
+                        image_enc_pred = voxel2sd(voxel)
 
                     mse_loss = F.mse_loss(image_enc_pred, image_enc)
                     
@@ -448,7 +467,7 @@ for epoch in progress_bar:
                 save_ckpt('best_ssim')
             else:
                 print(f'not best - val_ssim: {val_ssim:.3f}, best_ssim: {best_ssim:.3f}')
-
+            save_ckpt(f'last')
             # Save model checkpoint every `ckpt_interval`` epochs or on the last epoch
             if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
                 save_ckpt(f'epoch{(epoch+1):03d}')
@@ -485,7 +504,7 @@ for epoch in progress_bar:
 
         if wandb_log:
             wandb.log(logs)
-    if True:
+    if distributed:
         dist.barrier()
 
 if wandb_log:

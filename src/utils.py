@@ -24,6 +24,7 @@ import socket
 from clip_retrieval.clip_client import ClipClient
 import time 
 from torchvision.models import alexnet, AlexNet_Weights
+import braceexpand
 # from image_finder import _check_whether_images_are_identical
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -187,7 +188,7 @@ def mixco(voxels, beta=0.15, s_thresh=0.5):
     perm = torch.randperm(voxels.shape[0]).to(voxels.device)
     voxels_shuffle = voxels[perm]
     betas = torch.distributions.Beta(beta, beta).sample([voxels.shape[0]]).to(voxels.device)
-    select = (torch.rand(voxels.shape[0]) <= s_thresh).to(voxels.device)
+    select = (torch.rand(voxels.shape[0]) < s_thresh).to(voxels.device)
     betas_shape = [-1] + [1]*(len(voxels.shape)-1)
     voxels[select] = voxels[select] * betas[select].reshape(*betas_shape) + \
         voxels_shuffle[select] * (1 - betas[select]).reshape(*betas_shape)
@@ -423,6 +424,7 @@ def get_dataloaders(
     if cache_dir is not None and not os.path.exists(cache_dir):
         os.makedirs(cache_dir,exist_ok=True)
     
+    train_url = list(braceexpand.braceexpand(train_url))
     train_data = (wds.WebDataset(train_url, resampled=True, cache_dir=cache_dir, nodesplitter=wds.split_by_node)
         .shuffle(500, initial=500, rng=random.Random(42))
         .decode("torch")
@@ -438,13 +440,16 @@ def get_dataloaders(
     train_dl = torch.utils.data.DataLoader(train_data, batch_size=None, num_workers=num_workers, shuffle=False)
 
     # Validation
-    # just using the first 300 samples! no shuffling!
-    val_num_workers = num_workers
+    # should be deterministic, no shuffling!    
+    num_batches = math.floor(num_val / global_batch_size)
+    num_worker_batches = math.floor(num_batches / num_workers)
+    if num_worker_batches == 0: num_worker_batches = 1
     
     if local_rank==0: print("\nnum_val",num_val)
+    if local_rank==0: print("val_num_batches",num_batches)
     if local_rank==0: print("val_batch_size",val_batch_size)
-    if local_rank==0: print("val_num_workers",val_num_workers)
     
+    val_url = list(braceexpand.braceexpand(val_url))
     val_data = (wds.WebDataset(val_url, resampled=False, cache_dir=cache_dir, nodesplitter=wds.split_by_node)
         .decode("torch")
         .rename(images="jpg;png", voxels=voxels_key, trial="trial.npy", coco="coco73k.npy", reps="num_uniques.npy")
@@ -452,7 +457,7 @@ def get_dataloaders(
         .to_tuple(*to_tuple)
         .batched(val_batch_size, partial=False))
     
-    val_dl = torch.utils.data.DataLoader(val_data, batch_size=None, num_workers=val_num_workers, shuffle=False)
+    val_dl = torch.utils.data.DataLoader(val_data, batch_size=None, num_workers=num_workers, shuffle=False)
 
     if n_cache_recs > 0:
         val_data = val_data.compose(wds.DBCache, os.path.join(cache_dir, "cache-val.db"),  n_cache_recs)

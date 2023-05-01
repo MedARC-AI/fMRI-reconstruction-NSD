@@ -106,7 +106,7 @@ def parse_args():
         help="output location",
     )
     parser.add_argument(
-        "--no_normed_mse",
+        "--normed_mse",
         action="store_true",
         help="output location",
     )
@@ -118,7 +118,7 @@ def parse_args():
         help="loss type",
     )
     parser.add_argument(
-        "--full_train_set",
+        "--no_full_train_set",
         action="store_true",
         help="whether to disable image augmentation (only used for modality=image)",
     )
@@ -140,12 +140,37 @@ def parse_args():
     parser.add_argument(
         "--cont_loss_cands",
         choices=["none", "v2c", "prior", "v2c_prior"],
-        default=None
+        default="v2c"
     )
     parser.add_argument(
         "--mse_loss_cands",
         choices=["prior", "v2c_prior"],
-        default=None
+        default="prior"
+    )
+    parser.add_argument(
+        "--mixup_pct",
+        type=float,
+        default=0.5
+    )
+    parser.add_argument(
+        "--bidir_mixco",
+        action="store_true",
+        help="make mixco bidirectional"
+    )
+    parser.add_argument(
+        "--num_epochs",
+        type=int,
+        default=240
+    )
+    parser.add_argument(
+        "--mixco_sel_thresh",
+        type=float,
+        default=0.5
+    )
+    parser.add_argument(
+        "--soft_loss_type",
+        choices=["clip", "cont_flatten", "cont_inter"],
+        default="clip"
     )
     return parser.parse_args()
 
@@ -160,11 +185,13 @@ def do_contrastive_loss(clip_voxels, clip_target, temp, mixco, training, loss_ty
                 temp=temp, perm=perm, betas=betas, select=select,
                 distributed=distributed, accelerator=accelerator, local_rank=local_rank)
         else:
+            # this is used
             loss_nce = utils.mixco_nce(
                 nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
                 nn.functional.normalize(clip_target.flatten(1), dim=-1),
                 temp=temp, perm=perm, betas=betas, select=select,
-                distributed=distributed, accelerator=accelerator, local_rank=local_rank)
+                distributed=distributed, accelerator=accelerator, local_rank=local_rank,
+                bidirectional=args.bidir_mixco)
     else:
         if loss_type == 'all':
             if training:
@@ -182,12 +209,33 @@ def do_contrastive_loss(clip_voxels, clip_target, temp, mixco, training, loss_ty
                     distributed=distributed, accelerator=accelerator)
         else:
             if training:
-                loss_nce = utils.soft_cont_loss(
-                    nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
-                    nn.functional.normalize(clip_target.flatten(1), dim=-1),
-                    nn.functional.normalize(clip_trans.flatten(1), dim=-1),
-                    temp=temp,
-                    distributed=distributed, accelerator=accelerator)
+                if args.soft_loss_type == "cont_flatten":
+                    loss_nce = utils.soft_cont_loss(
+                        nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                        nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                        nn.functional.normalize(clip_trans.flatten(1), dim=-1),
+                        temp=temp,
+                        distributed=distributed, accelerator=accelerator)
+                elif args.soft_loss_type == "cont_inter":
+                    loss_nce_1 = utils.soft_clip_loss(
+                        nn.functional.normalize(clip_voxels[:, 0], dim=-1), 
+                        nn.functional.normalize(clip_target[:, 0], dim=-1),
+                        temp=temp,
+                        distributed=distributed, accelerator=accelerator)
+                    loss_nce_2 = utils.soft_cont_loss(
+                        nn.functional.normalize(clip_voxels[:, 1:].flatten(0, 1), dim=-1), 
+                        nn.functional.normalize(clip_target[:, 1:].flatten(0, 1), dim=-1),
+                        nn.functional.normalize(clip_trans[:, 1:].flatten(0, 1), dim=-1),
+                        temp=temp,
+                        distributed=distributed, accelerator=accelerator)
+                    loss_nce = (loss_nce_1 + loss_nce_2)/2
+                else:
+                    # this is used
+                    loss_nce = utils.soft_clip_loss(
+                        nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
+                        nn.functional.normalize(clip_target.flatten(1), dim=-1),
+                        temp=temp,
+                        distributed=distributed, accelerator=accelerator)
             else:
                 loss_nce = utils.soft_clip_loss(
                     nn.functional.normalize(clip_voxels.flatten(1), dim=-1), 
@@ -225,7 +273,7 @@ if __name__ == '__main__':
     batch_size = 32 if args.voxel_dims == 1 else 16
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
 
-    num_epochs = 120  # 350 if data_commit=='avg' else 120
+    num_epochs = args.num_epochs  # 350 if data_commit=='avg' else 120
     lr_scheduler = 'cycle'
     initial_lr = 1e-3 #3e-5
     max_lr = 3e-4
@@ -236,7 +284,7 @@ if __name__ == '__main__':
     wandb_notes = ''
     first_batch = False
     ckpt_saving = True
-    ckpt_interval = 10
+    ckpt_interval = 25
     use_mp = False
     distributed = False
     save_at_end = False
@@ -244,16 +292,17 @@ if __name__ == '__main__':
 
     cache_dir = 'cache'
     n_cache_recs = 0
-    mixup_pct = 0.25 if num_epochs == 120 else 0.125
+    mixup_pct = args.mixup_pct
     loss_type = args.cont_loss_type
     
-    normed_mse = not args.no_normed_mse
+    normed_mse = args.normed_mse
     learned_query_mode = args.learned_query_mode
     pretrained_v2c = args.pretrained_v2c
     use_projector = args.v2c_projector  # True
-    use_full_trainset = args.full_train_set
+    use_full_trainset = not args.no_full_train_set
 
     resume_from_ckpt = args.ckpt_path is not None
+    ckpt_path = args.ckpt_path
 
     lr_scheduler = 'cycle'
     initial_lr = 5e-4 # only used if lr_scheduler is 'fixed'
@@ -281,23 +330,35 @@ if __name__ == '__main__':
     num_workers = num_devices * 4
 
     if not args.disable_image_aug:
-        train_augs = [
-            AugmentationSequential(
-                kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
-                kornia.augmentation.RandomSolarize(p=0.2),
-                kornia.augmentation.RandomGrayscale(p=0.2),
-                data_keys=["input"],
-                # random_apply = (1,4)
-            ),
-            AugmentationSequential(
-                kornia.augmentation.RandomResizedCrop((224,224), (0.5, 1), p=0.5),
-                kornia.augmentation.RandomHorizontalFlip(p=0.5),
-                data_keys=["input"],
-                # random_apply = (1,4)
-            )
-        ]
+        # train_augs = [
+        #     AugmentationSequential(
+        #         kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
+        #         kornia.augmentation.RandomSolarize(p=0.2),
+        #         kornia.augmentation.RandomGrayscale(p=0.2),
+        #         data_keys=["input"],
+        #         # random_apply = (1,4)
+        #     ),
+        #     AugmentationSequential(
+        #         kornia.augmentation.RandomResizedCrop((224,224), (0.5, 1), p=0.5),
+        #         kornia.augmentation.RandomHorizontalFlip(p=0.5),
+        #         data_keys=["input"],
+        #         # random_apply = (1,4)
+        #     )
+        # ]
+        train_augs = AugmentationSequential(
+            kornia.augmentation.RandomResizedCrop((240,240), (0.6,1), p=0.3),
+            kornia.augmentation.Resize((224, 224)),
+            kornia.augmentation.RandomGaussianBlur(kernel_size=(7,7), sigma=(5,5), p=0.3), #MedianBlur is better but computationally inefficient
+            # kornia.augmentation.RandomHorizontalFlip(p=0.5),
+            kornia.augmentation.ColorJiggle(brightness=0.2, contrast=0.2, saturation=0.3, hue=0., p=0.3),
+        )
     else:
         train_augs = None
+
+    # auto resume
+    if os.path.exists(os.path.join(outdir, 'last.pth')):
+        ckpt_path = os.path.join(outdir, 'last.pth')
+        resume_from_ckpt = True
 
     vd_cache_dir = '/fsx/proj-medarc/fmri/cache/models--shi-labs--versatile-diffusion/snapshots/2926f8e11ea526b562cd592b099fcf9c2985d0b7'
     vd_pipe =  BrainVD.from_pretrained(
@@ -440,7 +501,8 @@ if __name__ == '__main__':
 
         if pretrained_v2c:
             checkpoint = torch.load(
-                "/fsx/proj-medarc/fmri/paulscotti/fMRI-reconstruction-NSD/train_logs/v2c_v2/last.pth", 
+                # "/fsx/proj-medarc/fmri/paulscotti/fMRI-reconstruction-NSD/train_logs/v2c_v2/last.pth", 
+                "/fsx/proj-medarc/fmri/paulscotti/fMRI-reconstruction-NSD/train_logs/v2c_v3_/last.pth", 
                 map_location=device
             )
             try:
@@ -589,8 +651,8 @@ if __name__ == '__main__':
 
     # Optionally resume from checkpoint #
     if resume_from_ckpt:
-        print("\n---resuming from ckpt_path---\n",args.ckpt_path)
-        checkpoint = torch.load(args.ckpt_path, map_location=device)
+        print("\n---resuming from ckpt_path---\n", ckpt_path)
+        checkpoint = torch.load(ckpt_path, map_location=device)
         epoch = checkpoint['epoch']+1
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])        
         diffusion_prior.load_state_dict(checkpoint['model_state_dict'])
@@ -832,7 +894,7 @@ if __name__ == '__main__':
                         pass
                 else:
                     print(f'not best - val_loss: {val_loss:.3f}, best_val_loss: {best_val_loss:.3f}')
-
+                save_ckpt(f'last')
                 # Save model checkpoint every `ckpt_interval`` epochs or on the last epoch
                 if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
                     try:

@@ -226,6 +226,7 @@ class BrainNetwork(nn.Module):
         norm_func = partial(nn.BatchNorm1d, num_features=h) if norm_type == 'bn' else partial(nn.LayerNorm, normalized_shape=h)
         act_fn = partial(nn.ReLU, inplace=True) if norm_type == 'bn' else nn.GELU
         act_and_norm = (act_fn, norm_func) if act_first else (norm_func, act_fn)
+        self.temp = nn.Parameter(torch.tensor(.006))
         self.lin0 = nn.Sequential(
             nn.Linear(in_dim, h),
             *[item() for item in act_and_norm],
@@ -707,7 +708,6 @@ class BrainDiffusionPrior(DiffusionPrior):
         image_embed *= self.image_embed_scale
 
         # calculate forward loss
-
         loss, pred = self.p_losses(image_embed, times, text_cond = text_cond, *args, **kwargs)
 
         # return denormalized pred, diff model learns to predict normalized pred
