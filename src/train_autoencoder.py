@@ -73,6 +73,8 @@ use_sobel_loss = True
 use_blurred_training = True
 
 torch.backends.cuda.matmul.allow_tf32 = True
+# need non-deterministic CuDNN for conv3D to work
+utils.seed_everything(local_rank+0, cudnn_deterministic=False)
 
 # if running command line, read in args or config file values and override above params
 try:
@@ -140,13 +142,13 @@ elif voxel_dims == 3: # 3D data
     
 voxel2sd.to(device)
 voxel2sd = torch.nn.SyncBatchNorm.convert_sync_batchnorm(voxel2sd)
-try:
-    voxel2sd.load_state_dict(
-        torch.load('../train_logs/models/clip_image_vitL_2stage_mixco_lotemp_125ep_subj01_best.pth'), 
-        strict=False
-    )
-except:
-    pass
+# try:
+#     voxel2sd.load_state_dict(
+#         torch.load('../train_logs/models/clip_image_vitL_2stage_mixco_lotemp_125ep_subj01_best.pth'), 
+#         strict=False
+#     )
+# except:
+#     pass
 voxel2sd = DDP(voxel2sd, device_ids=[local_rank])
 
 try:
@@ -156,17 +158,22 @@ except:
 
 
 if local_rank == 0: print('Pulling NSD webdataset data...')
-if remote_data:
-    # pull data directly from huggingface
-    train_url, val_url = utils.get_huggingface_urls(data_commit)
-else:
-    # local paths
-    if data_commit is None:
-        train_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/train/train_subj01_{0..49}.tar"
-        val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/val/val_subj01_0.tar"
-    else:
-        train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_train/train_subj01_{{0..49}}.tar"
-        val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_val/val_subj01_0.tar"
+# if remote_data:
+#     # pull data directly from huggingface
+#     train_url, val_url = utils.get_huggingface_urls(data_commit)
+# else:
+#     # local paths
+#     if data_commit is None:
+#         train_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/train/train_subj01_{0..49}.tar"
+#         val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/val/val_subj01_0.tar"
+#     else:
+#         train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_train/train_subj01_{{0..49}}.tar"
+#         val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_val/val_subj01_0.tar"
+
+subj_id = "01"
+train_url = "{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj01_{0..17}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj01_0.tar}"
+val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/test/test_subj01_{0..1}.tar"
+meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/metadata_subj01.json"
 
 # which to use for the voxels
 if voxel_dims == 1:
@@ -228,10 +235,6 @@ def save_ckpt(tag):
         #     wandb.save(ckpt_path)
 if local_rank==0: print("\nDone with model preparations!")
 
-
-# need non-deterministic CuDNN for conv3D to work
-utils.seed_everything(local_rank, cudnn_deterministic=False)
-
 if wandb_log:
     wandb.init(
         project=wandb_project,
@@ -267,6 +270,7 @@ for epoch in progress_bar:
         image = image.to(device).float()
         image_512 = F.interpolate(image, (512, 512), mode='bilinear', align_corners=False, antialias=True)
         voxel = voxel.to(device).float()
+        voxel = utils.voxel_select(voxel)
         if epoch <= mixup_pct * num_epochs:
             voxel, perm, betas, select = utils.mixco(voxel)
         else:
@@ -365,6 +369,7 @@ for epoch in progress_bar:
                 image = image.to(device).float()
                 image = F.interpolate(image, (512, 512), mode='bilinear', align_corners=False, antialias=True)              
                 voxel = voxel.to(device).float()
+                voxel = voxel.mean(1)
                 
                 with torch.cuda.amp.autocast(enabled=use_mp):
                     image_enc = autoenc.encode(2*image-1).latent_dist.mode() * 0.18215
