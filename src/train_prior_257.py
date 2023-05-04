@@ -1,6 +1,7 @@
 # # Import packages & functions
 
 import os
+import shutil
 import sys
 import traceback
 import time
@@ -172,6 +173,11 @@ def parse_args():
         choices=["clip", "cont_flatten", "cont_inter"],
         default="clip"
     )
+    parser.add_argument(
+        "--subj_id",
+        choices=["01", "02", "05", "07"],
+        default="01"
+    )
     return parser.parse_args()
 
 def do_contrastive_loss(clip_voxels, clip_target, temp, mixco, training, loss_type,
@@ -288,7 +294,7 @@ if __name__ == '__main__':
     use_mp = False
     distributed = False
     save_at_end = False
-    subj_id = '01'
+    subj_id = args.subj_id
 
     cache_dir = 'cache'
     n_cache_recs = 0
@@ -422,9 +428,9 @@ if __name__ == '__main__':
             train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj{subj_id}_{{0..17}}.tar"
             val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj{subj_id}_0.tar"
             if pretrained_v2c or use_full_trainset:
-                train_url = "{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj01_{0..17}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj01_0.tar}"
-                val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/test/test_subj01_{0..1}.tar"
-                meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/metadata_subj01.json"
+                train_url = f"{{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj{subj_id}_{{0..17}}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj{subj_id}_0.tar}}"
+                val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/test/test_subj{subj_id}_{{0..1}}.tar"
+                meta_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/metadata_subj{subj_id}.json"
         elif data_commit == 'indiv':
             train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/train/train_subj{subj_id}_{{0..49}}.tar"
             val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_indiv_split/val/val_subj{subj_id}_0.tar"
@@ -497,6 +503,8 @@ if __name__ == '__main__':
             voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
         else:
             voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=257, use_projector=use_projector)
+            in_dims = {'01': 15724, '02': 14278, '05': 13039, '07':12682}
+            voxel2clip_kwargs["in_dim"] = in_dims[subj_id]
             voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
 
         if pretrained_v2c:
@@ -581,6 +589,10 @@ if __name__ == '__main__':
         )
 
     def save_ckpt(tag):
+        if tag == "last":
+            if os.path.exists(os.path.join(outdir, f'{tag}.pth')):
+                shutil.copyfile(os.path.join(outdir, f'{tag}.pth'), os.path.join(outdir, f'{tag}_old.pth'))
+                # shutil.move(os.path.join(outdir, f'{tag}.pth'), os.path.join(outdir, f'{tag}_old.pth'))
         ckpt_path = os.path.join(outdir, f'{tag}.pth')
         print(f'saving {ckpt_path}',flush=True)
         torch.save({
@@ -595,6 +607,8 @@ if __name__ == '__main__':
             'val_bwd_percent_correct': val_bwd_percent_correct,
             'lrs': lrs,
             }, ckpt_path)
+        if tag == "last":
+            os.remove(os.path.join(outdir, f'{tag}_old.pth'))
 
     print("\nDone with model preparations!")
     
