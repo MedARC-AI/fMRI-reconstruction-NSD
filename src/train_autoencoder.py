@@ -1,6 +1,7 @@
 # # Import packages & functions
 
 import os
+import shutil
 import sys
 import json
 import traceback
@@ -66,15 +67,17 @@ ckpt_interval = 5
 save_at_end = False
 use_mp = False
 remote_data = False
-data_commit = '9947586218b6b7c8cab804009ddca5045249a38d'
+subj_id = "01"
 mixup_pct = 0.0
 use_cont = True
 use_sobel_loss = True
 use_blurred_training = True
+cont_model = 'cnx'
+seed = 0
 
 torch.backends.cuda.matmul.allow_tf32 = True
 # need non-deterministic CuDNN for conv3D to work
-utils.seed_everything(local_rank+0, cudnn_deterministic=False)
+utils.seed_everything(local_rank+seed, cudnn_deterministic=False)
 
 # if running command line, read in args or config file values and override above params
 try:
@@ -87,17 +90,17 @@ except:
 
 if use_cont:
     mixup_pct = -1
-    cnx = ConvnextXL('../train_logs/models/convnext_xlarge_alpha0.75_fullckpt.pth')
-    cnx.requires_grad_(False)
-    cnx.eval()
-    cnx.to(device)
+    if cont_model == 'cnx':
+        cnx = ConvnextXL('../train_logs/models/convnext_xlarge_alpha0.75_fullckpt.pth')
+        cnx.requires_grad_(False)
+        cnx.eval()
+        cnx.to(device)
     train_augs = AugmentationSequential(
         # kornia.augmentation.RandomCrop((480, 480), p=0.3),
         # kornia.augmentation.Resize((512, 512)),
-        kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
-        kornia.augmentation.RandomGrayscale(p=0.2),
+        kornia.augmentation.ColorJiggle(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.3),
         kornia.augmentation.RandomSolarize(p=0.2),
-        kornia.augmentation.RandomGaussianBlur(kernel_size=(7, 7), sigma=(0.1, 2.0), p=0.1),
+        kornia.augmentation.RandomGaussianBlur(kernel_size=(7, 7), sigma=(0.5, 5.0), p=0.3),
         kornia.augmentation.RandomResizedCrop((512, 512), scale=(0.5, 1.0)),
         data_keys=["input"],
     )
@@ -109,23 +112,6 @@ if local_rank==0:
 num_devices = torch.cuda.device_count()
 if num_devices==0: num_devices = 1
 num_workers = num_devices
-
-wandb_log = False
-wandb_project = 'stability'
-wandb_run_name = 'pstest'
-wandb_notes = ''
-if wandb_log: 
-    import wandb
-    config = {
-      "model_name": model_name,
-      "modality": modality,
-      "batch_size": batch_size,
-      "num_epochs": num_epochs,
-      "initial_lr": initial_lr,
-      "max_lr": max_lr,
-      "lr_scheduler": lr_scheduler,
-      "clamp_embs": clamp_embs,
-    }
 
 cache_dir = 'cache'
 n_cache_recs = 0
@@ -142,13 +128,6 @@ elif voxel_dims == 3: # 3D data
     
 voxel2sd.to(device)
 voxel2sd = torch.nn.SyncBatchNorm.convert_sync_batchnorm(voxel2sd)
-# try:
-#     voxel2sd.load_state_dict(
-#         torch.load('../train_logs/models/clip_image_vitL_2stage_mixco_lotemp_125ep_subj01_best.pth'), 
-#         strict=False
-#     )
-# except:
-#     pass
 voxel2sd = DDP(voxel2sd, device_ids=[local_rank])
 
 try:
@@ -158,22 +137,11 @@ except:
 
 
 if local_rank == 0: print('Pulling NSD webdataset data...')
-# if remote_data:
-#     # pull data directly from huggingface
-#     train_url, val_url = utils.get_huggingface_urls(data_commit)
-# else:
-#     # local paths
-#     if data_commit is None:
-#         train_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/train/train_subj01_{0..49}.tar"
-#         val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset/val/val_subj01_0.tar"
-#     else:
-#         train_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_train/train_subj01_{{0..49}}.tar"
-#         val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/{data_commit}/datasets_pscotti_naturalscenesdataset_resolve_{data_commit}_webdataset_val/val_subj01_0.tar"
 
-subj_id = "01"
-train_url = "{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj01_{0..17}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj01_0.tar}"
-val_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/test/test_subj01_{0..1}.tar"
-meta_url = "/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/metadata_subj01.json"
+train_url = f"{{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj{subj_id}_{{0..17}}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj{subj_id}_0.tar}}"
+val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/test/test_subj{subj_id}_{{0..1}}.tar"
+meta_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/metadata_subj{subj_id}.json"
+
 
 # which to use for the voxels
 if voxel_dims == 1:
@@ -184,20 +152,26 @@ else:
     raise Exception(f"voxel_dims must be 1 or 3, not {voxel_dims}")
 
 if local_rank == 0: print('Prepping train and validation dataloaders...')
+num_train = 8559 + 300
+num_val = 982
+
 train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
-    batch_size, 
-    image_var,
+    batch_size,
     num_devices=num_devices,
     num_workers=num_workers,
     train_url=train_url,
     val_url=val_url,
-    cache_dir=cache_dir,
-    n_cache_recs=n_cache_recs,
+    meta_url=meta_url,
+    val_batch_size=16,
+    cache_dir='/tmp/wds-cache',
+    seed=seed+local_rank,
     voxels_key=voxels_key,
-    val_batch_size=16
+    local_rank=local_rank,
+    num_train=num_train,
+    num_val=num_val
 )
 
-no_decay = ['bias']
+no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
 opt_grouped_parameters = [
     {'params': [p for n, p in voxel2sd.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 1e-2},
     {'params': [p for n, p in voxel2sd.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
@@ -209,15 +183,17 @@ lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=max_lr,
                                             last_epoch=-1, pct_start=2/num_epochs)
     
 def save_ckpt(tag):
-    ckpt_path = os.path.join(outdir, f'ckpt-{tag}.pth')
+    ckpt_path = os.path.join(outdir, f'{tag}.pth')
+    if tag == "last":
+        if os.path.exists(ckpt_path):
+            shutil.copyfile(ckpt_path, os.path.join(outdir, f'{tag}_old.pth'))
     print(f'saving {ckpt_path}')
     if local_rank==0:
         state_dict = voxel2sd.state_dict()
-        if True: # if using DDP, convert DDP state_dict to non-DDP before saving
-            for key in list(state_dict.keys()):
-                if 'module.' in key:
-                    state_dict[key.replace('module.', '')] = state_dict[key]
-                    del state_dict[key]
+        for key in list(state_dict.keys()):
+            if 'module.' in key:
+                state_dict[key.replace('module.', '')] = state_dict[key]
+                del state_dict[key]
         try:
             torch.save({
                 'epoch': epoch,
@@ -230,18 +206,12 @@ def save_ckpt(tag):
         except:
             print('Failed to save weights')
             print(traceback.format_exc())
+    if tag == "last":
+        os.remove(os.path.join(outdir, f'{tag}_old.pth'))
 
         # if wandb_log:
         #     wandb.save(ckpt_path)
 if local_rank==0: print("\nDone with model preparations!")
-
-if wandb_log:
-    wandb.init(
-        project=wandb_project,
-        name=wandb_run_name,
-        config=config,
-        notes=wandb_notes,
-    )
 
 progress_bar = tqdm(range(num_epochs), ncols=150, disable=(local_rank!=0))
 losses = []
@@ -283,11 +253,13 @@ for epoch in progress_bar:
                 image_enc_pred, transformer_feats = voxel2sd(voxel, return_transformer_feats=True)
             else:
                 image_enc_pred = voxel2sd(voxel)
+            
             if epoch <= mixup_pct * num_epochs:
                 image_enc_shuf = image_enc[perm]
                 betas_shape = [-1] + [1]*(len(image_enc.shape)-1)
                 image_enc[select] = image_enc[select] * betas[select].reshape(*betas_shape) + \
                     image_enc_shuf[select] * (1 - betas[select]).reshape(*betas_shape)
+            
             if use_cont:
                 image_norm = (image_512 - mean)/std
                 image_aug = (train_augs(image_512) - mean)/std
@@ -315,7 +287,6 @@ for epoch in progress_bar:
                     selected_inds = torch.where(~select)[0]
                     reconst_select = selected_inds[torch.randperm(len(selected_inds))][:4] 
                 else:
-                    # reconst_select = torch.randperm(len(image_enc_pred))[:4]
                     reconst_select = torch.arange(len(image_enc_pred))
                 image_enc_pred = F.interpolate(image_enc_pred[reconst_select], scale_factor=0.5, mode='bilinear', align_corners=False)
                 reconst = autoenc.decode(image_enc_pred/0.18215).sample
@@ -365,7 +336,7 @@ for epoch in progress_bar:
     if local_rank==0: 
         voxel2sd.eval()
         for val_i, (voxel, image, _) in enumerate(val_dl): 
-            with torch.no_grad():
+            with torch.inference_mode():
                 image = image.to(device).float()
                 image = F.interpolate(image, (512, 512), mode='bilinear', align_corners=False, antialias=True)              
                 voxel = voxel.to(device).float()
@@ -449,14 +420,8 @@ for epoch in progress_bar:
         if len(reconst_fails) > 0 and local_rank==0:
             print(f'Reconst fails {len(reconst_fails)}/{train_i}: {reconst_fails}')
 
-        if wandb_log:
-            wandb.log(logs)
     if True:
         dist.barrier()
-
-if wandb_log:
-    wandb.finish()
-
 
 
 
