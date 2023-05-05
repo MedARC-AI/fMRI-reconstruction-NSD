@@ -74,6 +74,7 @@ use_sobel_loss = True
 use_blurred_training = True
 cont_model = 'cnx'
 seed = 0
+resume_from_ckpt = False
 
 torch.backends.cuda.matmul.allow_tf32 = True
 # need non-deterministic CuDNN for conv3D to work
@@ -98,9 +99,10 @@ if use_cont:
     train_augs = AugmentationSequential(
         # kornia.augmentation.RandomCrop((480, 480), p=0.3),
         # kornia.augmentation.Resize((512, 512)),
-        kornia.augmentation.ColorJiggle(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.3),
+        kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
+        kornia.augmentation.RandomGrayscale(p=0.2),
         kornia.augmentation.RandomSolarize(p=0.2),
-        kornia.augmentation.RandomGaussianBlur(kernel_size=(7, 7), sigma=(0.5, 5.0), p=0.3),
+        kornia.augmentation.RandomGaussianBlur(kernel_size=(7, 7), sigma=(0.1, 2.0), p=0.1),
         kornia.augmentation.RandomResizedCrop((512, 512), scale=(0.5, 1.0)),
         data_keys=["input"],
     )
@@ -108,6 +110,11 @@ if use_cont:
 outdir = f'../train_logs/models/{model_name}/test'
 if local_rank==0:
     os.makedirs(outdir, exist_ok=True)
+
+# auto resume
+if os.path.exists(os.path.join(outdir, 'last.pth')):
+    ckpt_path = os.path.join(outdir, 'last.pth')
+    resume_from_ckpt = True
 
 num_devices = torch.cuda.device_count()
 if num_devices==0: num_devices = 1
@@ -120,8 +127,9 @@ n_cache_recs = 0
 # # Prep models and data loaders
 if local_rank == 0: print('Creating voxel2sd...')
 
+in_dims = {'01': 15724, '02': 14278, '05': 13039, '07':12682}
 if voxel_dims == 1: # 1D data
-    voxel2sd = Voxel2StableDiffusionModel(use_cont=use_cont)
+    voxel2sd = Voxel2StableDiffusionModel(use_cont=use_cont, in_dim=in_dims[subj_id])
     # 134M params
 elif voxel_dims == 3: # 3D data
     raise NotImplementedError()
@@ -207,13 +215,31 @@ def save_ckpt(tag):
             print('Failed to save weights')
             print(traceback.format_exc())
     if tag == "last":
-        os.remove(os.path.join(outdir, f'{tag}_old.pth'))
+        if os.path.exists(os.path.join(outdir, f'{tag}_old.pth')):
+            os.remove(os.path.join(outdir, f'{tag}_old.pth'))
 
         # if wandb_log:
         #     wandb.save(ckpt_path)
+
+# Optionally resume from checkpoint #
+if resume_from_ckpt:
+    print("\n---resuming from ckpt_path---\n", ckpt_path)
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    epoch = checkpoint['epoch']+1
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])        
+    voxel2sd.module.load_state_dict(checkpoint['model_state_dict'])
+    global_batch_size = batch_size * num_devices
+    total_steps_done = epoch*((num_train//batch_size)//num_devices)
+    for _ in range(total_steps_done):
+        lr_scheduler.step()
+    del checkpoint
+    torch.cuda.empty_cache()
+else:
+    epoch = 0
+
 if local_rank==0: print("\nDone with model preparations!")
 
-progress_bar = tqdm(range(num_epochs), ncols=150, disable=(local_rank!=0))
+progress_bar = tqdm(range(epoch, num_epochs), ncols=150, disable=(local_rank!=0))
 losses = []
 val_losses = []
 lrs = []
@@ -386,22 +412,23 @@ for epoch in progress_bar:
             else:
                 print(f'not best - val_ssim: {val_ssim:.3f}, best_ssim: {best_ssim:.3f}')
 
+            save_ckpt('last')
             # Save model checkpoint every `ckpt_interval`` epochs or on the last epoch
             if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
                 save_ckpt(f'epoch{(epoch+1):03d}')
-                try:
-                    orig = image
-                    if reconst is None:
-                        reconst = autoenc.decode(image_enc_pred[:16].detach()/0.18215).sample
-                        orig = image[:16]
-                    pred_grid = make_grid(((reconst/2 + 0.5).clamp(0,1)*255).byte(), nrow=int(len(reconst)**0.5)).permute(1,2,0).cpu().numpy()
-                    orig_grid = make_grid((orig*255).byte(), nrow=int(len(orig)**0.5)).permute(1,2,0).cpu().numpy()
-                    comb_grid = np.concatenate([orig_grid, pred_grid], axis=1)
-                    del pred_grid, orig_grid
-                    Image.fromarray(comb_grid).save(f'{outdir}/reconst_epoch{(epoch+1):03d}.png')
-                except:
-                    print("Failed to save reconst image")
-                    print(traceback.format_exc())
+            try:
+                orig = image
+                if reconst is None:
+                    reconst = autoenc.decode(image_enc_pred[:16].detach()/0.18215).sample
+                    orig = image[:16]
+                pred_grid = make_grid(((reconst/2 + 0.5).clamp(0,1)*255).byte(), nrow=int(len(reconst)**0.5)).permute(1,2,0).cpu().numpy()
+                orig_grid = make_grid((orig*255).byte(), nrow=int(len(orig)**0.5)).permute(1,2,0).cpu().numpy()
+                comb_grid = np.concatenate([orig_grid, pred_grid], axis=1)
+                del pred_grid, orig_grid
+                Image.fromarray(comb_grid).save(f'{outdir}/reconst_epoch{(epoch+1):03d}.png')
+            except:
+                print("Failed to save reconst image")
+                print(traceback.format_exc())
 
         logs = {
             "train/loss": np.mean(losses[-(train_i+1):]),

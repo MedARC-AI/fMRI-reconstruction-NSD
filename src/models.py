@@ -494,10 +494,10 @@ class Voxel2StableDiffusionModel(torch.nn.Module):
         self.lin1 = nn.Linear(h, 16384, bias=False)
         self.norm = nn.LayerNorm(512)
 
-        self.register_parameter('queries', nn.Parameter(torch.randn(1, 256, 512)))
+        self.register_parameter('queries', nn.Parameter(torch.randn(1, 256, 512) * 0.044))
         self.transformer = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(d_model=512, nhead=8, 
-                                        dim_feedforward=1024, 
+            nn.TransformerDecoderLayer(d_model=512, nhead=8, norm_first=True,
+                                        dim_feedforward=1024, activation=F.gelu,
                                         batch_first=True, dropout=0.25),
             num_layers=n_blocks
         )
@@ -553,7 +553,7 @@ class Voxel2StableDiffusionModel(torch.nn.Module):
         residual = x
         for res_block in self.mlp:
             x = res_block(x)
-            x += residual
+            x = x + residual
             residual = x
         x = x.reshape(len(x), -1)
         x = self.lin1(x)  # bs, 4096
