@@ -474,7 +474,7 @@ class Voxel2StableDiffusionModelSmall(torch.nn.Module):
 
 
 class Voxel2StableDiffusionModel(torch.nn.Module):
-    def __init__(self, in_dim=15724, h=4096, n_blocks=4, use_cont=False):
+    def __init__(self, in_dim=15724, h=4096, n_blocks=4, use_cont=False, ups_mode='4x'):
         super().__init__()
         self.lin0 = nn.Sequential(
             nn.Linear(in_dim, h, bias=False),
@@ -491,16 +491,66 @@ class Voxel2StableDiffusionModel(torch.nn.Module):
                 nn.Dropout(0.25)
             ) for _ in range(n_blocks)
         ])
-        self.lin1 = nn.Linear(h, 16384, bias=False)
-        self.norm = nn.LayerNorm(512)
+        self.ups_mode = ups_mode
+        if ups_mode=='4x':
+            self.lin1 = nn.Linear(h, 16384, bias=False)
+            self.norm = nn.GroupNorm(1, 64)
+            
+            self.upsampler = Decoder(
+                in_channels=64,
+                out_channels=4,
+                up_block_types=["UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D"],
+                block_out_channels=[64, 128, 256],
+                layers_per_block=1,
+            )
 
-        self.register_parameter('queries', nn.Parameter(torch.randn(1, 256, 512) * 0.044))
-        self.transformer = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(d_model=512, nhead=8, norm_first=True,
-                                        dim_feedforward=1024, activation=F.gelu,
-                                        batch_first=True, dropout=0.25),
-            num_layers=n_blocks
-        )
+            if use_cont:
+                self.maps_projector = nn.Sequential(
+                    nn.Conv2d(64, 512, 1, bias=False),
+                    nn.GroupNorm(1,512),
+                    nn.ReLU(True),
+                    nn.Conv2d(512, 512, 1, bias=False),
+                    nn.GroupNorm(1,512),
+                    nn.ReLU(True),
+                    nn.Conv2d(512, 512, 1, bias=True),
+                )
+            else:
+                self.maps_projector = nn.Identity()
+        
+        if ups_mode=='8x':  # prev best
+            self.lin1 = nn.Linear(h, 16384, bias=False)
+            self.norm = nn.GroupNorm(1, 256)
+            
+            self.upsampler = Decoder(
+                in_channels=256,
+                out_channels=4,
+                up_block_types=["UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D"],
+                block_out_channels=[64, 128, 256, 256],
+                layers_per_block=1,
+            )
+            self.maps_projector = nn.Identity()
+        
+        if ups_mode=='16x':
+            self.lin1 = nn.Linear(h, 8192, bias=False)
+            self.norm = nn.GroupNorm(1, 512)
+            
+            self.upsampler = Decoder(
+                in_channels=512,
+                out_channels=4,
+                up_block_types=["UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D", "UpDecoderBlock2D"],
+                block_out_channels=[64, 128, 256, 256, 512],
+                layers_per_block=1,
+            )
+            self.maps_projector = nn.Identity()
+
+
+        # self.register_parameter('queries', nn.Parameter(torch.randn(1, 256, 512) * 0.044))
+        # self.transformer = nn.TransformerDecoder(
+        #     nn.TransformerDecoderLayer(d_model=512, nhead=8, norm_first=True,
+        #                                 dim_feedforward=1024, activation=F.gelu,
+        #                                 batch_first=True, dropout=0.25),
+        #     num_layers=n_blocks
+        # )
 
         # option 1  -> 124.56M
         # self.lin1 = nn.Linear(h, 32768, bias=True)
@@ -522,31 +572,31 @@ class Voxel2StableDiffusionModel(torch.nn.Module):
         #     layers_per_block=1,
         # )
         
-        if use_cont:
-            self.maps_projector = nn.Sequential(
-                nn.LayerNorm(512),
-                nn.Linear(512, 512),
-                nn.LayerNorm(512),
-                nn.ReLU(True),
-                nn.Linear(512, 512),
-                nn.LayerNorm(512),
-                nn.ReLU(True),
-                nn.Linear(512, 512)
-            )
-        else:
-            self.maps_projector = nn.Identity()
+        # if use_cont:
+        #     self.maps_projector = nn.Sequential(
+        #         nn.LayerNorm(512),
+        #         nn.Linear(512, 512),
+        #         nn.LayerNorm(512),
+        #         nn.ReLU(True),
+        #         nn.Linear(512, 512),
+        #         nn.LayerNorm(512),
+        #         nn.ReLU(True),
+        #         nn.Linear(512, 512)
+        #     )
+        # else:
+        #     self.maps_projector = nn.Identity()
 
-        self.upsampler = nn.Sequential(
-            nn.GroupNorm(1, 32),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(32, 320, 3, padding=1),
-            nn.GroupNorm(32, 320),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(320, 320, 3, padding=1),
-            nn.GroupNorm(32, 320),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(320, 4, 3, padding=1)
-        )
+        # self.upsampler = nn.Sequential(
+        #     nn.GroupNorm(1, 32),
+        #     nn.SiLU(inplace=True),
+        #     nn.Conv2d(32, 320, 3, padding=1),
+        #     nn.GroupNorm(32, 320),
+        #     nn.SiLU(inplace=True),
+        #     nn.Conv2d(320, 320, 3, padding=1),
+        #     nn.GroupNorm(32, 320),
+        #     nn.SiLU(inplace=True),
+        #     nn.Conv2d(320, 4, 3, padding=1)
+        # )
 
     def forward(self, x, return_transformer_feats=False):
         x = self.lin0(x)
@@ -558,21 +608,35 @@ class Voxel2StableDiffusionModel(torch.nn.Module):
         x = x.reshape(len(x), -1)
         x = self.lin1(x)  # bs, 4096
 
-        # # x = x.reshape(x.shape[0], -1, 8, 8).contiguous()  # bs, 64, 8, 8
-        # x = x.reshape(x.shape[0], -1, 64, 64).contiguous()
-        # return self.upsampler(x)
-
-        # decoder
-        x = self.norm(x.reshape(x.shape[0], 32, 512))
-        preds = self.transformer(self.queries.expand(x.shape[0], -1, -1), x)
-        sd_embeds = preds.permute(0,2,1).reshape(-1, 512, 16, 16)
-        sd_embeds = F.pixel_shuffle(sd_embeds, 4)  # bs, 32, 32, 32
-
-        # contrastive
-        if return_transformer_feats:
-            return self.upsampler(sd_embeds), self.maps_projector(preds)
+        if self.ups_mode == '4x':
+            side = 16
+        if self.ups_mode == '8x':
+            side = 8
+        if self.ups_mode == '16x':
+            side = 4
         
-        return self.upsampler(sd_embeds)
+        # decoder
+        x = self.norm(x.reshape(x.shape[0], -1, side, side).contiguous())
+        if return_transformer_feats:
+            return self.upsampler(x), self.maps_projector(x).flatten(2).permute(0,2,1)
+        return self.upsampler(x)
+
+
+        # # # x = x.reshape(x.shape[0], -1, 8, 8).contiguous()  # bs, 64, 8, 8
+        # # x = x.reshape(x.shape[0], -1, 64, 64).contiguous()
+        # # return self.upsampler(x)
+
+        # # decoder
+        # x = self.norm(x.reshape(x.shape[0], 32, 512))
+        # preds = self.transformer(self.queries.expand(x.shape[0], -1, -1), x)
+        # sd_embeds = preds.permute(0,2,1).reshape(-1, 512, 16, 16)
+        # sd_embeds = F.pixel_shuffle(sd_embeds, 4)  # bs, 32, 32, 32
+
+        # # contrastive
+        # if return_transformer_feats:
+        #     return self.upsampler(sd_embeds), self.maps_projector(preds)
+        
+        # return self.upsampler(sd_embeds)
 
 class Voxel2StableDiffusionContModel(torch.nn.Module):
     def __init__(self, in_dim=15724, h=4096, n_blocks=4, use_cont=True):

@@ -23,7 +23,7 @@ from kornia.augmentation.container import AugmentationSequential
 from pytorch_msssim import ssim
 
 import ddp_config
-_, local_rank, device = ddp_config.set_ddp()
+_, local_rank, device, num_devices = ddp_config.set_ddp()
 
 import utils
 from models import Voxel2StableDiffusionModel
@@ -52,7 +52,7 @@ clamp_embs = False # clamp embeddings to (-1.5, 1.5)
 voxel_dims = 1 # 1 for flattened 3 for 3d
 n_samples_save = 4 # how many SD samples from train and val to save
 
-use_reconst = True
+use_reconst = False
 if use_reconst:
     batch_size = 8
 else:
@@ -63,18 +63,19 @@ initial_lr = 1e-3
 max_lr = 5e-4
 first_batch = False
 ckpt_saving = True
-ckpt_interval = 5
+ckpt_interval = 24
 save_at_end = False
 use_mp = False
 remote_data = False
 subj_id = "01"
-mixup_pct = 0.0
-use_cont = True
-use_sobel_loss = True
-use_blurred_training = True
+mixup_pct = -1
+use_cont = False
+use_sobel_loss = False
+use_blurred_training = False
 cont_model = 'cnx'
-seed = 0
+seed = 42
 resume_from_ckpt = False
+ups_mode = '8x'
 
 torch.backends.cuda.matmul.allow_tf32 = True
 # need non-deterministic CuDNN for conv3D to work
@@ -116,7 +117,7 @@ if os.path.exists(os.path.join(outdir, 'last.pth')):
     ckpt_path = os.path.join(outdir, 'last.pth')
     resume_from_ckpt = True
 
-num_devices = torch.cuda.device_count()
+# num_devices = torch.cuda.device_count()
 if num_devices==0: num_devices = 1
 num_workers = num_devices
 
@@ -129,8 +130,7 @@ if local_rank == 0: print('Creating voxel2sd...')
 
 in_dims = {'01': 15724, '02': 14278, '05': 13039, '07':12682}
 if voxel_dims == 1: # 1D data
-    voxel2sd = Voxel2StableDiffusionModel(use_cont=use_cont, in_dim=in_dims[subj_id])
-    # 134M params
+    voxel2sd = Voxel2StableDiffusionModel(use_cont=use_cont, in_dim=in_dims[subj_id], ups_mode=ups_mode)
 elif voxel_dims == 3: # 3D data
     raise NotImplementedError()
     
@@ -170,7 +170,7 @@ train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
     train_url=train_url,
     val_url=val_url,
     meta_url=meta_url,
-    val_batch_size=16,
+    val_batch_size=max(16, batch_size),
     cache_dir='/tmp/wds-cache',
     seed=seed+local_rank,
     voxels_key=voxels_key,
@@ -228,7 +228,6 @@ if resume_from_ckpt:
     epoch = checkpoint['epoch']+1
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])        
     voxel2sd.module.load_state_dict(checkpoint['model_state_dict'])
-    global_batch_size = batch_size * num_devices
     total_steps_done = epoch*((num_train//batch_size)//num_devices)
     for _ in range(total_steps_done):
         lr_scheduler.step()
@@ -330,9 +329,10 @@ for epoch in progress_bar:
                     sobel_loss = torch.tensor(0)
             else:
                 reconst_loss = torch.tensor(0)
+                sobel_loss = torch.tensor(0)
             
 
-            loss = mse_loss/0.18215 + 2*reconst_loss + cont_loss + 16*sobel_loss
+            loss = mse_loss/0.18215 + 2*reconst_loss + 0.1*cont_loss + 16*sobel_loss
             # utils.check_loss(loss)
 
             loss_mse_sum += mse_loss.item()
@@ -375,8 +375,8 @@ for epoch in progress_bar:
                     mse_loss = F.mse_loss(image_enc_pred, image_enc)
                     
                     if use_reconst:
-                        reconst = autoenc.decode(image_enc_pred[:16]/0.18215).sample
-                        image = image[:16]
+                        reconst = autoenc.decode(image_enc_pred[-16:]/0.18215).sample
+                        image = image[-16:]
                         reconst_loss = F.mse_loss(reconst, 2*image-1)
                         ssim_score = ssim((reconst/2 + 0.5).clamp(0,1), image, data_range=1, size_average=True, nonnegative_ssim=True)
                     else:
@@ -419,8 +419,8 @@ for epoch in progress_bar:
             try:
                 orig = image
                 if reconst is None:
-                    reconst = autoenc.decode(image_enc_pred[:16].detach()/0.18215).sample
-                    orig = image[:16]
+                    reconst = autoenc.decode(image_enc_pred[-16:].detach()/0.18215).sample
+                    orig = image[-16:]
                 pred_grid = make_grid(((reconst/2 + 0.5).clamp(0,1)*255).byte(), nrow=int(len(reconst)**0.5)).permute(1,2,0).cpu().numpy()
                 orig_grid = make_grid((orig*255).byte(), nrow=int(len(orig)**0.5)).permute(1,2,0).cpu().numpy()
                 comb_grid = np.concatenate([orig_grid, pred_grid], axis=1)

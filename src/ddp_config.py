@@ -37,11 +37,11 @@ def set_ddp():
     env_dict = {
         key: os.environ[key]
         for key in ("MASTER_ADDR", "MASTER_PORT", "RANK",
-                    "LOCAL_RANK", "WORLD_SIZE")
+                    "LOCAL_RANK", "WORLD_SIZE", "NUM_GPUS")
     }
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
-    n = torch.cuda.device_count()
+    n = int(os.environ["NUM_GPUS"])
     device_ids = list(
         range(local_rank * n, (local_rank + 1) * n)
     )
@@ -59,7 +59,7 @@ def set_ddp():
         + f"world_size = {dist.get_world_size()}, n = {n}, device_ids = {device_ids}"
     )
     device = torch.device("cuda", local_rank)
-    return True, local_rank, device
+    return True, local_rank, device, n
 
 # Slurm reference for DDP:
 ## !/bin/bash

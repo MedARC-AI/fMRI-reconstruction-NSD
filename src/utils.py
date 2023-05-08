@@ -369,8 +369,8 @@ def get_dataloaders(
     train_dl = torch.utils.data.DataLoader(train_data, batch_size=None, num_workers=num_workers, shuffle=False)
 
     # Validation
-    # should be deterministic, no shuffling!    
-    num_batches = math.floor(num_val / global_batch_size)
+    # should be deterministic, no shuffling!  
+    num_batches = math.floor(num_val / val_batch_size)
     num_worker_batches = math.floor(num_batches / num_workers)
     if num_worker_batches == 0: num_worker_batches = 1
     
