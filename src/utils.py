@@ -220,7 +220,7 @@ def mixco_nce(preds, targs, temp=0.1, perm=None, betas=None, select=None, distri
 
         loss = -(brain_clip.log_softmax(-1) * probs).sum(-1).mean()
         if bidirectional:
-            loss2 = -(brain_clip.T.log_softmax(-1) * probs).sum(-1).mean()
+            loss2 = -(brain_clip.T.log_softmax(-1) * probs.T).sum(-1).mean()
             loss = (loss + loss2)/2
         #print('mixco loss: ', loss.item())
         return loss
