@@ -353,19 +353,6 @@ class BrainNetworkNoDETR(BrainNetwork):
         # self.norm = nn.LayerNorm(out_dim)
         self.encoder_tokens = encoder_tokens
         
-        # self.register_parameter('queries', nn.Parameter(torch.randn(1, decoder_tokens, out_dim)))
-        # self.transformer = nn.TransformerDecoder(
-        #     nn.TransformerDecoderLayer(d_model=out_dim, nhead=8,
-        #                                dim_feedforward=1024, norm_first=True,
-        #                                activation='gelu',batch_first=True, 
-        #                                dropout=0.25),
-        #     num_layers=n_blocks
-        # )
-        # self.decoder_projector = nn.Sequential(
-        #     nn.LayerNorm(out_dim),
-        #     nn.GELU(),
-        #     nn.Linear(out_dim, out_dim)
-        # )
         self.use_projector = use_projector
         if use_projector:
             self.projector = nn.Sequential(
@@ -380,11 +367,11 @@ class BrainNetworkNoDETR(BrainNetwork):
                 nn.Linear(2048, out_dim)
             )
 
-
-
     def forward(self, x):
         enc = super().forward(x)
         enc = enc.reshape(enc.shape[0], self.encoder_tokens, -1)
+        if self.encoder_tokens == 1:
+            enc = enc.squeeze(1)
         if self.use_projector:
             return enc, self.projector(enc)
         return enc

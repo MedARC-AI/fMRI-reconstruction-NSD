@@ -16,7 +16,7 @@ from kornia.augmentation.container import AugmentationSequential
 
 import utils
 from utils import torch_to_matplotlib, torch_to_Image
-from models import Clipper, OpenClipper, BrainNetworkDETR2, BrainNetworkNoDETR, BrainDiffusionPrior, BrainVD, VersatileDiffusionPriorNetwork
+from models import Clipper, OpenClipper, BrainNetworkDETR2, BrainNetworkNoDETR, BrainDiffusionPrior, BrainVD, BrainSD, VersatileDiffusionPriorNetwork
 from model3d import SimpleVoxel3dConvEncoder
 
 import torch.distributed as dist
@@ -178,6 +178,14 @@ def parse_args():
         choices=["01", "02", "05", "07"],
         default="01"
     )
+    parser.add_argument(
+        "--no_versatile",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--causal",
+        action="store_true",
+    )
     return parser.parse_args()
 
 def do_contrastive_loss(clip_voxels, clip_target, temp, mixco, training, loss_type,
@@ -279,7 +287,7 @@ if __name__ == '__main__':
     batch_size = 32 if args.voxel_dims == 1 else 16
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')    
 
-    num_epochs = args.num_epochs  # 350 if data_commit=='avg' else 120
+    num_epochs = args.num_epochs
     lr_scheduler = 'cycle'
     initial_lr = 1e-3 #3e-5
     max_lr = 3e-4
@@ -290,7 +298,7 @@ if __name__ == '__main__':
     wandb_notes = ''
     first_batch = False
     ckpt_saving = True
-    ckpt_interval = 25
+    ckpt_interval = 50 # 25
     use_mp = False
     distributed = False
     save_at_end = False
@@ -309,6 +317,7 @@ if __name__ == '__main__':
 
     resume_from_ckpt = args.ckpt_path is not None
     ckpt_path = args.ckpt_path
+    use_versatile = not args.no_versatile
 
     lr_scheduler = 'cycle'
     initial_lr = 5e-4 # only used if lr_scheduler is 'fixed'
@@ -316,7 +325,10 @@ if __name__ == '__main__':
     if normed_mse:
         alpha = 30  # 100
     else:
-        alpha = 3  # 0.1
+        if use_versatile:
+            alpha = 3
+        else:
+            alpha = 0.3
 
     if args.outdir is None:
         # outdir = os.path.expanduser(f'../train_logs/models/{model_name}/test')
@@ -366,25 +378,43 @@ if __name__ == '__main__':
         ckpt_path = os.path.join(outdir, 'last.pth')
         resume_from_ckpt = True
 
-    vd_cache_dir = '/fsx/proj-medarc/fmri/cache/models--shi-labs--versatile-diffusion/snapshots/2926f8e11ea526b562cd592b099fcf9c2985d0b7'
-    vd_pipe =  BrainVD.from_pretrained(
-        # "lambdalabs/sd-image-variations-diffusers",
-        vd_cache_dir,
-        safety_checker=None,
-        requires_safety_checker=False,
-        torch_dtype=torch.float32, # fp16 is fine if we're not training this
-    ).to("cpu")
+    if use_versatile:
+        vd_cache_dir = '/fsx/proj-medarc/fmri/cache/models--shi-labs--versatile-diffusion/snapshots/2926f8e11ea526b562cd592b099fcf9c2985d0b7'
+        vd_pipe =  BrainVD.from_pretrained(
+            # "lambdalabs/sd-image-variations-diffusers",
+            vd_cache_dir,
+            safety_checker=None,
+            requires_safety_checker=False,
+            torch_dtype=torch.float32, # fp16 is fine if we're not training this
+        ).to("cpu")
 
-    vd_pipe.text_encoder.eval()
-    vd_pipe.text_encoder.requires_grad_(False)
-    vd_pipe.image_encoder.eval()
-    vd_pipe.image_encoder.requires_grad_(False)
-    vd_pipe.text_unet.eval()
-    vd_pipe.text_unet.requires_grad_(False)
-    vd_pipe.image_unet.eval()
-    vd_pipe.image_unet.requires_grad_(False)
-    vd_pipe.vae.eval()
-    vd_pipe.vae.requires_grad_(False)
+        vd_pipe.text_encoder.eval()
+        vd_pipe.text_encoder.requires_grad_(False)
+        vd_pipe.image_encoder.eval()
+        vd_pipe.image_encoder.requires_grad_(False)
+        vd_pipe.text_unet.eval()
+        vd_pipe.text_unet.requires_grad_(False)
+        vd_pipe.image_unet.eval()
+        vd_pipe.image_unet.requires_grad_(False)
+        vd_pipe.vae.eval()
+        vd_pipe.vae.requires_grad_(False)
+    else:
+        sd_cache_dir = '/fsx/proj-medarc/fmri/cache/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc'
+        sd_pipe = BrainSD.from_pretrained(
+            sd_cache_dir, 
+            revision="v2.0",
+            safety_checker=None,
+            requires_safety_checker=False,
+            torch_dtype=torch.float32,
+        ).to("cpu")
+
+        # freeze everything, we're just using this for inference
+        sd_pipe.unet.eval()
+        sd_pipe.unet.requires_grad_(False)
+        sd_pipe.vae.eval()
+        sd_pipe.vae.requires_grad_(False)
+        sd_pipe.image_encoder.eval()
+        sd_pipe.image_encoder.requires_grad_(False)
 
     num_devices = torch.cuda.device_count()
     if num_devices==0: num_devices = 1
@@ -399,7 +429,7 @@ if __name__ == '__main__':
         distributed = True
     
     try:
-        clip_extractor = Clipper(clip_variant, clamp_embs=False, norm_embs=False, hidden_state=True, refine=False, 
+        clip_extractor = Clipper(clip_variant, clamp_embs=False, norm_embs=False, hidden_state=use_versatile, refine=False, 
             device=device, train_transforms=train_augs)
         print('Creating Clipper...')
     except AssertionError:
@@ -502,7 +532,10 @@ if __name__ == '__main__':
             voxel2clip_kwargs = dict(out_dim=out_dim, encoder_tokens=257)
             voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
         else:
-            voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=257, use_projector=use_projector)
+            if use_versatile:
+                voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=257, use_projector=use_projector)
+            else:
+                voxel2clip_kwargs = dict(out_dim=out_dim, norm_type='ln', act_first=False, encoder_tokens=1, use_projector=use_projector)
             in_dims = {'01': 15724, '02': 14278, '05': 13039, '07':12682}
             voxel2clip_kwargs["in_dim"] = in_dims[subj_id]
             voxel2clip = BrainNetworkNoDETR(**voxel2clip_kwargs)
@@ -540,25 +573,38 @@ if __name__ == '__main__':
     dim_head = 64
     heads = 12 # heads * dim_head = 12 * 64 = 768
     timesteps = 100
-    prior_network = VersatileDiffusionPriorNetwork(
-        dim=out_dim,
-        depth=depth,
-        dim_head=dim_head,
-        heads=heads,
-        causal=False,
-        learned_query_mode=learned_query_mode
-    ).to(device)
-
-    # custom version that can fix seeds
-    diffusion_prior = BrainDiffusionPrior(
-        net=prior_network,
-        image_embed_dim=out_dim,
-        condition_on_text_encodings=False,
-        timesteps=timesteps,
-        cond_drop_prob=0.2,
-        image_embed_scale=None,
-        voxel2clip=voxel2clip
-    ).to(device)
+    if use_versatile:
+        prior_network = VersatileDiffusionPriorNetwork(
+            dim=out_dim,
+            depth=depth,
+            dim_head=dim_head,
+            heads=heads,
+            causal=args.causal,
+            learned_query_mode=learned_query_mode
+        ).to(device)
+        # custom version that can fix seeds
+        diffusion_prior = BrainDiffusionPrior(
+            net=prior_network,
+            image_embed_dim=out_dim,
+            condition_on_text_encodings=False,
+            timesteps=timesteps,
+            cond_drop_prob=0.2,
+            image_embed_scale=None,
+            voxel2clip=voxel2clip
+        ).to(device)
+    else:
+        diffusion_prior = BrainDiffusionPrior.from_pretrained(
+        # kwargs for DiffusionPriorNetwork
+        dict(),
+        # kwargs for DiffusionNetwork
+        dict(
+            condition_on_text_encodings=False,
+            timesteps=1000,
+            voxel2clip=voxel2clip,
+        ),
+        voxel2clip_path=None,
+        ckpt_dir='../train_logs/models/nousr_aesthetic_prior/'
+    )
     
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     if pretrained_v2c:
@@ -589,10 +635,9 @@ if __name__ == '__main__':
         )
 
     def save_ckpt(tag):
-        if tag == "last":
-            if os.path.exists(os.path.join(outdir, f'{tag}.pth')):
-                shutil.copyfile(os.path.join(outdir, f'{tag}.pth'), os.path.join(outdir, f'{tag}_old.pth'))
-                # shutil.move(os.path.join(outdir, f'{tag}.pth'), os.path.join(outdir, f'{tag}_old.pth'))
+        if tag == "last" and os.path.exists(os.path.join(outdir, f'{tag}.pth')):
+            shutil.copyfile(os.path.join(outdir, f'{tag}.pth'), os.path.join(outdir, f'{tag}_old.pth'))
+            # shutil.move(os.path.join(outdir, f'{tag}.pth'), os.path.join(outdir, f'{tag}_old.pth'))
         ckpt_path = os.path.join(outdir, f'{tag}.pth')
         print(f'saving {ckpt_path}',flush=True)
         torch.save({
@@ -607,7 +652,7 @@ if __name__ == '__main__':
             'val_bwd_percent_correct': val_bwd_percent_correct,
             'lrs': lrs,
             }, ckpt_path)
-        if tag == "last":
+        if tag == "last" and os.path.exists(os.path.join(outdir, f'{tag}_old.pth')):
             os.remove(os.path.join(outdir, f'{tag}_old.pth'))
 
     print("\nDone with model preparations!")
@@ -645,10 +690,12 @@ if __name__ == '__main__':
         }
         print("wandb_config:\n",wandb_config)
         wandb.init(
+            id = model_name,
             project=args.wandb_project,
             name=wandb_run,
             config=wandb_config,
             notes=wandb_notes,
+            resume="allow"
         )
             
     #----ACCELERATE------------
@@ -935,38 +982,71 @@ if __name__ == '__main__':
                 }
             progress_bar.set_postfix(**logs)
 
-            # sample some images
-            if vd_pipe is not None:
-                if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
-                    if (not save_at_end and n_samples_save > 0) or (save_at_end and epoch == num_epochs - 1):
-                        # training
-                        del clip_voxels, clip_voxels_mse, clip_target, image, voxel, pred, clip_target_prior
-                        torch.cuda.empty_cache()
-                        vd_pipe.to(device)
-                        vd_pipe.to(torch.float16)
-                        # training
-                        grids,_ = utils.vd_sample_images(
-                            clip_extractor, diffusion_prior.voxel2clip, vd_pipe, diffusion_prior,
-                            voxel0[:n_samples_save], image0[:n_samples_save], seed=42,
-                        )
-                        for i, grid in enumerate(grids):
-                            grid.save(os.path.join(outdir, f'samples-train-{i:03d}.png'))
-                        if wandb_log:
-                            logs['train/samples'] = [wandb.Image(grid) for grid in grids]
+            if use_versatile:
+                # sample some images
+                if vd_pipe is not None:
+                    if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
+                        if (not save_at_end and n_samples_save > 0) or (save_at_end and epoch == num_epochs - 1):
+                            # training
+                            del clip_voxels, clip_voxels_mse, clip_target, image, voxel, pred, clip_target_prior
+                            torch.cuda.empty_cache()
+                            vd_pipe.to(device)
+                            vd_pipe.to(torch.float16)
+                            # training
+                            grids,_ = utils.vd_sample_images(
+                                clip_extractor, diffusion_prior.voxel2clip, vd_pipe, diffusion_prior,
+                                voxel0[:n_samples_save], image0[:n_samples_save], seed=42,
+                            )
+                            for i, grid in enumerate(grids):
+                                grid.save(os.path.join(outdir, f'samples-train-{i:03d}.png'))
+                            if wandb_log:
+                                logs['train/samples'] = [wandb.Image(grid) for grid in grids]
 
-                        # validation
-                        grids,_ = utils.vd_sample_images(
-                            clip_extractor, diffusion_prior.voxel2clip, vd_pipe, diffusion_prior,
-                            val_voxel0[:n_samples_save], val_image0[:n_samples_save], seed=42,
-                        )
-                        for i, grid in enumerate(grids):
-                            grid.save(os.path.join(outdir, f'samples-val-{i:03d}.png'))
-                        if wandb_log:
-                            logs['val/samples'] = [wandb.Image(grid) for grid in grids]
-                    
-                        del grids
-                        vd_pipe.to(torch.float32)
-                        vd_pipe.to('cpu')
+                            # validation
+                            grids,_ = utils.vd_sample_images(
+                                clip_extractor, diffusion_prior.voxel2clip, vd_pipe, diffusion_prior,
+                                val_voxel0[:n_samples_save], val_image0[:n_samples_save], seed=42,
+                            )
+                            for i, grid in enumerate(grids):
+                                grid.save(os.path.join(outdir, f'samples-val-{i:03d}.png'))
+                            if wandb_log:
+                                logs['val/samples'] = [wandb.Image(grid) for grid in grids]
+                        
+                            del grids
+                            vd_pipe.to(torch.float32)
+                            vd_pipe.to('cpu')
+            else:
+                if sd_pipe is not None:
+                    if (ckpt_interval is not None and (epoch + 1) % ckpt_interval == 0) or epoch == num_epochs - 1:
+                        if (not save_at_end and n_samples_save > 0) or (save_at_end and epoch == num_epochs - 1):
+                            # training
+                            del clip_voxels, clip_voxels_mse, clip_target, image, voxel, pred, clip_target_prior
+                            torch.cuda.empty_cache()
+                            sd_pipe.to(device)
+                            sd_pipe.to(torch.float16)
+                            # training
+                            grids,_ = utils.sample_images(
+                                clip_extractor, diffusion_prior.voxel2clip, sd_pipe, diffusion_prior,
+                                voxel0[:n_samples_save], image0[:n_samples_save], seed=42,
+                            )
+                            for i, grid in enumerate(grids):
+                                grid.save(os.path.join(outdir, f'samples-train-{i:03d}.png'))
+                            if wandb_log:
+                                logs['train/samples'] = [wandb.Image(grid) for grid in grids]
+
+                            # validation
+                            grids,_ = utils.sample_images(
+                                clip_extractor, diffusion_prior.voxel2clip, sd_pipe, diffusion_prior,
+                                val_voxel0[:n_samples_save], val_image0[:n_samples_save], seed=42,
+                            )
+                            for i, grid in enumerate(grids):
+                                grid.save(os.path.join(outdir, f'samples-val-{i:03d}.png'))
+                            if wandb_log:
+                                logs['val/samples'] = [wandb.Image(grid) for grid in grids]
+                        
+                            del grids
+                            sd_pipe.to(torch.float32)
+                            sd_pipe.to('cpu')
             
             if args.wandb_log:
                 while True:

@@ -25,6 +25,7 @@ from clip_retrieval.clip_client import ClipClient
 import time 
 from torchvision.models import alexnet, AlexNet_Weights
 import braceexpand
+import traceback
 # from image_finder import _check_whether_images_are_identical
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -618,6 +619,7 @@ def sample_images(
     seed=None,
     verbose=True,
     device='cuda',
+    do_fid=False
 ):
 
     def null_sync(t, *args, **kwargs):
@@ -627,12 +629,13 @@ def sample_images(
         # Convert from [0, 1] to [0, 255] and from torch.float to torch.uint8
         return imgs.mul(255).add(0.5).clamp(0, 255).type(torch.uint8)
 
-    fid = FrechetInceptionDistance(feature=64, dist_sync_fn=null_sync).to(device)
+    if do_fid:
+        fid = FrechetInceptionDistance(feature=64, dist_sync_fn=null_sync).to(device)
 
-    # inside FID it will resize to 300x300 from 256x256
-    # [n, 3, 256, 256]
-    # print('img_input.shape', img_input.shape)
-    fid.update(convert_imgs_for_fid(img_input.to(device)), real=True)
+        # inside FID it will resize to 300x300 from 256x256
+        # [n, 3, 256, 256]
+        # print('img_input.shape', img_input.shape)
+        fid.update(convert_imgs_for_fid(img_input.to(device)), real=True)
     
     assert voxel.shape[0] == img_input.shape[0], 'batch dim must be the same for voxels and images'
     n_examples = voxel.shape[0]
@@ -664,7 +667,7 @@ def sample_images(
 
         # Original clip embedding:
         if annotations is None:
-            clip_emb = clip_extractor.embed_image(image)
+            clip_emb = clip_extractor.embed_image(image, apply_transforms=False)
         else:
             print('Sampling with CLIP text guidance')
             # random=False will use the first prompt here, which could be different from training 
@@ -677,6 +680,9 @@ def sample_images(
 
         # Encode voxels to CLIP space
         image_embeddings = brain_net(voxel[[idx]].to(device).float())
+        if brain_net.use_projector:
+            # tuple of mse embeds and contrastive embeds
+            image_embeddings = image_embeddings[0]
         norm_pre_prior = image_embeddings.norm().item()
         
         # image_embeddings = nn.functional.normalize(image_embeddings, dim=-1) 
@@ -737,10 +743,11 @@ def sample_images(
             # print('img_clip.shape', img_clip.shape)
             # print('imgs_brain.shape', imgs_brain.shape)
 
-        # inside FID it will resize to 300x300 from 512x512
-        print('Done sampling images, updating FID', flush=True)
-        fid.update(convert_imgs_for_fid(imgs_brain.to(device)), real=False)
-        print('Done updating FID', flush=True)
+        if do_fid:
+            # inside FID it will resize to 300x300 from 512x512
+            print('Done sampling images, updating FID', flush=True)
+            fid.update(convert_imgs_for_fid(imgs_brain.to(device)), real=False)
+            print('Done updating FID', flush=True)
         
         # resizing for now since passing target sizes into sd_pipe doesn't work
         size = (256, 256)
@@ -753,7 +760,7 @@ def sample_images(
         )
         grids.append(grid)
 
-    return grids, fid
+    return grids, fid if do_fid else None
 
 def save_ckpt(model, optimizer, losses, val_losses, lrs, epoch, tag, outdir):
         ckpt_path = os.path.join(outdir, f'ckpt-{tag}.pth')
