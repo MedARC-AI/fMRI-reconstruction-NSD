@@ -1,4 +1,4 @@
-# MindEye fMRI-to-Image reconstructions & retrieval
+# MindEye fMRI-to-Image reconstruction & retrieval
 
 ![](docs/pipeline.png)<br>
 
@@ -24,7 +24,7 @@ Train MindEye via ``Train_MindEye.py``.
 Set ``data_path`` to where you want to download the Natural Scenes Dataset (warning: >30Gb per subject).
 Set ``model_name`` to what you want to name the model, used for saving.
 
-Other arguments can be set as default to train the full MindEye high-level pipeline to the last hidden layer of CLIP ViT-L/14 using the same settings as the paper, for Subject 1.
+Various arguments can be set (see below), the default is to train MindEye high-level pipeline to the last hidden layer of CLIP ViT-L/14 using the same settings as the paper, for Subject 1.
 
 Trained model checkpoints will be saved inside a folder "fMRI-reconstruction-NSD/train_logs". All other outputs get saved inside "fMRI-reconstruction-NSD/src" folder.
 
@@ -116,7 +116,7 @@ options:
 
 # Reconstructing from pre-trained MindEye
 
-Pretrained Subject 1 models can be downloaded [huggingface](https://huggingface.co/datasets/pscotti/naturalscenesdataset/tree/main/mindeye_models). Includes mapping to CLIP ViT-L/14 hidden layer (257x768), CLIP ViT-L/14 final layer (1x768), and Stable Diffusion VAE (low-level pipeline). If you want to use these checkpoints you must put them inside of the train_logs folder like so: "fMRI-reconstruction-NSD/train_logs/model_name/last.pth". Then when you run the below code specify "model_name" as the ``model_name`` argument.
+Pretrained Subject 1 models can be downloaded on [huggingface](https://huggingface.co/datasets/pscotti/naturalscenesdataset/tree/main/mindeye_models). Includes mapping to CLIP ViT-L/14 hidden layer (257x768), CLIP ViT-L/14 final layer (1x768), and Stable Diffusion VAE (low-level pipeline). If you want to use these checkpoints you must put them inside of the train_logs folder like so: "fMRI-reconstruction-NSD/train_logs/model_name/last.pth". Then when you run the below code specify "model_name" as the ``model_name`` argument.
 
 ``Reconstructions.py`` defaults to outputting a 
 
