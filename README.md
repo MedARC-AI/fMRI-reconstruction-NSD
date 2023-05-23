@@ -118,7 +118,7 @@ options:
 
 Pretrained Subject 1 models can be downloaded on [huggingface](https://huggingface.co/datasets/pscotti/naturalscenesdataset/tree/main/mindeye_models). Includes mapping to CLIP ViT-L/14 hidden layer (257x768), CLIP ViT-L/14 final layer (1x768), and Stable Diffusion VAE (low-level pipeline). If you want to use these checkpoints you must put them inside of the train_logs folder like so: "fMRI-reconstruction-NSD/train_logs/model_name/last.pth". Then when you run the below code specify "model_name" as the ``model_name`` argument.
 
-``Reconstructions.py`` defaults to outputting a 
+``Reconstructions.py`` defaults to outputting Versatile Diffusion reconstructions as a torch .pt file, without img2img and without second-order selection (recons_per_sample=1).
 
 ```bash
 $ python Reconstructions.py --help
