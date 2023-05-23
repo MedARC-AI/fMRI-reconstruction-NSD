@@ -15,7 +15,7 @@ conda env create -f src/environment.yaml
 conda activate medical-v1
 ```
 
-4. (optional) For LAION-5B retrieval you will need to map to the last layer of CLIP ViT-L/32 (in addition to the last hidden layer, which is the standard MindEye pipeline). For training MindEye on just the last layer (aka "4 ResBlocks + Only CLS" in the paper), you will need to cd into the "src" folder and run ``. download.sh``. This will allow you to train the diffusion prior from a pretrained checkpoint (text to image diffusion prior trained from LAION-Aesthetics).
+4. (optional) For LAION-5B retrieval you will need to map to the last layer of CLIP ViT-L/14 (in addition to the last hidden layer, which is the standard MindEye pipeline). For training MindEye on just the last layer (aka "4 ResBlocks + Only CLS" in the paper), you will need to cd into the "src" folder and run ``. download.sh``. This will allow you to train the diffusion prior from a pretrained checkpoint (text to image diffusion prior trained from LAION-Aesthetics).
 
 # Training MindEye (high-level pipeline)
 
