@@ -6,11 +6,11 @@
 
 # # Code to convert this notebook to .py if you want to run it via command line or with Slurm
 # from subprocess import call
-# command = "jupyter nbconvert Retrieval_Evaluation.ipynb --to python"
+# command = "jupyter nbconvert Retrievals.ipynb --to python"
 # call(command,shell=True)
 
 
-# In[2]:
+# In[1]:
 
 
 import os
@@ -54,8 +54,8 @@ if utils.is_interactive():
     # Example use
     jupyter_args = "--data_path=/fsx/proj-medarc/fmri/natural-scenes-dataset \
                     --subj=1 \
-                    --model_name=test\
-                    --model_name2=testing"
+                    --model_name=prior_257_final_subj01_bimixco_softclip_byol\
+                    --model_name2=prior_1x768_final_subj01_bimixco_softclip_byol"
     
     jupyter_args = jupyter_args.split()
     print(jupyter_args)
@@ -228,7 +228,7 @@ diffusion_prior_cls.eval().to(device)
 pass
 
 
-# In[9]:
+# In[6]:
 
 
 print(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
@@ -294,7 +294,7 @@ if not utils.is_interactive():
 
 # # Image/Brain retrieval
 
-# In[ ]:
+# In[7]:
 
 
 batch_size = 300 # same as used in mind_reader
@@ -326,7 +326,7 @@ for val_i, (voxel, img_input, coco) in enumerate(val_dl):
 
 # ### VD
 
-# In[ ]:
+# In[8]:
 
 
 out_dim = 257 * 768
@@ -420,7 +420,7 @@ pass
 
 # ## Retrieval on test set
 
-# In[ ]:
+# In[9]:
 
 
 percent_correct_fwds, percent_correct_bwds = [], []
@@ -492,7 +492,7 @@ bwd_sim = np.array(bwd_sim.cpu())
 
 # ## Image retrieval visualization
 
-# In[ ]:
+# In[10]:
 
 
 print("Given Brain embedding, find correct Image embedding")
@@ -510,9 +510,9 @@ fig.tight_layout()
 plt.show()
 
 
-# ### Zebra example
+# ### Zebra example / Retrieval with batch size 982
 
-# In[ ]:
+# In[14]:
 
 
 device = 'cpu' # move to cpu to not OOM with all 982 samples
@@ -525,11 +525,11 @@ val_data = wds.WebDataset(val_url, resampled=False)\
     .to_tuple("voxels", "images", "coco")\
     .batched(982, partial=True)
 val_dl = torch.utils.data.DataLoader(val_data, batch_size=None, shuffle=False)
-for val_i, (voxel, img, coco) in enumerate(tqdm(val_dl,total=1)):
+for val_i, (voxel, img_input, coco) in enumerate(tqdm(val_dl,total=1)):
     with torch.no_grad():
         voxel = torch.mean(voxel,axis=1).to(device) # average across repetitions
 
-        emb = clip_extractor0.embed_image(img.to(device)).float() # CLIP-Image
+        emb = clip_extractor0.embed_image(img_input.to(device)).float() # CLIP-Image
         
         _, emb_ = diffusion_prior.voxel2clip(voxel.float()) # CLIP-Brain
         
@@ -545,24 +545,19 @@ for val_i, (voxel, img, coco) in enumerate(tqdm(val_dl,total=1)):
         bwd_sim = utils.batchwise_cosine_similarity(emb,emb_)  # clip, brain
         fwd_sim = utils.batchwise_cosine_similarity(emb_,emb)  # brain, clip
         
-        if percent_correct_fwd is None:
-            cnt=len(fwd_sim)
-            percent_correct_fwd = utils.topk(fwd_sim, labels,k=1)
-            percent_correct_bwd = utils.topk(bwd_sim, labels,k=1)
-        else:
-            cnt+=len(fwd_sim)
-            percent_correct_fwd += utils.topk(fwd_sim, labels,k=1)
-            percent_correct_bwd += utils.topk(bwd_sim, labels,k=1)
+        cnt=len(fwd_sim)
+        percent_correct_fwd = utils.topk(fwd_sim, labels,k=1)
+        percent_correct_bwd = utils.topk(bwd_sim, labels,k=1)
             
 print(percent_correct_fwd, percent_correct_bwd)
 fwd_sim = fwd_sim.numpy()
 bwd_sim = bwd_sim.numpy()
 
 
-# In[ ]:
+# In[20]:
 
 
-zebra_indices = [32,33]#[891, 892, 893, 863, 833, 652, 516, 512, 498, 451, 331, 192, 129, 66] # 10
+zebra_indices = [891, 892, 893, 863, 833, 652, 516, 512, 498, 451, 331, 192, 129, 66]
 print("# zebras =", len(zebra_indices))
 fig, ax = plt.subplots(nrows=2, ncols=6, figsize=(11,5))
 for trial,t in enumerate(zebra_indices[:2]):
@@ -578,16 +573,9 @@ fig.tight_layout()
 plt.show()
 
 
-# In[ ]:
-
-
-for z in zebra_indices[:2]:
-    display(utils.torch_to_Image(img_input[z]))
-
-
 # ## Brain retrieval visualization
 
-# In[ ]:
+# In[22]:
 
 
 print("Given Image embedding, find correct Brain embedding")

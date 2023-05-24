@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[3]:
+# In[ ]:
 
 
 # # Code to convert this notebook to .py if you want to run it via command line or with Slurm
@@ -48,13 +48,13 @@ imsize = 512
 
 # # Configurations
 
-# In[ ]:
+# In[3]:
 
 
 # if running this interactively, can specify jupyter_args here for argparser to use
 if utils.is_interactive():
     # Example use
-    jupyter_args = "--recon_path=test"
+    jupyter_args = "--recon_path=prior_257_final_subj01_bimixco_softclip_byol_brain_recons_full_img2img0.85_16samples.pt"
     
     jupyter_args = jupyter_args.split()
     print(jupyter_args)
@@ -64,7 +64,7 @@ if utils.is_interactive():
     get_ipython().run_line_magic('autoreload', '2 # this allows you to change functions in models.py or utils.py and have this notebook automatically update with your revisions')
 
 
-# In[ ]:
+# In[6]:
 
 
 parser = argparse.ArgumentParser(description="Model Training Configuration")
@@ -73,7 +73,7 @@ parser.add_argument(
     help="path to reconstructed/retrieved outputs",
 )
 parser.add_argument(
-    "--all_images_path", type=str, default="all_images",
+    "--all_images_path", type=str, default="all_images.pt",
     help="path to ground truth outputs",
 )
 
@@ -87,7 +87,7 @@ for attribute_name in vars(args).keys():
     globals()[attribute_name] = getattr(args, attribute_name)
 
 
-# In[ ]:
+# In[7]:
 
 
 all_brain_recons = torch.load(f'{recon_path}')
@@ -98,6 +98,40 @@ print(all_brain_recons.shape)
 
 all_images = all_images.to(device)
 all_brain_recons = all_brain_recons.to(device).to(all_images.dtype).clamp(0,1)
+
+
+# # Display reconstructions next to ground truth images
+
+# In[12]:
+
+
+imsize = 256
+all_images = transforms.Resize((imsize,imsize))(all_images)
+all_brain_recons = transforms.Resize((imsize,imsize))(all_brain_recons)
+
+np.random.seed(0)
+ind = np.flip(np.array([112,119,101,44,159,22,173,174,175,189,981,243,249,255,265]))
+
+all_interleaved = torch.zeros(len(ind)*2,3,imsize,imsize)
+icount = 0
+for t in ind:
+    all_interleaved[icount] = all_images[t]
+    all_interleaved[icount+1] = all_brain_recons[t]
+    icount += 2
+
+plt.rcParams["savefig.bbox"] = 'tight'
+def show(imgs,figsize):
+    if not isinstance(imgs, list):
+        imgs = [imgs]
+    fig, axs = plt.subplots(ncols=len(imgs), squeeze=False, figsize=figsize)
+    for i, img in enumerate(imgs):
+        img = img.detach()
+        img = transforms.ToPILImage()(img)
+        axs[0, i].imshow(np.asarray(img))
+        axs[0, i].set(xticklabels=[], yticklabels=[], xticks=[], yticks=[])
+    
+grid = make_grid(all_interleaved, nrow=10, padding=2)
+show(grid,figsize=(20,16))
 
 
 # # 2-Way Identification
