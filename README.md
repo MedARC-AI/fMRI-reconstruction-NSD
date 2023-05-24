@@ -23,7 +23,7 @@ This repository contains Jupyter notebooks for
 
 1. Training MindEye (src/Train_MindEye.ipynb)
 2. Reconstructing images from brain activity using the trained model (src/Reconstructions.ipynb)
-3. Retrieving images from brain activity either from the test set or via LAION-5B (src/Retrieval_Evaluation.ipynb) 
+3. Retrieving images from brain activity either from the test set or via LAION-5B (src/Retrievals.ipynb) 
 4. Evaluating reconstructions against the ground truth images according to low- and high-level image metrics (src/Reconstruction_Metrics.ipynb) 
 
 All the above Jupyter notebooks also have corresponding python (.py) files which can be run via the command-line.
@@ -183,19 +183,19 @@ options:
 
 ## Image/Brain Retrieval (inc. LAION-5B image retrieval)
 
-To evaluate image/brain retrieval using the NSD test set then use the Jupyter notebook ``Retrieval_Evaluation.ipynb`` and follow the code blocks under the "Image/Brain Retrieval" heading.
+To evaluate image/brain retrieval using the NSD test set then use the Jupyter notebook ``Retrievals.ipynb`` and follow the code blocks under the "Image/Brain Retrieval" heading.
 
-Running ``Retrieval_Evaluation.py`` will retrieve the top 16 nearest neighbors in LAION-5B based on the MindEye variant where brain activity is mapped to the final layer of CLIP. This is followed by second-order selection where the 16 retrieved images are converted to CLIP last hidden layer embeddings and compared to the MindEye outputs from the core model where brain activity is mapped to the last hidden layer of CLIP. The highest CLIP similarity retrieved image will be chosen, with all top-1 retrievals saved to a torch .pt file.
+Running ``Retrievals.py`` will retrieve the top 16 nearest neighbors in LAION-5B based on the MindEye variant where brain activity is mapped to the final layer of CLIP. This is followed by second-order selection where the 16 retrieved images are converted to CLIP last hidden layer embeddings and compared to the MindEye outputs from the core model where brain activity is mapped to the last hidden layer of CLIP. The highest CLIP similarity retrieved image will be chosen, with all top-1 retrievals saved to a torch .pt file.
 
 - Set ``data_path`` to the folder containing the Natural Scenes Dataset (will download there if not found; >30Gb per subject, only downloads data for the current subject).
 - Set ``model_name`` to the name of the folder contained in "fMRI-reconstruction-NSD/train_logs" that contains the ckpt mapping brain activity to the last hidden layer of CLIP.
 - Set ``model_name2`` to the name of the folder contained in "fMRI-reconstruction-NSD/train_logs" that contains the ckpt mapping brain activity to the final layer of CLIP.
 
 ```bash
-$ python Retrieval_Evaluation.py --help
+$ python Retrievals.py --help
 ```
 ```
-usage: Retrieval_Evaluation.py [-h] [--model_name MODEL_NAME]
+usage: Retrievals.py [-h] [--model_name MODEL_NAME]
                                [--model_name2 MODEL_NAME2] [--data_path DATA_PATH]
                                [--subj {1,2,5,7}]
 
@@ -216,11 +216,11 @@ options:
 
 ## Evaluating Reconstructions
 
-After you have saved a .pt file from running ``Reconstructions.py`` or ``Retrieval_Evaluation.py``, you can use ``Reconstruction_Metrics.py`` to evaluate reconstructed images using the same low- and high-level image metrics used in the paper.
+After you have saved a .pt file from running ``Reconstructions.py`` or ``Retrievals.py``, you can use ``Reconstruction_Metrics.py`` to evaluate reconstructed images using the same low- and high-level image metrics used in the paper.
 
 - Set ``recon_path`` to the name of the file in "fMRI-reconstruction-NSD/src" that was output from ``Reconstructions.py`` (should be ```{model_name}_recons_img2img{img2img_strength}_{recons_per_sample}samples.pt```). 
-- Alternatively, to evaluate LAION-5B retrievals, you can replace recon_path with the name of the .pt file output from ```Retrieval_Evaluation.py``` (should be ```{model_name}_laion_retrievals_top16.pt```).
-- Set ``all_images_path`` to the all_images.pt file in "fMRI-reconstruction-NSD/src" that was output from either ``Reconstructions.py`` or ``Retrieval_Evaluation.py`` (should be ```all_images.pt```). 
+- Alternatively, to evaluate LAION-5B retrievals, you can replace recon_path with the name of the .pt file output from ```Retrievals.py``` (should be ```{model_name}_laion_retrievals_top16.pt```).
+- Set ``all_images_path`` to the all_images.pt file in "fMRI-reconstruction-NSD/src" that was output from either ``Reconstructions.py`` or ``Retrievals.py`` (should be ```all_images.pt```). 
 
 ```bash
 $ python Reconstruction_Metrics.py --help
