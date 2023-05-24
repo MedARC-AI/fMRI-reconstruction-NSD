@@ -6,7 +6,7 @@
 
 1. Agree to the following [Terms and Conditions](https://cvnlab.slite.page/p/IB6BSeW_7o/Terms-and-Conditions) and fill out the [NSD Data Access form](https://forms.gle/xue2bCdM9LaFNMeb7)
 
-2. Download a copy of this repository via "git clone https://github.com/MedARC-AI/fMRI-reconstruction-NSD.git"
+2. Download this repository: ``git clone https://github.com/MedARC-AI/fMRI-reconstruction-NSD.git``
 
 3. Create a conda environment that will run the notebooks and training scripts:
 
