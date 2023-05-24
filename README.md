@@ -15,16 +15,40 @@ conda env create -f src/environment.yaml
 conda activate medical-v1
 ```
 
-4. (optional) For LAION-5B retrieval you will need to map to the last layer of CLIP ViT-L/14 (in addition to the last hidden layer, which is the standard MindEye pipeline). For training MindEye on just the last layer (aka "4 ResBlocks + Only CLS" in the paper), you will need to cd into the "src" folder and run ``. download.sh``. This will allow you to train the diffusion prior from a pretrained checkpoint (text to image diffusion prior trained from LAION-Aesthetics).
+4. (optional) For LAION-5B retrieval you will need to map to the last layer of CLIP ViT-L/14 (in addition to the last hidden layer, which is the standard MindEye pipeline). For training MindEye on just the last layer ("4 ResBlocks + Only CLS"), you will first need to cd into the "src" folder and run ``. download.sh``. This will allow you to train the diffusion prior starting from a pretrained checkpoint (text-to-image diffusion prior trained from LAION-Aesthetics). We observed that using this checkpoint, rather than training the prior from scratch, significantly improved results.
 
-# Training MindEye (high-level pipeline)
+## General information
+
+This repository contains Jupyter notebooks for 
+
+1. Training MindEye (src/Train_MindEye.ipynb)
+2. Reconstructing images from brain activity using the trained model (src/Reconstructions.ipynb)
+3. Retrieving images from brain activity either from the test set or via LAION-5B (src/Retrieval_Evaluation.ipynb) 
+4. Evaluating reconstructions against the ground truth images according to low- and high-level image metrics (src/Reconstruction_Metrics.ipynb) 
+
+The Jupyter notebooks are configured such that they can be run interactively (.ipynb) or via command-line with argparse arguments (.py).
+
+This repo also contains code for mapping brain activity to the variational autoencoder of Stable Diffusion (src/train_autoencoder.py).
+
+### Pre-trained Subject 1 models
+
+You can skip training MindEye yourself and instead run the rest of the notebooks on Subject 1 of NSD by downloading our pre-trained models available on [huggingface](https://huggingface.co/datasets/pscotti/naturalscenesdataset/tree/main/mindeye_models) and putting these folders containing model checkpoints inside "fMRI-reconstruction-NSD/train_logs/".
+
+```
+prior_257_final_subj01_bimixco_softclip_byol: CLIP ViT-L/14 hidden layer (257x768) 
+prior_1x768_final_subj01_bimixco_softclip_byol: CLIP ViT-L/14 final layer (1x768)
+autoencoder_subj01_4x_locont_no_reconst: Stable Diffusion VAE (low-level pipeline)
+```
+
+## Training MindEye (high-level pipeline)
 
 Train MindEye via ``Train_MindEye.py``.
 
-Set ``data_path`` to where you want to download the Natural Scenes Dataset (warning: >30Gb per subject).
-Set ``model_name`` to what you want to name the model, used for saving.
+- Set ``data_path`` to the folder containing the Natural Scenes Dataset (will download there if not found; >30Gb per subject, only downloads data for the current subject).
+- Set ``model_name`` to what you want to name the model, used for saving.
+- Set ``--no-hidden --no-norm_embs`` if you want to map to the final layer of CLIP for LAION-5B retrieval purposes. Otherwise use the defaults ``--hidden --norm_embs``.
 
-Various arguments can be set (see below), the default is to train MindEye high-level pipeline to the last hidden layer of CLIP ViT-L/14 using the same settings as the paper, for Subject 1.
+Various arguments can be set (see below) for training; the default is to train MindEye to the last hidden layer of CLIP ViT-L/14 using the same settings as our paper, for Subject 1 of NSD.
 
 Trained model checkpoints will be saved inside a folder "fMRI-reconstruction-NSD/train_logs". All other outputs get saved inside "fMRI-reconstruction-NSD/src" folder.
 
@@ -114,11 +138,16 @@ options:
                         will download to this path
 ```
 
-# Reconstructing from pre-trained MindEye
+## Reconstructing from pre-trained MindEye
 
-Pretrained Subject 1 models can be downloaded on [huggingface](https://huggingface.co/datasets/pscotti/naturalscenesdataset/tree/main/mindeye_models). Includes mapping to CLIP ViT-L/14 hidden layer (257x768), CLIP ViT-L/14 final layer (1x768), and Stable Diffusion VAE (low-level pipeline). If you want to use these checkpoints you must put them inside of the train_logs folder like so: "fMRI-reconstruction-NSD/train_logs/model_name/last.pth". Then when you run the below code specify "model_name" as the ``model_name`` argument.
+Now that you have pre-trained model ckpts in your "train_logs" folder, either from running ``Train_MindEye.py`` or by downloading our pre-trained Subject 1 models from [huggingface](https://huggingface.co/datasets/pscotti/naturalscenesdataset/tree/main/mindeye_models), we can proceed to reconstructing images from the test set of held-out brain activity. 
 
 ``Reconstructions.py`` defaults to outputting Versatile Diffusion reconstructions as a torch .pt file, without img2img and without second-order selection (recons_per_sample=1).
+
+- Set ``data_path`` to the folder containing the Natural Scenes Dataset (will download there if not found; >30Gb per subject, only downloads data for the current subject).
+- Set ``model_name`` to the name of the folder contained in "fMRI-reconstruction-NSD/train_logs" that contains the ckpt mapping brain activity to the last hidden layer of CLIP.
+- If you want to use img2img, set ``autoencoder_name`` to the name of the folder contained in "fMRI-reconstruction-NSD/train_logs" that contains the ckpt mapping brain activity to the variational autoencoder of Stable Diffusion. 
+- If you are using img2img, set ``img2img_strength`` to the level of guidance you prefer, where 1=no img2img and 0=outputs solely from the low-level pipeline.
 
 ```bash
 $ python Reconstructions.py --help
@@ -152,26 +181,15 @@ options:
                         download to this path
 ```
 
-# Evaluating Reconstructions
+## Image/Brain Retrieval (inc. LAION-5B image retrieval)
 
-```bash
-$ python Reconstruction_Metrics.py --help
-```
-```
-usage: Reconstruction_Metrics.py [-h] [--recon_path RECON_PATH]
-                                 [--all_images_path ALL_IMAGES_PATH]
+To evaluate image/brain retrieval using the NSD test set then use the Jupyter notebook ``Retrieval_Evaluation.ipynb`` and follow the code blocks under the "Image/Brain Retrieval" heading.
 
-Model Training Configuration
+Running ``Retrieval_Evaluation.py`` will retrieve the top 16 nearest neighbors in LAION-5B based on the MindEye variant where brain activity is mapped to the final layer of CLIP. This is followed by second-order selection where the 16 retrieved images are converted to CLIP last hidden layer embeddings and compared to the MindEye outputs from the core model where brain activity is mapped to the last hidden layer of CLIP. The highest CLIP similarity retrieved image will be chosen, with all top-1 retrievals saved to a torch .pt file.
 
-options:
-  -h, --help            show this help message and exit
-  --recon_path RECON_PATH
-                        path to reconstructed/retrieved outputs
-  --all_images_path ALL_IMAGES_PATH
-                        path to ground truth outputs
-```
-
-# MindEye Retrieval (with LAION-5B)
+- Set ``data_path`` to the folder containing the Natural Scenes Dataset (will download there if not found; >30Gb per subject, only downloads data for the current subject).
+- Set ``model_name`` to the name of the folder contained in "fMRI-reconstruction-NSD/train_logs" that contains the ckpt mapping brain activity to the last hidden layer of CLIP.
+- Set ``model_name2`` to the name of the folder contained in "fMRI-reconstruction-NSD/train_logs" that contains the ckpt mapping brain activity to the final layer of CLIP.
 
 ```bash
 $ python Retrieval_Evaluation.py --help
@@ -195,7 +213,33 @@ options:
   --subj {1,2,5,7}
 ```
 
-# Training MindEye (low-level pipeline)
+
+## Evaluating Reconstructions
+
+After you have saved a .pt file from running ``Reconstructions.py`` or ``Retrieval_Evaluation.py``, you can use ``Reconstruction_Metrics.py`` to evaluate reconstructed images using the same low- and high-level image metrics used in the paper.
+
+- Set ``recon_path`` to the name of the file in "fMRI-reconstruction-NSD/src" that was output from ``Reconstructions.py`` (should be ```{model_name}_recons_img2img{img2img_strength}_{recons_per_sample}samples.pt```). 
+- Alternatively, to evaluate LAION-5B retrievals, you can replace recon_path with the name of the .pt file output from ```Retrieval_Evaluation.py``` (should be ```{model_name}_laion_retrievals_top16.pt```).
+- Set ``all_images_path`` to the all_images.pt file in "fMRI-reconstruction-NSD/src" that was output from either ``Reconstructions.py`` or ``Retrieval_Evaluation.py`` (should be ```all_images.pt```). 
+
+```bash
+$ python Reconstruction_Metrics.py --help
+```
+```
+usage: Reconstruction_Metrics.py [-h] [--recon_path RECON_PATH]
+                                 [--all_images_path ALL_IMAGES_PATH]
+
+Model Training Configuration
+
+options:
+  -h, --help            show this help message and exit
+  --recon_path RECON_PATH
+                        path to reconstructed/retrieved outputs
+  --all_images_path ALL_IMAGES_PATH
+                        path to ground truth outputs
+```
+
+## Training MindEye (low-level pipeline)
 
 Under construction (see train_autoencoder.py)
 
