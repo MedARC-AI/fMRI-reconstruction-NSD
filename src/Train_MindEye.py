@@ -76,11 +76,11 @@ if utils.is_interactive():
 parser = argparse.ArgumentParser(description="Model Training Configuration")
 parser.add_argument(
     "--model_name", type=str, default="testing",
-    help="name of model, used for ckpt saving and wandb logging",
+    help="name of model, used for ckpt saving and wandb logging (if enabled)",
 )
 parser.add_argument(
     "--data_path", type=str, default="/fsx/proj-medarc/fmri/natural-scenes-dataset",
-    help="Path to where NSD data is stored (see README)",
+    help="Path to where NSD data is stored / where to download it to",
 )
 parser.add_argument(
     "--subj",type=int, default=1, choices=[1,2,5,7],
@@ -95,7 +95,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--clip_variant",type=str,default="ViT-L/14",choices=["RN50", "ViT-L/14", "ViT-B/32", "RN50x64"],
-    help='clip variant',
+    help='OpenAI clip variant',
 )
 parser.add_argument(
     "--wandb_log",action=argparse.BooleanOptionalAction,default=False,
@@ -111,11 +111,11 @@ parser.add_argument(
 )
 parser.add_argument(
     "--mixup_pct",type=float,default=.33,
-    help="proportion of way through training when to switch from InfoNCE to soft_clip_loss",
+    help="proportion of way through training when to switch from BiMixCo to SoftCLIP",
 )
 parser.add_argument(
     "--norm_embs",action=argparse.BooleanOptionalAction,default=True,
-    help="Do norming (using cls token if VD) of CLIP embeddings",
+    help="Do l2-norming of CLIP embeddings",
 )
 parser.add_argument(
     "--use_image_aug",action=argparse.BooleanOptionalAction,default=True,
@@ -127,11 +127,11 @@ parser.add_argument(
 )
 parser.add_argument(
     "--prior",action=argparse.BooleanOptionalAction,default=True,
-    help="if False, only train via NCE loss",
+    help="if False, will only use CLIP loss and ignore diffusion prior",
 )
 parser.add_argument(
     "--v2c",action=argparse.BooleanOptionalAction,default=True,
-    help="if False, only train via diffusion prior loss",
+    help="if False, will only use diffusion prior loss",
 )
 parser.add_argument(
     "--plot_umap",action=argparse.BooleanOptionalAction,default=False,

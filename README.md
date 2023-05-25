@@ -62,8 +62,8 @@ usage: Train_MindEye.py [-h] [--model_name MODEL_NAME] [--data_path DATA_PATH]
                         [--clip_variant {RN50,ViT-L/14,ViT-B/32,RN50x64}]
                         [--wandb_log | --no-wandb_log]
                         [--resume_from_ckpt | --no-resume_from_ckpt]
-                        [--wandb_project WANDB_PROJECT] [--mixup_pct MIXUP_PCT]
-                        [--norm_embs | --no-norm_embs]
+                        [--wandb_project WANDB_PROJECT]
+                        [--mixup_pct MIXUP_PCT] [--norm_embs | --no-norm_embs]
                         [--use_image_aug | --no-use_image_aug]
                         [--num_epochs NUM_EPOCHS] [--prior | --no-prior]
                         [--v2c | --no-v2c] [--plot_umap | --no-plot_umap]
@@ -71,7 +71,7 @@ usage: Train_MindEye.py [-h] [--model_name MODEL_NAME] [--data_path DATA_PATH]
                         [--ckpt_saving | --no-ckpt_saving]
                         [--ckpt_interval CKPT_INTERVAL]
                         [--save_at_end | --no-save_at_end] [--seed SEED]
-                        [--max_lr MAX_LR] [--n_samples_save N_SAMPLES_SAVE]
+                        [--max_lr MAX_LR] [--n_samples_save {0,1}]
                         [--use_projector | --no-use_projector]
                         [--vd_cache_dir VD_CACHE_DIR]
 
@@ -81,18 +81,20 @@ options:
   -h, --help            show this help message and exit
   --model_name MODEL_NAME
                         name of model, used for ckpt saving and wandb logging
+                        (if enabled)
   --data_path DATA_PATH
-                        Path to where NSD data is stored (see README)
+                        Path to where NSD data is stored / where to download
+                        it to
   --subj {1,2,5,7}
   --batch_size BATCH_SIZE
-                        Batch size can be increased by 10x if only training v2c
-                        and not diffusion prior
+                        Batch size can be increased by 10x if only training
+                        v2c and not diffusion prior
   --hidden, --no-hidden
                         if True, CLIP embeddings will come from last hidden
-                        layer (e.g., 257x768 - Versatile Diffusion), rather than
-                        final layer (default: True)
+                        layer (e.g., 257x768 - Versatile Diffusion), rather
+                        than final layer (default: True)
   --clip_variant {RN50,ViT-L/14,ViT-B/32,RN50x64}
-                        clip variant
+                        OpenAI clip variant
   --wandb_log, --no-wandb_log
                         whether to log to wandb (default: False)
   --resume_from_ckpt, --no-resume_from_ckpt
@@ -102,16 +104,16 @@ options:
                         wandb project name
   --mixup_pct MIXUP_PCT
                         proportion of way through training when to switch from
-                        InfoNCE to soft_clip_loss
+                        BiMixCo to SoftCLIP
   --norm_embs, --no-norm_embs
-                        Do norming (using cls token if VD) of CLIP embeddings
-                        (default: True)
+                        Do l2-norming of CLIP embeddings (default: True)
   --use_image_aug, --no-use_image_aug
                         whether to use image augmentation (default: True)
   --num_epochs NUM_EPOCHS
                         number of epochs of training
-  --prior, --no-prior   if False, only train via NCE loss (default: True)
-  --v2c, --no-v2c       if False, only train via diffusion prior loss (default:
+  --prior, --no-prior   if False, will only use CLIP loss and ignore diffusion
+                        prior (default: True)
+  --v2c, --no-v2c       if False, will only use diffusion prior loss (default:
                         True)
   --plot_umap, --no-plot_umap
                         Plot UMAP plots alongside reconstructions (default:
@@ -126,7 +128,7 @@ options:
                         epoch shows best validation score (default: False)
   --seed SEED
   --max_lr MAX_LR
-  --n_samples_save N_SAMPLES_SAVE
+  --n_samples_save {0,1}
                         Number of reconstructions for monitoring progress, 0
                         will speed up training
   --use_projector, --no-use_projector
@@ -134,8 +136,8 @@ options:
                         separately learn a way to minimize NCE from prior loss
                         (BYOL) (default: True)
   --vd_cache_dir VD_CACHE_DIR
-                        Where is cached Versatile Diffusion model; if not cached
-                        will download to this path
+                        Where is cached Versatile Diffusion model; if not
+                        cached will download to this path
 ```
 
 ## Reconstructing from pre-trained MindEye
