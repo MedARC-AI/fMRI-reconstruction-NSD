@@ -1,31 +1,17 @@
 #!/bin/bash
-#
 # Commands to setup a new conda environment and install all the necessary packages
-# See the environment.yaml file for a conda freeze after running this.
+# See the environment.yaml file for "conda env export > environment.yaml" after running this.
 
 set -e
 
-conda install -y mamba -n base -c conda-forge
+conda create -n mindeye python=3.10.8 -y
+conda activate mindeye
 
-## create env first
-# mamba create -n medical-v1 python=3.10 -y
+conda install numpy matplotlib tqdm scikit-image jupyterlab -y
+conda install -c conda-forge accelerate -y
 
-mamba install pytorch torchvision torchaudio pytorch-cuda=11.7 -c pytorch -c nvidia -y
-
-## need at least this version of transformers
-mamba install -c huggingface transformers==4.25.1 -y
-
-## using conda will downgrade transformers, so use pip instead
-# mamba install -c conda-forge diffusers -y
-pip install diffusers[torch]
-
-# ananconda channel must be used so that HF transformers is not downgraded
-mamba install -c anaconda ipython ipykernel seaborn pillow h5py scikit-learn -y
-
-pip install webdataset info-nce-pytorch
-
-# for CLIP
-pip install ftfy regex tqdm
-pip install git+https://github.com/openai/CLIP.git
-
+pip install clip-retrieval webdataset clip pandas matplotlib ftfy regex kornia umap-learn
 pip install dalle2-pytorch
+
+pip install torchvision==0.15.2 torch==2.0.1
+pip install diffusers==0.13.0

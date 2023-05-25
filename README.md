@@ -1,91 +1,254 @@
-# fMRI-reconstruction-NSD
+# MindEye: fMRI-to-Image reconstruction & retrieval
 
-To create a conda environment that will run the notebooks and training scripts:
-```bash
-conda env create -f src/environment.yaml
-conda activate medical-v1
-```
-The [setup.sh](./src/setup.sh) script list the conda and pip commands to create this environment. There's also a [Dockerfile](./src/Dockerfile) and docker image that was created with `make build push` on DockerHub at `jimgoo6/laion-fmri`.
+![](docs/pipeline.png)<br>
 
-To use the pretrained diffusion prior weights from LAION 2B, run the `download.sh` script to get the files from HuggingFace. For more info on how that model was trained, see [https://huggingface.co/nousr/conditioned-prior/](https://huggingface.co/nousr/conditioned-prior/).
+## Installation instructions
 
-## voxel2clip model
+1. Agree to the Natural Scenes Dataset's [Terms and Conditions](https://cvnlab.slite.page/p/IB6BSeW_7o/Terms-and-Conditions) and fill out the [NSD Data Access form](https://forms.gle/xue2bCdM9LaFNMeb7)
 
-The voxel2clip feed forward model takes 1D or 3D voxel vectors and converts to a CLIP vector using contrastive learning. Training is done with the [train_voxel2clip.py](./src/train_voxel2clip.py) script:
+2. Download this repository: ``git clone https://github.com/MedARC-AI/fMRI-reconstruction-NSD.git``
+
+3. Run ``setup.sh`` to create a conda environment that contains the packages necessary to run our scripts; activate the environment with ``conda activate mindeye``.
 
 ```bash
-$ python train_voxel2clip.py --help
+cd fMRI-reconstruction-NSD/src
+. setup.sh
 ```
-```
-usage: train_voxel2clip.py [-h] [--model_name MODEL_NAME] [--modality {image,text}] [--clip_variant {RN50,ViT-L/14,ViT-B/32}] [--outdir OUTDIR] [--wandb_log]
-                           [--wandb_project WANDB_PROJECT] [--h5_dir H5_DIR] [--voxel_dims {1,3}] [--remote_data] [--wds_cache_dir WDS_CACHE_DIR] [--disable_image_aug]
 
-Train voxel2clip
+4. (optional) For LAION-5B retrieval you will need to additionally download pretrained checkpoints. To do this, cd into the "src" folder and run ``. download.sh``. This will allow you to train the diffusion prior starting from a [pretrained checkpoint](https://huggingface.co/nousr/conditioned-prior/tree/main/vit-l-14/aesthetic) (text-to-image diffusion prior trained from LAION-Aesthetics). We observed that using this checkpoint, rather than training the prior from scratch, significantly improved LAION-5B retrieval.
+
+## General information
+
+This repository contains Jupyter notebooks for 
+
+1. Training MindEye (src/Train_MindEye.ipynb)
+2. Reconstructing images from brain activity using the trained model (src/Reconstructions.ipynb)
+3. Retrieving images from brain activity either from the test set or via LAION-5B (src/Retrievals.ipynb) 
+4. Evaluating reconstructions against the ground truth images according to low- and high-level image metrics (src/Reconstruction_Metrics.ipynb) 
+
+All the above Jupyter notebooks also have corresponding python (.py) files which can be run via the command-line.
+
+This repo also contains code for mapping brain activity to the variational autoencoder of Stable Diffusion (src/train_autoencoder.py).
+
+### Pre-trained Subject 1 models
+
+You can skip training MindEye yourself and instead run the rest of the notebooks on Subject 1 of NSD by downloading our pre-trained models available on [huggingface](https://huggingface.co/datasets/pscotti/naturalscenesdataset/tree/main/mindeye_models) and putting these folders containing model checkpoints inside "fMRI-reconstruction-NSD/train_logs/".
+
+```
+prior_257_final_subj01_bimixco_softclip_byol: CLIP ViT-L/14 hidden layer (257x768) 
+prior_1x768_final_subj01_bimixco_softclip_byol: CLIP ViT-L/14 final layer (1x768)
+autoencoder_subj01_4x_locont_no_reconst: Stable Diffusion VAE (low-level pipeline)
+```
+
+## Training MindEye (high-level pipeline)
+
+Train MindEye via ``Train_MindEye.py``.
+
+- Set ``data_path`` to the folder containing the Natural Scenes Dataset (will download there if not found; >30Gb per subject, only downloads data for the current subject).
+- Set ``model_name`` to what you want to name the model, used for saving.
+- Set ``--no-hidden --no-norm_embs`` if you want to map to the final layer of CLIP for LAION-5B retrieval or to reconstruct via Stable Diffusion (Image Variations). Otherwise, Versatile Diffusion uses the default ``--hidden --norm_embs``.
+
+Various arguments can be set (see below) for training; the default is to train MindEye to the last hidden layer of CLIP ViT-L/14 using the same settings as our paper, for Subject 1 of NSD.
+
+Trained model checkpoints will be saved inside a folder "fMRI-reconstruction-NSD/train_logs". All other outputs get saved inside "fMRI-reconstruction-NSD/src" folder.
+
+```bash
+$ python Train_MindEye.py --help
+```
+```
+usage: Train_MindEye.py [-h] [--model_name MODEL_NAME] [--data_path DATA_PATH]
+                        [--subj {1,2,5,7}] [--batch_size BATCH_SIZE]
+                        [--hidden | --no-hidden]
+                        [--clip_variant {RN50,ViT-L/14,ViT-B/32,RN50x64}]
+                        [--wandb_log | --no-wandb_log]
+                        [--resume_from_ckpt | --no-resume_from_ckpt]
+                        [--wandb_project WANDB_PROJECT]
+                        [--mixup_pct MIXUP_PCT] [--norm_embs | --no-norm_embs]
+                        [--use_image_aug | --no-use_image_aug]
+                        [--num_epochs NUM_EPOCHS] [--prior | --no-prior]
+                        [--v2c | --no-v2c] [--plot_umap | --no-plot_umap]
+                        [--lr_scheduler_type {cycle,linear}]
+                        [--ckpt_saving | --no-ckpt_saving]
+                        [--ckpt_interval CKPT_INTERVAL]
+                        [--save_at_end | --no-save_at_end] [--seed SEED]
+                        [--max_lr MAX_LR] [--n_samples_save {0,1}]
+                        [--use_projector | --no-use_projector]
+                        [--vd_cache_dir VD_CACHE_DIR]
+
+Model Training Configuration
 
 options:
   -h, --help            show this help message and exit
   --model_name MODEL_NAME
-                        name of model, used for wandb logging
-  --modality {image,text}
-                        image or text
-  --clip_variant {RN50,ViT-L/14,ViT-B/32}
-                        clip variant
-  --outdir OUTDIR       output directory for logs and checkpoints
-  --wandb_log           whether to log to wandb
+                        name of model, used for ckpt saving and wandb logging
+                        (if enabled)
+  --data_path DATA_PATH
+                        Path to where NSD data is stored / where to download
+                        it to
+  --subj {1,2,5,7}
+  --batch_size BATCH_SIZE
+                        Batch size can be increased by 10x if only training
+                        v2c and not diffusion prior
+  --hidden, --no-hidden
+                        if True, CLIP embeddings will come from last hidden
+                        layer (e.g., 257x768 - Versatile Diffusion), rather
+                        than final layer (default: True)
+  --clip_variant {RN50,ViT-L/14,ViT-B/32,RN50x64}
+                        OpenAI clip variant
+  --wandb_log, --no-wandb_log
+                        whether to log to wandb (default: False)
+  --resume_from_ckpt, --no-resume_from_ckpt
+                        if not using wandb and want to resume from a ckpt
+                        (default: False)
   --wandb_project WANDB_PROJECT
                         wandb project name
-  --h5_dir H5_DIR       directory containing COCO h5 files (only used for modality=text)
-  --voxel_dims {1,3}    1 for flattened input, 3 for 3d input
-  --remote_data         whether to pull data from huggingface
-  --wds_cache_dir WDS_CACHE_DIR
-                        directory for caching webdatasets fetched from huggingface
-  --disable_image_aug   whether to disable image augmentation (only used for modality=image)
+  --mixup_pct MIXUP_PCT
+                        proportion of way through training when to switch from
+                        BiMixCo to SoftCLIP
+  --norm_embs, --no-norm_embs
+                        Do l2-norming of CLIP embeddings (default: True)
+  --use_image_aug, --no-use_image_aug
+                        whether to use image augmentation (default: True)
+  --num_epochs NUM_EPOCHS
+                        number of epochs of training
+  --prior, --no-prior   if False, will only use CLIP loss and ignore diffusion
+                        prior (default: True)
+  --v2c, --no-v2c       if False, will only use diffusion prior loss (default:
+                        True)
+  --plot_umap, --no-plot_umap
+                        Plot UMAP plots alongside reconstructions (default:
+                        False)
+  --lr_scheduler_type {cycle,linear}
+  --ckpt_saving, --no-ckpt_saving
+  --ckpt_interval CKPT_INTERVAL
+                        save backup ckpt and reconstruct every x epochs
+  --save_at_end, --no-save_at_end
+                        if True, saves best.ckpt at end of training. if False
+                        and ckpt_saving==True, will save best.ckpt whenever
+                        epoch shows best validation score (default: False)
+  --seed SEED
+  --max_lr MAX_LR
+  --n_samples_save {0,1}
+                        Number of reconstructions for monitoring progress, 0
+                        will speed up training
+  --use_projector, --no-use_projector
+                        Additional MLP after the main MLP so model can
+                        separately learn a way to minimize NCE from prior loss
+                        (BYOL) (default: True)
+  --vd_cache_dir VD_CACHE_DIR
+                        Where is cached Versatile Diffusion model; if not
+                        cached will download to this path
 ```
 
-## Combined model
+## Reconstructing from pre-trained MindEye
+
+Now that you have pre-trained model ckpts in your "train_logs" folder, either from running ``Train_MindEye.py`` or by downloading our pre-trained Subject 1 models from [huggingface](https://huggingface.co/datasets/pscotti/naturalscenesdataset/tree/main/mindeye_models), we can proceed to reconstructing images from the test set of held-out brain activity. 
+
+``Reconstructions.py`` defaults to outputting Versatile Diffusion reconstructions as a torch .pt file, without img2img and without second-order selection (recons_per_sample=1).
+
+- Set ``data_path`` to the folder containing the Natural Scenes Dataset (will download there if not found; >30Gb per subject, only downloads data for the current subject).
+- Set ``model_name`` to the name of the folder contained in "fMRI-reconstruction-NSD/train_logs" that contains the ckpt mapping brain activity to the last hidden layer of CLIP.
+- If you want to use img2img, set ``autoencoder_name`` to the name of the folder contained in "fMRI-reconstruction-NSD/train_logs" that contains the ckpt mapping brain activity to the variational autoencoder of Stable Diffusion. 
+- If you are using img2img, set ``img2img_strength`` to the level of guidance you prefer, where 1=no img2img and 0=outputs solely from the low-level pipeline.
 
 ```bash
-# model diagram to go here
+$ python Reconstructions.py --help
+```
+```
+usage: Reconstructions.py [-h] [--model_name MODEL_NAME]
+                          [--autoencoder_name AUTOENCODER_NAME] [--data_path DATA_PATH]
+                          [--subj {1,2,5,7}] [--img2img_strength IMG2IMG_STRENGTH]
+                          [--recons_per_sample RECONS_PER_SAMPLE]
+                          [--vd_cache_dir VD_CACHE_DIR]
+
+Model Training Configuration
+
+options:
+  -h, --help            show this help message and exit
+  --model_name MODEL_NAME
+                        name of trained model
+  --autoencoder_name AUTOENCODER_NAME
+                        name of trained autoencoder model
+  --data_path DATA_PATH
+                        Path to where NSD data is stored (see README)
+  --subj {1,2,5,7}
+  --img2img_strength IMG2IMG_STRENGTH
+                        How much img2img (1=no img2img; 0=outputting the low-level image
+                        itself)
+  --recons_per_sample RECONS_PER_SAMPLE
+                        How many recons to output, to then automatically pick the best
+                        one (MindEye uses 16)
+  --vd_cache_dir VD_CACHE_DIR
+                        Where is cached Versatile Diffusion model; if not cached will
+                        download to this path
 ```
 
-The combined model is a combination of two models trained end-to-end:
+## Image/Brain Retrieval (inc. LAION-5B image retrieval)
 
-1) The voxel2clip feed forward model that takes 1D or 3D voxel vectors and converts to a CLIP image vector using contrastive learning.
-2) The diffusion prior network from DALLE2-pytorch which takes an input CLIP vector and refines it to a target CLIP space using MSE loss. We initialize the weights from the [pretrained prior](https://huggingface.co/nousr/conditioned-prior) that was trained on LAION aesthetics to go from text CLIP to image CLIP as part of the [DALLE2-pytorch](https://github.com/lucidrains/DALLE2-pytorch) project.
+To evaluate image/brain retrieval using the NSD test set then use the Jupyter notebook ``Retrievals.ipynb`` and follow the code blocks under the "Image/Brain Retrieval" heading.
 
-The loss for this model is a combination of NCE for the voxel2clip model and MSE for the diffusion prior model. There is an alpha parameter that controls the relative weight of the two losses.
+Running ``Retrievals.py`` will retrieve the top 16 nearest neighbors in LAION-5B based on the MindEye variant where brain activity is mapped to the final layer of CLIP. This is followed by second-order selection where the 16 retrieved images are converted to CLIP last hidden layer embeddings and compared to the MindEye outputs from the core model where brain activity is mapped to the last hidden layer of CLIP. The highest CLIP similarity retrieved image will be chosen, with all top-1 retrievals saved to a torch .pt file.
 
-To train this model, you use the `train_combined.py` script, which accepts config files and parameter values as arguments. For example, this is the command to run the current best model:
+- Set ``data_path`` to the folder containing the Natural Scenes Dataset (will download there if not found; >30Gb per subject, only downloads data for the current subject).
+- Set ``model_name`` to the name of the folder contained in "fMRI-reconstruction-NSD/train_logs" that contains the ckpt mapping brain activity to the last hidden layer of CLIP.
+- Set ``model_name2`` to the name of the folder contained in "fMRI-reconstruction-NSD/train_logs" that contains the ckpt mapping brain activity to the final layer of CLIP.
 
 ```bash
-python train_combined.py \
-config/1D_combo.py \
---remote_data=True
+$ python Retrievals.py --help
+```
+```
+usage: Retrievals.py [-h] [--model_name MODEL_NAME]
+                               [--model_name2 MODEL_NAME2] [--data_path DATA_PATH]
+                               [--subj {1,2,5,7}]
+
+Model Training Configuration
+
+options:
+  -h, --help            show this help message and exit
+  --model_name MODEL_NAME
+                        name of 257x768 model, used for everything except LAION-5B
+                        retrieval
+  --model_name2 MODEL_NAME2
+                        name of 1x768 model, used for LAION-5B retrieval
+  --data_path DATA_PATH
+                        Path to where NSD data is stored (see README)
+  --subj {1,2,5,7}
 ```
 
-The `--remote_data=True` flag will download the NSD WebDatasets directly from HuggingFace and save them into `/tmp/wds-cache` by default. To train on the Stability cluster with slurm, run `sbatch train_combined.slurm`, which will essentially run the above command in a conda env with 8 GPUs.
 
-To keep the two models separate and have the voxel2clip model be frozen throughout training, you can set `--combine_models=False` and pass a voxel2clip checkpoint path:
+## Evaluating Reconstructions
+
+After you have saved a .pt file from running ``Reconstructions.py`` or ``Retrievals.py``, you can use ``Reconstruction_Metrics.py`` to evaluate reconstructed images using the same low- and high-level image metrics used in the paper.
+
+- Set ``recon_path`` to the name of the file in "fMRI-reconstruction-NSD/src" that was output from ``Reconstructions.py`` (should be ```{model_name}_recons_img2img{img2img_strength}_{recons_per_sample}samples.pt```). 
+- Alternatively, to evaluate LAION-5B retrievals, you can replace recon_path with the name of the .pt file output from ```Retrievals.py``` (should be ```{model_name}_laion_retrievals_top16.pt```).
+- Set ``all_images_path`` to the all_images.pt file in "fMRI-reconstruction-NSD/src" that was output from either ``Reconstructions.py`` or ``Retrievals.py`` (should be ```all_images.pt```). 
 
 ```bash
-python train_combined.py \
-config/1D_combo.py \
---remote_data=True \
---combine_models=False \
---voxel2clip_path='checkpoints/clip_image_vitL_2stage_mixco_lotemp_125ep_subj01_best.pth' \
+$ python Reconstruction_Metrics.py --help
+```
+```
+usage: Reconstruction_Metrics.py [-h] [--recon_path RECON_PATH]
+                                 [--all_images_path ALL_IMAGES_PATH]
+
+Model Training Configuration
+
+options:
+  -h, --help            show this help message and exit
+  --recon_path RECON_PATH
+                        path to reconstructed/retrieved outputs
+  --all_images_path ALL_IMAGES_PATH
+                        path to ground truth outputs
 ```
 
-The same `--voxel2clip_path` flag can be used to load a checkpoint during end-to-end training as well (when `--combine_models=True`, which is the default).
+## Training MindEye (low-level pipeline)
 
-When the two models are combined, the default behavior is to combine losses of the two models so that `loss = alpha * loss_mse + loss_nce`. With the default of `alpha = 0.01`, the two terms are weighted roughly equally at the beginning of training. You can disable this via the `--combine_losses=False` flag, which will just use the MSE loss for the diffusion prior model.
+Under construction (see train_autoencoder.py)
 
-## Weights & Biases
+# Citation
 
-Metrics and sampled images are saved to the Stability wandb project at [https://stability.wandb.io/jimgoo/fMRI-reconstruction-NSD?workspace=user-jimgoo](https://stability.wandb.io/jimgoo/fMRI-reconstruction-NSD?workspace=user-jimgoo). 
+If you make use of this work please cite both the MindEye paper and the Natural Scenes Dataset paper.
 
-For logging to the Stability wandb account:
+Scotti*, Banerjee*, Goode†, Shabalin, Nguyen, Cohen, Dempster, Verlinde, Yundler, Weisberg, Norman§, & Abraham§. Reconstructing the Mind's Eye: fMRI-to-Image with Contrastive Learning and Diffusion Priors. arXiv (2023).
 
-```bash
-pip install wandb
-wandb login --host=https://stability.wandb.io --relogin
-```
+Allen, St-Yves, Wu, Breedlove, Prince, Dowdle, Nau, Caron, Pestilli, Charest, Hutchinson, Naselaris*, & Kay*. A massive 7T fMRI dataset to bridge cognitive neuroscience and artificial intelligence. Nature Neuroscience (2021).

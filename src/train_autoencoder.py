@@ -21,7 +21,7 @@ import kornia
 from kornia.augmentation.container import AugmentationSequential
 from pytorch_msssim import ssim
 
-import ddp_config
+# import ddp_config
 
 import utils
 from models import Voxel2StableDiffusionModel
