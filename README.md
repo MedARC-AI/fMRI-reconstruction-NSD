@@ -15,7 +15,7 @@ cd fMRI-reconstruction-NSD/src
 . setup.sh
 ```
 
-4. (optional) For LAION-5B retrieval you will need to additionally download pretrained checkpoints. To do this, cd into the "src" folder and run ``. download.sh``. This will allow you to train the diffusion prior starting from a [pretrained checkpoint](https://huggingface.co/nousr/conditioned-prior/tree/main/vit-l-14/aesthetic) (text-to-image diffusion prior trained from LAION-Aesthetics). We observed that using this checkpoint, rather than training the prior from scratch, significantly improved LAION-5B retrieval. You will also need to install 
+4. (optional) For LAION-5B retrieval you will need to additionally download pretrained checkpoints. To do this, cd into the "src" folder and run ``. download.sh``. This will allow you to train the diffusion prior starting from a [pretrained checkpoint](https://huggingface.co/nousr/conditioned-prior/tree/main/vit-l-14/aesthetic) (text-to-image diffusion prior trained from LAION-Aesthetics). We observed that using this checkpoint, rather than training the prior from scratch, significantly improved LAION-5B retrieval.
 
 ## General information
 
