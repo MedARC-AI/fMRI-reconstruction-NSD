@@ -8,7 +8,7 @@
 
 2. Download this repository: ``git clone https://github.com/MedARC-AI/fMRI-reconstruction-NSD.git``
 
-3. Create a conda environment named "mindeye" by running ``setup.sh``:
+3. Run ``setup.sh`` to create a conda environment that contains the packages necessary to run our scripts; activate the environment with ``conda activate mindeye``.
 
 ```bash
 cd fMRI-reconstruction-NSD/src
