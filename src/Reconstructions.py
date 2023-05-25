@@ -10,7 +10,7 @@
 # call(command,shell=True)
 
 
-# In[1]:
+# In[2]:
 
 
 import os
@@ -56,10 +56,6 @@ if utils.is_interactive():
     
     jupyter_args = jupyter_args.split()
     print(jupyter_args)
-    
-    from IPython.display import clear_output # function to clear print outputs in cell
-    get_ipython().run_line_magic('load_ext', 'autoreload')
-    get_ipython().run_line_magic('autoreload', '2 # this allows you to change functions in models.py or utils.py and have this notebook automatically update with your revisions')
 
 
 # In[3]:
@@ -422,16 +418,10 @@ all_brain_recons = all_brain_recons.view(-1,3,imsize,imsize)
 print(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
 if saving:
-    torch.save(all_images,f'all_images')
-    torch.save(all_brain_recons,f'{model_name}_recons_img2img{img2img_strength}_{recons_per_sample}samples')
+    torch.save(all_images,f'all_images.pt')
+    torch.save(all_brain_recons,f'{model_name}_recons_img2img{img2img_strength}_{recons_per_sample}samples.pt')
 print(f'recon_path: {model_name}_recons_img2img{img2img_strength}_{recons_per_sample}samples')
 
 if not utils.is_interactive():
     sys.exit(0)
-
-
-# In[ ]:
-
-
-
 

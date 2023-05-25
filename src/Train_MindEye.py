@@ -766,7 +766,6 @@ for epoch in progress_bar:
                         vd_pipe = vd_pipe.to(device)
                     grid, _, _, _ = utils.reconstruction(
                         val_image0, val_voxel0,
-                        #clip_extractor, vd_pipe.image_unet, vd_pipe.vae, vd_pipe.scheduler,
                         clip_extractor, unet, vae, noise_scheduler,
                         diffusion_priors = diffusion_prior.module if distributed else diffusion_prior,
                         num_inference_steps = num_inference_steps,
@@ -777,7 +776,7 @@ for epoch in progress_bar:
                         retrieve = False,
                         plotting = True,
                         img_variations = not hidden,
-                        verbose=True,
+                        verbose=False,
                     )
                 if wandb_log:
                     logs[f"val/recons"] = wandb.Image(grid, caption=f"epoch{epoch:03d}")

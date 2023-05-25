@@ -48,7 +48,7 @@ imsize = 512
 
 # # Configurations
 
-# In[3]:
+# In[4]:
 
 
 # if running this interactively, can specify jupyter_args here for argparser to use
@@ -58,13 +58,9 @@ if utils.is_interactive():
     
     jupyter_args = jupyter_args.split()
     print(jupyter_args)
-    
-    from IPython.display import clear_output # function to clear print outputs in cell
-    get_ipython().run_line_magic('load_ext', 'autoreload')
-    get_ipython().run_line_magic('autoreload', '2 # this allows you to change functions in models.py or utils.py and have this notebook automatically update with your revisions')
 
 
-# In[6]:
+# In[5]:
 
 
 parser = argparse.ArgumentParser(description="Model Training Configuration")
@@ -87,7 +83,7 @@ for attribute_name in vars(args).keys():
     globals()[attribute_name] = getattr(args, attribute_name)
 
 
-# In[7]:
+# In[6]:
 
 
 all_brain_recons = torch.load(f'{recon_path}')
@@ -102,7 +98,7 @@ all_brain_recons = all_brain_recons.to(device).to(all_images.dtype).clamp(0,1)
 
 # # Display reconstructions next to ground truth images
 
-# In[12]:
+# In[8]:
 
 
 imsize = 256
@@ -136,7 +132,7 @@ show(grid,figsize=(20,16))
 
 # # 2-Way Identification
 
-# In[53]:
+# In[9]:
 
 
 from torchvision.models.feature_extraction import create_feature_extractor, get_graph_node_names
@@ -168,7 +164,7 @@ def two_way_identification(all_brain_recons, all_images, model, preprocess, feat
 
 # ## PixCorr
 
-# In[54]:
+# In[10]:
 
 
 preprocess = transforms.Compose([
@@ -193,7 +189,7 @@ print(pixcorr)
 
 # ## SSIM
 
-# In[55]:
+# In[11]:
 
 
 # see https://github.com/zijin-gu/meshconv-decoding/issues/3
@@ -219,7 +215,7 @@ print(ssim)
 
 # ### AlexNet
 
-# In[56]:
+# In[12]:
 
 
 from torchvision.models import alexnet, AlexNet_Weights
@@ -252,7 +248,7 @@ print(f"2-way Percent Correct: {alexnet5:.4f}")
 
 # ### InceptionV3
 
-# In[57]:
+# In[13]:
 
 
 from torchvision.models import inception_v3, Inception_V3_Weights
@@ -277,7 +273,7 @@ print(f"2-way Percent Correct: {inception:.4f}")
 
 # ### CLIP
 
-# In[58]:
+# In[14]:
 
 
 import clip
@@ -297,7 +293,7 @@ print(f"2-way Percent Correct: {clip_:.4f}")
 
 # ### Efficient Net
 
-# In[59]:
+# In[15]:
 
 
 from torchvision.models import efficientnet_b1, EfficientNet_B1_Weights
@@ -324,7 +320,7 @@ print("Distance:",effnet)
 
 # ### SwAV
 
-# In[60]:
+# In[16]:
 
 
 swav_model = torch.hub.load('facebookresearch/swav:main', 'resnet50')
@@ -349,7 +345,7 @@ print("Distance:",swav)
 
 # # Display in table
 
-# In[61]:
+# In[34]:
 
 
 # Create a dictionary to store variable names and their corresponding values
@@ -359,10 +355,9 @@ data = {
 }
 
 df = pd.DataFrame(data)
-print(model_name)
 print(df.to_string(index=False))
 
 if not utils.is_interactive():
     # save table to txt file
-    df.to_csv(f'{recon_path}.txt', sep='\t', index=False)
+    df.to_csv(f'{recon_path[:-3]}.csv', sep='\t', index=False)
 

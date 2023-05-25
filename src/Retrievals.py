@@ -59,10 +59,6 @@ if utils.is_interactive():
     
     jupyter_args = jupyter_args.split()
     print(jupyter_args)
-    
-    from IPython.display import clear_output # function to clear print outputs in cell
-    get_ipython().run_line_magic('load_ext', 'autoreload')
-    get_ipython().run_line_magic('autoreload', '2 # this allows you to change functions in models.py or utils.py and have this notebook automatically update with your revisions')
 
 
 # In[4]:
