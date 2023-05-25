@@ -46,7 +46,7 @@ Train MindEye via ``Train_MindEye.py``.
 
 - Set ``data_path`` to the folder containing the Natural Scenes Dataset (will download there if not found; >30Gb per subject, only downloads data for the current subject).
 - Set ``model_name`` to what you want to name the model, used for saving.
-- Set ``--no-hidden --no-norm_embs`` if you want to map to the final layer of CLIP for LAION-5B retrieval purposes. Otherwise use the defaults ``--hidden --norm_embs``.
+- Set ``--no-hidden --no-norm_embs`` if you want to map to the final layer of CLIP for LAION-5B retrieval or to reconstruct via Stable Diffusion (Image Variations). Otherwise, Versatile Diffusion uses the default ``--hidden --norm_embs``.
 
 Various arguments can be set (see below) for training; the default is to train MindEye to the last hidden layer of CLIP ViT-L/14 using the same settings as our paper, for Subject 1 of NSD.
 
