@@ -1,4 +1,4 @@
-# # Import packages & functions
+ # # Import packages & functions
 
 import os
 import shutil
@@ -57,7 +57,7 @@ if use_reconst:
     batch_size = 8
 else:
     batch_size = 32
-num_epochs = 120
+num_epochs = 50
 lr_scheduler = 'cycle'
 initial_lr = 1e-3
 max_lr = 5e-4
@@ -128,9 +128,8 @@ n_cache_recs = 0
 # # Prep models and data loaders
 if local_rank == 0: print('Creating voxel2sd...')
 
-in_dims = {'01': 15724, '02': 14278, '05': 13039, '07':12682}
 if voxel_dims == 1: # 1D data
-    voxel2sd = Voxel2StableDiffusionModel(use_cont=use_cont, in_dim=in_dims[subj_id], ups_mode=ups_mode)
+    voxel2sd = Voxel2StableDiffusionModel(use_cont=use_cont, in_dim=1685, ups_mode=ups_mode, h=1024, n_blocks=2)
 elif voxel_dims == 3: # 3D data
     raise NotImplementedError()
     
@@ -146,38 +145,118 @@ except:
 
 if local_rank == 0: print('Pulling NSD webdataset data...')
 
-train_url = f"{{/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/train/train_subj{subj_id}_{{0..17}}.tar,/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/val/val_subj{subj_id}_0.tar}}"
-val_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/test/test_subj{subj_id}_{{0..1}}.tar"
-meta_url = f"/fsx/proj-medarc/fmri/natural-scenes-dataset/webdataset_avg_split/metadata_subj{subj_id}.json"
+## USING BOLD5000 DATASET
+from torch.utils.data import Dataset, DataLoader
+def get_stimuli_list(root, sub):
+    sti_name = []
+    path = os.path.join(root, 'Stimuli_Presentation_Lists', sub)
+    folders = os.listdir(path)
+    folders.sort()
+    for folder in folders:
+        if not os.path.isdir(os.path.join(path, folder)):
+            continue
+        files = os.listdir(os.path.join(path, folder))
+        files.sort()
+        for file in files:
+            if file.endswith('.txt'):
+                sti_name += list(np.loadtxt(os.path.join(path, folder, file), dtype=str))
 
+    sti_name_to_return = []
+    for name in sti_name:
+        if name.startswith('rep_'):
+            name = name.replace('rep_', '', 1)
+        sti_name_to_return.append(name)
+    return sti_name_to_return
 
-# which to use for the voxels
-if voxel_dims == 1:
-    voxels_key = 'nsdgeneral.npy'
-elif voxel_dims == 3:
-    voxels_key = 'wholebrain_3d.npy'
-else:
-    raise Exception(f"voxel_dims must be 1 or 3, not {voxel_dims}")
+def list_get_all_index(list, value):
+    return [i for i, v in enumerate(list) if v == value]
 
-if local_rank == 0: print('Prepping train and validation dataloaders...')
-num_train = 8559 + 300
-num_val = 982
+class FMRI_Dataset(Dataset):
+    def __init__(self, images, fmri):
+        self.images = images
+        self.fmri = fmri
+        self.coco = fmri
+    
+    def __len__(self):
+        return len(self.images)
 
-train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
-    batch_size,
-    num_devices=num_devices,
-    num_workers=num_workers,
-    train_url=train_url,
-    val_url=val_url,
-    meta_url=meta_url,
-    val_batch_size=max(16, batch_size),
-    cache_dir='/tmp/wds-cache',
-    seed=seed+local_rank,
-    voxels_key=voxels_key,
-    local_rank=local_rank,
-    num_train=num_train,
-    num_val=num_val
-)
+    def __getitem__(self, idx):
+        return self.fmri[idx], self.images[idx], self.coco[idx]
+    
+def create_BOLD5000_dataset(path='/fsx/proj-fmri/shared/datasets_god_hcp_bold5000/BOLD5000', fmri_transform=None,
+            image_transform=None, subjects = ['CSI1', 'CSI2', 'CSI3', 'CSI4'], include_nonavg_test=False):
+    roi_list = ['EarlyVis', 'LOC', 'OPA', 'PPA', 'RSC']
+    fmri_path = os.path.join(path, 'BOLD5000_GLMsingle_ROI_betas/py')
+    img_path = os.path.join(path, 'BOLD5000_Stimuli')
+    imgs_dict = np.load(os.path.join(img_path, 'Scene_Stimuli/Presented_Stimuli/img_dict.npy'),allow_pickle=True).item()
+    repeated_imgs_list = np.loadtxt(os.path.join(img_path, 'Scene_Stimuli', 'repeated_stimuli_113_list.txt'), dtype=str)
+
+    fmri_files = [f for f in os.listdir(fmri_path) if f.endswith('.npy')]
+    fmri_files.sort()
+    
+    fmri_train_major = []
+    fmri_test_major = []
+    img_train_major = []
+    img_test_major = []
+    for sub in subjects:
+        # load fmri
+        fmri_data_sub = []
+        for roi in roi_list:
+            for npy in fmri_files:
+                if npy.endswith('.npy') and sub in npy and roi in npy:
+                    fmri_data_sub.append(np.load(os.path.join(fmri_path, npy)))
+        fmri_data_sub = np.concatenate(fmri_data_sub, axis=-1) # concatenate all rois
+        # fmri_data_sub = normalize(pad_to_patch_size(fmri_data_sub, patch_size))
+      
+        # load image
+        img_files = get_stimuli_list(img_path, sub)
+        img_data_sub = [imgs_dict[name] for name in img_files]
+        
+        # split train test
+        test_idx = [list_get_all_index(img_files, img) for img in repeated_imgs_list]
+        test_idx = [i for i in test_idx if len(i) > 0] # remove empy list for CSI4
+        test_fmri = np.stack([fmri_data_sub[idx].mean(axis=0) for idx in test_idx])
+        test_img = np.stack([img_data_sub[idx[0]] for idx in test_idx])
+        
+        test_idx_flatten = []
+        for idx in test_idx:
+            test_idx_flatten += idx # flatten
+        if include_nonavg_test:
+            test_fmri = np.concatenate([test_fmri, fmri_data_sub[test_idx_flatten]], axis=0)
+            test_img = np.concatenate([test_img, np.stack([img_data_sub[idx] for idx in test_idx_flatten])], axis=0)
+
+        train_idx = [i for i in range(len(img_files)) if i not in test_idx_flatten]
+        train_img = np.stack([img_data_sub[idx] for idx in train_idx])
+        train_fmri = fmri_data_sub[train_idx]
+
+        fmri_train_major.append(train_fmri)
+        fmri_test_major.append(test_fmri)
+        img_train_major.append(train_img)
+        img_test_major.append(test_img)
+    fmri_train_major = np.concatenate(fmri_train_major, axis=0)
+    fmri_test_major = np.concatenate(fmri_test_major, axis=0)
+    img_train_major = np.concatenate(img_train_major, axis=0)
+    img_test_major = np.concatenate(img_test_major, axis=0)
+
+    print("fmri_train_major",fmri_train_major.shape)
+    print("fmri_test_major",fmri_test_major.shape)
+    print("img_train_major",img_train_major.shape)
+    print("img_test_major",img_test_major.shape)
+    
+    num_voxels = fmri_train_major.shape[-1]
+    print("num_voxels", num_voxels)
+    return (FMRI_Dataset(img_train_major, fmri_train_major), 
+                FMRI_Dataset(img_test_major, fmri_test_major))
+
+### Replacing the NSD dataloaders ###
+train_dataset, test_dataset = create_BOLD5000_dataset(subjects = ['CSI1'])
+train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, drop_last=True)
+train_dl = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, sampler=train_sampler, drop_last=True)
+val_dl = DataLoader(test_dataset, batch_size=16, shuffle=False, drop_last=True)
+god=True
+num_train = 4803
+num_val = 113
+num_voxels = 1685
 
 no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
 opt_grouped_parameters = [
@@ -247,6 +326,7 @@ best_ssim = 0
 mean = torch.tensor([0.485, 0.456, 0.406]).to(device).reshape(1,3,1,1)
 std = torch.tensor([0.228, 0.224, 0.225]).to(device).reshape(1,3,1,1)
 for epoch in progress_bar:
+    train_sampler.set_epoch(epoch)
     voxel2sd.train()
     
     loss_mse_sum = 0
@@ -262,10 +342,11 @@ for epoch in progress_bar:
     for train_i, (voxel, image, _) in enumerate(train_dl):
         optimizer.zero_grad()
 
+        image = (torch.permute(image, (0,3,1,2)).float()/255).float()
+
         image = image.to(device).float()
         image_512 = F.interpolate(image, (512, 512), mode='bilinear', align_corners=False, antialias=True)
         voxel = voxel.to(device).float()
-        voxel = utils.voxel_select(voxel)
         if epoch <= mixup_pct * num_epochs:
             voxel, perm, betas, select = utils.mixco(voxel)
         else:
@@ -363,10 +444,10 @@ for epoch in progress_bar:
         voxel2sd.eval()
         for val_i, (voxel, image, _) in enumerate(val_dl): 
             with torch.inference_mode():
+                image = (torch.permute(image, (0,3,1,2)).float()/255).float()
                 image = image.to(device).float()
                 image = F.interpolate(image, (512, 512), mode='bilinear', align_corners=False, antialias=True)              
                 voxel = voxel.to(device).float()
-                voxel = voxel.mean(1)
                 
                 with torch.cuda.amp.autocast(enabled=use_mp):
                     image_enc = autoenc.encode(2*image-1).latent_dist.mode() * 0.18215

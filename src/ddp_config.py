@@ -35,13 +35,13 @@ def ddp_test():
 def set_ddp():
     import torch.distributed as dist
     env_dict = {
-        key: os.environ[key]
+        key: os.environ.get(key)
         for key in ("MASTER_ADDR", "MASTER_PORT", "RANK",
                     "LOCAL_RANK", "WORLD_SIZE", "NUM_GPUS")
     }
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
-    n = int(os.environ["NUM_GPUS"])
+    n = int(os.environ.get("NUM_GPUS", 8))
     device_ids = list(
         range(local_rank * n, (local_rank + 1) * n)
     )
