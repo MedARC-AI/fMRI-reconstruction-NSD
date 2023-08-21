@@ -28,11 +28,12 @@ class Clipper(torch.nn.Module):
         print(clip_variant, device)
         
         if clip_variant=="ViT-L/14" and hidden_state:
-            # from transformers import CLIPVisionModelWithProjection
-            # image_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14",cache_dir="/fsx/proj-medarc/fmri/cache")
             from transformers import CLIPVisionModelWithProjection
-            sd_cache_dir = '/fsx/proj-medarc/fmri/cache/models--shi-labs--versatile-diffusion/snapshots/2926f8e11ea526b562cd592b099fcf9c2985d0b7'
-            image_encoder = CLIPVisionModelWithProjection.from_pretrained(sd_cache_dir, subfolder='image_encoder').eval()
+            image_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14").eval()
+            # image_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14",cache_dir="/fsx/proj-medarc/fmri/cache")
+            #from transformers import CLIPVisionModelWithProjection
+            #sd_cache_dir = '/fsx/proj-medarc/fmri/cache/models--shi-labs--versatile-diffusion/snapshots/2926f8e11ea526b562cd592b099fcf9c2985d0b7'
+            #image_encoder = CLIPVisionModelWithProjection.from_pretrained(sd_cache_dir, subfolder='image_encoder').eval()
             image_encoder = image_encoder.to(device)
             for param in image_encoder.parameters():
                 param.requires_grad = False # dont need to calculate gradients
