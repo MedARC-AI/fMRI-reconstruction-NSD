@@ -1,4 +1,4 @@
-# # Import packages & functions
+ # # Import packages & functions
 
 import os
 import shutil
@@ -14,6 +14,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from info_nce import InfoNCE
 from tqdm import tqdm
 from collections import OrderedDict
+from dalle2_pytorch import DiffusionPriorNetwork
 
 from torchvision.utils import make_grid
 from PIL import Image
@@ -21,43 +22,13 @@ import kornia
 from kornia.augmentation.container import AugmentationSequential
 from pytorch_msssim import ssim
 
+import ddp_config
+_, local_rank, device, num_devices = ddp_config.set_ddp()
+
 import utils
 from models import Voxel2StableDiffusionModel
 from convnext import ConvnextXL
 
-def set_ddp():
-    import torch.distributed as dist
-    env_dict = {
-        key: os.environ.get(key)
-        for key in ("MASTER_ADDR", "MASTER_PORT", "RANK",
-                    "LOCAL_RANK", "WORLD_SIZE", "NUM_GPUS")
-    }
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    n = int(os.environ.get("NUM_GPUS", 8))
-    device_ids = list(
-        range(local_rank * n, (local_rank + 1) * n)
-    )
-
-    if local_rank == 0:
-        print(f"[{os.getpid()}] Initializing process group with: {env_dict}")
-    dist.init_process_group(backend="nccl")
-    print(
-        f"[{os.getpid()}] world_size = {dist.get_world_size()}, "
-        + f"rank = {dist.get_rank()}, backend={dist.get_backend()}"
-    )
-
-    print(
-        f"[{os.getpid()}] rank = {dist.get_rank()} ({rank}), "
-        + f"world_size = {dist.get_world_size()}, n = {n}, device_ids = {device_ids}"
-    )
-    device = torch.device("cuda", local_rank)
-    return local_rank, device, n
-
-local_rank = 0
-device = torch.device("cuda:0")
-num_devices = 1
-distributed = False
 
 from diffusers.models import AutoencoderKL
 autoenc = AutoencoderKL(
@@ -70,6 +41,7 @@ autoenc = AutoencoderKL(
 autoenc.load_state_dict(torch.load('../train_logs/models/sd_image_var_autoenc.pth'))
 autoenc.requires_grad_(False)
 autoenc.eval()
+autoenc.to(device)
 
 # # Configurations
 model_name = "autoencoder"
@@ -81,8 +53,11 @@ voxel_dims = 1 # 1 for flattened 3 for 3d
 n_samples_save = 4 # how many SD samples from train and val to save
 
 use_reconst = False
-batch_size = 8
-num_epochs = 120
+if use_reconst:
+    batch_size = 8
+else:
+    batch_size = 32
+num_epochs = 50
 lr_scheduler = 'cycle'
 initial_lr = 1e-3
 max_lr = 5e-4
@@ -92,24 +67,19 @@ ckpt_interval = 24
 save_at_end = False
 use_mp = False
 remote_data = False
-data_commit = "avg"  # '9947586218b6b7c8cab804009ddca5045249a38d'
+subj_id = "01"
 mixup_pct = -1
 use_cont = True
 use_sobel_loss = False
 use_blurred_training = False
-
-use_full_trainset = True
-subj_id = "01"
-seed = 0
-# ckpt_path = "../train_logs/models/autoencoder_final/test/ckpt-epoch015.pth"
-ckpt_path = None
 cont_model = 'cnx'
+seed = 42
 resume_from_ckpt = False
 ups_mode = '4x'
 
-# need non-deterministic CuDNN for conv3D to work
-utils.seed_everything(seed+local_rank, cudnn_deterministic=False)
 torch.backends.cuda.matmul.allow_tf32 = True
+# need non-deterministic CuDNN for conv3D to work
+utils.seed_everything(local_rank+seed, cudnn_deterministic=False)
 
 # if running command line, read in args or config file values and override above params
 try:
@@ -119,10 +89,6 @@ try:
     config = {k: globals()[k] for k in config_keys} # will be useful for logging
 except:
     pass
-
-if distributed:
-    local_rank, device, num_devices = set_ddp()
-autoenc.to(device)
 
 if use_cont:
     mixup_pct = -1
@@ -142,7 +108,7 @@ if use_cont:
         data_keys=["input"],
     )
 
-outdir = f'../train_logs/models/{model_name}/'
+outdir = f'../train_logs/models/{model_name}/test'
 if local_rank==0:
     os.makedirs(outdir, exist_ok=True)
 
@@ -162,16 +128,14 @@ n_cache_recs = 0
 # # Prep models and data loaders
 if local_rank == 0: print('Creating voxel2sd...')
 
-in_dims = {'01': 15724, '02': 14278, '05': 13039, '07':12682}
 if voxel_dims == 1: # 1D data
-    voxel2sd = Voxel2StableDiffusionModel(use_cont=use_cont, in_dim=in_dims[subj_id], ups_mode=ups_mode)
+    voxel2sd = Voxel2StableDiffusionModel(use_cont=use_cont, in_dim=1685, ups_mode=ups_mode, h=1024, n_blocks=2)
 elif voxel_dims == 3: # 3D data
     raise NotImplementedError()
     
 voxel2sd.to(device)
 voxel2sd = torch.nn.SyncBatchNorm.convert_sync_batchnorm(voxel2sd)
-if distributed:
-    voxel2sd = DDP(voxel2sd)
+voxel2sd = DDP(voxel2sd, device_ids=[local_rank])
 
 try:
     utils.count_params(voxel2sd)
@@ -181,29 +145,118 @@ except:
 
 if local_rank == 0: print('Pulling NSD webdataset data...')
 
-train_url = f"{{/fsx/proj-fmri/shared/natural-scenes-dataset/webdataset_avg_split/train/train_subj{subj_id}_{{0..17}}.tar,/fsx/proj-fmri/shared/natural-scenes-dataset/webdataset_avg_split/val/val_subj{subj_id}_0.tar}}"
-val_url = f"/fsx/proj-fmri/shared/natural-scenes-dataset/webdataset_avg_split/test/test_subj{subj_id}_{{0..1}}.tar"
-meta_url = f"/fsx/proj-fmri/shared/natural-scenes-dataset/webdataset_avg_split/metadata_subj{subj_id}.json"
+## USING BOLD5000 DATASET
+from torch.utils.data import Dataset, DataLoader
+def get_stimuli_list(root, sub):
+    sti_name = []
+    path = os.path.join(root, 'Stimuli_Presentation_Lists', sub)
+    folders = os.listdir(path)
+    folders.sort()
+    for folder in folders:
+        if not os.path.isdir(os.path.join(path, folder)):
+            continue
+        files = os.listdir(os.path.join(path, folder))
+        files.sort()
+        for file in files:
+            if file.endswith('.txt'):
+                sti_name += list(np.loadtxt(os.path.join(path, folder, file), dtype=str))
 
-if local_rank == 0: print('Prepping train and validation dataloaders...')
-num_train = 8559 + 300
-num_val = 982
+    sti_name_to_return = []
+    for name in sti_name:
+        if name.startswith('rep_'):
+            name = name.replace('rep_', '', 1)
+        sti_name_to_return.append(name)
+    return sti_name_to_return
 
-train_dl, val_dl, num_train, num_val = utils.get_dataloaders(
-    batch_size,
-    num_devices=num_devices,
-    num_workers=num_workers,
-    train_url=train_url,
-    val_url=val_url,
-    meta_url=meta_url,
-    val_batch_size=max(16, batch_size),
-    cache_dir='/tmp/wds-cache',
-    seed=seed+local_rank,
-    voxels_key='nsdgeneral.npy',
-    local_rank=local_rank,
-    num_train=num_train,
-    num_val=num_val
-)
+def list_get_all_index(list, value):
+    return [i for i, v in enumerate(list) if v == value]
+
+class FMRI_Dataset(Dataset):
+    def __init__(self, images, fmri):
+        self.images = images
+        self.fmri = fmri
+        self.coco = fmri
+    
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        return self.fmri[idx], self.images[idx], self.coco[idx]
+    
+def create_BOLD5000_dataset(path='/fsx/proj-fmri/shared/datasets_god_hcp_bold5000/BOLD5000', fmri_transform=None,
+            image_transform=None, subjects = ['CSI1', 'CSI2', 'CSI3', 'CSI4'], include_nonavg_test=False):
+    roi_list = ['EarlyVis', 'LOC', 'OPA', 'PPA', 'RSC']
+    fmri_path = os.path.join(path, 'BOLD5000_GLMsingle_ROI_betas/py')
+    img_path = os.path.join(path, 'BOLD5000_Stimuli')
+    imgs_dict = np.load(os.path.join(img_path, 'Scene_Stimuli/Presented_Stimuli/img_dict.npy'),allow_pickle=True).item()
+    repeated_imgs_list = np.loadtxt(os.path.join(img_path, 'Scene_Stimuli', 'repeated_stimuli_113_list.txt'), dtype=str)
+
+    fmri_files = [f for f in os.listdir(fmri_path) if f.endswith('.npy')]
+    fmri_files.sort()
+    
+    fmri_train_major = []
+    fmri_test_major = []
+    img_train_major = []
+    img_test_major = []
+    for sub in subjects:
+        # load fmri
+        fmri_data_sub = []
+        for roi in roi_list:
+            for npy in fmri_files:
+                if npy.endswith('.npy') and sub in npy and roi in npy:
+                    fmri_data_sub.append(np.load(os.path.join(fmri_path, npy)))
+        fmri_data_sub = np.concatenate(fmri_data_sub, axis=-1) # concatenate all rois
+        # fmri_data_sub = normalize(pad_to_patch_size(fmri_data_sub, patch_size))
+      
+        # load image
+        img_files = get_stimuli_list(img_path, sub)
+        img_data_sub = [imgs_dict[name] for name in img_files]
+        
+        # split train test
+        test_idx = [list_get_all_index(img_files, img) for img in repeated_imgs_list]
+        test_idx = [i for i in test_idx if len(i) > 0] # remove empy list for CSI4
+        test_fmri = np.stack([fmri_data_sub[idx].mean(axis=0) for idx in test_idx])
+        test_img = np.stack([img_data_sub[idx[0]] for idx in test_idx])
+        
+        test_idx_flatten = []
+        for idx in test_idx:
+            test_idx_flatten += idx # flatten
+        if include_nonavg_test:
+            test_fmri = np.concatenate([test_fmri, fmri_data_sub[test_idx_flatten]], axis=0)
+            test_img = np.concatenate([test_img, np.stack([img_data_sub[idx] for idx in test_idx_flatten])], axis=0)
+
+        train_idx = [i for i in range(len(img_files)) if i not in test_idx_flatten]
+        train_img = np.stack([img_data_sub[idx] for idx in train_idx])
+        train_fmri = fmri_data_sub[train_idx]
+
+        fmri_train_major.append(train_fmri)
+        fmri_test_major.append(test_fmri)
+        img_train_major.append(train_img)
+        img_test_major.append(test_img)
+    fmri_train_major = np.concatenate(fmri_train_major, axis=0)
+    fmri_test_major = np.concatenate(fmri_test_major, axis=0)
+    img_train_major = np.concatenate(img_train_major, axis=0)
+    img_test_major = np.concatenate(img_test_major, axis=0)
+
+    print("fmri_train_major",fmri_train_major.shape)
+    print("fmri_test_major",fmri_test_major.shape)
+    print("img_train_major",img_train_major.shape)
+    print("img_test_major",img_test_major.shape)
+    
+    num_voxels = fmri_train_major.shape[-1]
+    print("num_voxels", num_voxels)
+    return (FMRI_Dataset(img_train_major, fmri_train_major), 
+                FMRI_Dataset(img_test_major, fmri_test_major))
+
+### Replacing the NSD dataloaders ###
+train_dataset, test_dataset = create_BOLD5000_dataset(subjects = ['CSI1'])
+train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, drop_last=True)
+train_dl = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, sampler=train_sampler, drop_last=True)
+val_dl = DataLoader(test_dataset, batch_size=16, shuffle=False, drop_last=True)
+god=True
+num_train = 4803
+num_val = 113
+num_voxels = 1685
 
 no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
 opt_grouped_parameters = [
@@ -252,11 +305,8 @@ if resume_from_ckpt:
     print("\n---resuming from ckpt_path---\n", ckpt_path)
     checkpoint = torch.load(ckpt_path, map_location=device)
     epoch = checkpoint['epoch']+1
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict']) 
-    if hasattr(voxel2sd, 'module'):
-        voxel2sd.module.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        voxel2sd.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])        
+    voxel2sd.module.load_state_dict(checkpoint['model_state_dict'])
     total_steps_done = epoch*((num_train//batch_size)//num_devices)
     for _ in range(total_steps_done):
         lr_scheduler.step()
@@ -275,24 +325,8 @@ best_val_loss = 1e10
 best_ssim = 0
 mean = torch.tensor([0.485, 0.456, 0.406]).to(device).reshape(1,3,1,1)
 std = torch.tensor([0.228, 0.224, 0.225]).to(device).reshape(1,3,1,1)
-epoch = 0
-
-if ckpt_path is not None:
-    print("\n---resuming from ckpt_path---\n",ckpt_path)
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    epoch = checkpoint['epoch']+1
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])        
-    voxel2sd.module.load_state_dict(checkpoint['model_state_dict'])
-    global_batch_size = batch_size * num_devices
-    total_steps_done = epoch*(num_train//global_batch_size)
-    for _ in range(total_steps_done):
-        lr_scheduler.step()
-    del checkpoint
-    torch.cuda.empty_cache()
-
-progress_bar = tqdm(range(epoch, num_epochs), ncols=150, disable=(local_rank!=0))
-
 for epoch in progress_bar:
+    train_sampler.set_epoch(epoch)
     voxel2sd.train()
     
     loss_mse_sum = 0
@@ -308,10 +342,11 @@ for epoch in progress_bar:
     for train_i, (voxel, image, _) in enumerate(train_dl):
         optimizer.zero_grad()
 
+        image = (torch.permute(image, (0,3,1,2)).float()/255).float()
+
         image = image.to(device).float()
         image_512 = F.interpolate(image, (512, 512), mode='bilinear', align_corners=False, antialias=True)
         voxel = voxel.to(device).float()
-        voxel = utils.voxel_select(voxel)
         if epoch <= mixup_pct * num_epochs:
             voxel, perm, betas, select = utils.mixco(voxel)
         else:
@@ -342,7 +377,7 @@ for epoch in progress_bar:
                     F.normalize(cnx_embeds.reshape(-1, cnx_embeds.shape[-1]), dim=-1),
                     F.normalize(cnx_aug_embeds.reshape(-1, cnx_embeds.shape[-1]), dim=-1),
                     temp=0.075,
-                    distributed=distributed
+                    distributed=True
                 )
                 del image_aug, cnx_embeds, transformer_feats
             else:
@@ -409,17 +444,14 @@ for epoch in progress_bar:
         voxel2sd.eval()
         for val_i, (voxel, image, _) in enumerate(val_dl): 
             with torch.inference_mode():
+                image = (torch.permute(image, (0,3,1,2)).float()/255).float()
                 image = image.to(device).float()
                 image = F.interpolate(image, (512, 512), mode='bilinear', align_corners=False, antialias=True)              
                 voxel = voxel.to(device).float()
-                voxel = voxel.mean(1)
                 
                 with torch.cuda.amp.autocast(enabled=use_mp):
                     image_enc = autoenc.encode(2*image-1).latent_dist.mode() * 0.18215
-                    if hasattr(voxel2sd, 'module'):
-                        image_enc_pred = voxel2sd.module(voxel)
-                    else:
-                        image_enc_pred = voxel2sd(voxel)
+                    image_enc_pred = voxel2sd.module(voxel)
 
                     mse_loss = F.mse_loss(image_enc_pred, image_enc)
                     
@@ -496,8 +528,10 @@ for epoch in progress_bar:
         if len(reconst_fails) > 0 and local_rank==0:
             print(f'Reconst fails {len(reconst_fails)}/{train_i}: {reconst_fails}')
 
-    if distributed:
+    if True:
         dist.barrier()
+
+
 
 
 

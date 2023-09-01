@@ -619,6 +619,19 @@ class Voxel2StableDiffusionModel(torch.nn.Module):
             )
             self.maps_projector = nn.Identity()
 
+            if use_cont:
+                self.maps_projector = nn.Sequential(
+                    nn.Conv2d(64, 512, 1, bias=False),
+                    nn.GroupNorm(1,512),
+                    nn.ReLU(True),
+                    nn.Conv2d(512, 512, 1, bias=False),
+                    nn.GroupNorm(1,512),
+                    nn.ReLU(True),
+                    nn.Conv2d(512, 512, 1, bias=True),
+                )
+            else:
+                self.maps_projector = nn.Identity()
+
     def forward(self, x, return_transformer_feats=False):
         x = self.lin0(x)
         residual = x
