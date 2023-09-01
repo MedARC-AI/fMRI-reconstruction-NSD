@@ -247,7 +247,9 @@ options:
 
 ## Training MindEye (low-level pipeline)
 
-Under construction (see train_autoencoder.py)
+Run ``train_autoencoder.py`` to train the MindEye low-level model. 
+
+Before training set the ``train_url``, ``val_url`` an ``meta_url`` variables in the python file to the relevant NSD dataset location. The training code expects the weights for VICRegL ConvNext-XL (download from [here](https://dl.fbaipublicfiles.com/vicregl/convnext_xlarge_alpha0.75_fullckpt.pth)).
 
 # Citation
 
