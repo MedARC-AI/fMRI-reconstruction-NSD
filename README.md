@@ -150,7 +150,7 @@ Now that you have pre-trained model ckpts in your "train_logs" folder, either fr
 
 ``Reconstructions.py`` defaults to outputting Versatile Diffusion reconstructions as a torch .pt file, without img2img and without second-order selection (recons_per_sample=1).
 
-- Set ``data_path`` to the folder containing the Natural Scenes Dataset (will download there if not found; >30Gb per subject, only downloads data for the current subject).
+- Set ``data_path`` to the folder containing the Natural Scenes Dataset (needs to be downloaded first either through the above training script or manually via [huggingface](https://huggingface.co/datasets/pscotti/naturalscenesdataset/tree/main/webdataset_avg_split)).
 - Set ``model_name`` to the name of the folder contained in "fMRI-reconstruction-NSD/train_logs" that contains the ckpt mapping brain activity to the last hidden layer of CLIP.
 - If you want to use img2img, set ``autoencoder_name`` to the name of the folder contained in "fMRI-reconstruction-NSD/train_logs" that contains the ckpt mapping brain activity to the variational autoencoder of Stable Diffusion. 
 - If you are using img2img, set ``img2img_strength`` to the level of guidance you prefer, where 1=no img2img and 0=outputs solely from the low-level pipeline.
