@@ -249,7 +249,7 @@ options:
 
 Run ``train_autoencoder.py`` to train the MindEye low-level model. 
 
-Before training set the ``train_url``, ``val_url`` an ``meta_url`` variables in the python file to the relevant NSD dataset location. The training code expects the weights for VICRegL ConvNext-XL (download from [here](https://dl.fbaipublicfiles.com/vicregl/convnext_xlarge_alpha0.75_fullckpt.pth)).
+Before training set the ``train_url``, ``val_url`` an ``meta_url`` variables in the python file to the relevant NSD dataset location. The training code expects the weights for VICRegL ConvNext-XL (download from [here](https://dl.fbaipublicfiles.com/vicregl/convnext_xlarge_alpha0.75_fullckpt.pth)) and Stable Diffusion Image Variations Autoencoder (download from [here](https://huggingface.co/datasets/pscotti/naturalscenesdataset/blob/main/sd_image_var_autoenc.pth)). Note that these SD autoencoder weights have been extracted as is from the LambdaLabs SD Image Variations v2 model [here](https://huggingface.co/lambdalabs/sd-image-variations-diffusers).
 
 # Citation
 
