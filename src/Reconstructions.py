@@ -185,12 +185,12 @@ print('Creating versatile diffusion reconstruction pipeline...')
 from diffusers import VersatileDiffusionDualGuidedPipeline, UniPCMultistepScheduler
 from diffusers.models import DualTransformer2DModel
 try:
-    vd_pipe =  VersatileDiffusionDualGuidedPipeline.from_pretrained(vd_cache_dir).to(device)
+    vd_pipe =  VersatileDiffusionDualGuidedPipeline.from_pretrained(vd_cache_dir).to(device).to(torch.float16)
 except:
     print("Downloading Versatile Diffusion to", vd_cache_dir)
     vd_pipe =  VersatileDiffusionDualGuidedPipeline.from_pretrained(
             "shi-labs/versatile-diffusion",
-            cache_dir = vd_cache_dir).to(device)
+            cache_dir = vd_cache_dir).to(device).to(torch.float16)
 vd_pipe.image_unet.eval()
 vd_pipe.vae.eval()
 vd_pipe.image_unet.requires_grad_(False)
