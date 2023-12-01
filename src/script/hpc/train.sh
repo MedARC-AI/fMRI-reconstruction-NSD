@@ -19,4 +19,4 @@ python Train_MindEye.py --data_path $DATA_DIR \
                         --wandb_log \
                         --prior
 
-cd src/script/hpc
+cd script/hpc

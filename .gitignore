@@ -9,3 +9,4 @@
 *.pth
 src/evals
 src/evals-*
+*.out
