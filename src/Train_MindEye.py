@@ -465,7 +465,7 @@ if local_rank==0 and wandb_log: # only use main process for wandb logging
     wandb_notes = ''
     
     print(f"wandb {wandb_project} run {wandb_run}")
-    wandb.login(host='https://stability.wandb.io')#, relogin=True)
+    wandb.login(host='https://api.wandb.ai')
     wandb_config = {
       "model_name": model_name,
       "clip_variant": clip_variant,
