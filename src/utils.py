@@ -245,6 +245,7 @@ def get_dataloaders(
     
     train_url = list(braceexpand.braceexpand(train_url))
     val_url = list(braceexpand.braceexpand(val_url))
+
     if not os.path.exists(train_url[0]):
         # we will default to downloading from huggingface urls if data_path does not exist
         print("downloading NSD from huggingface...")
@@ -256,24 +257,30 @@ def get_dataloaders(
         test_url = list(braceexpand.braceexpand(test_url))
         
         from tqdm import tqdm
+        train_path = os.path.join(cache_dir,'webdataset_avg_split/train')
+        os.makedirs(train_path,exist_ok=True)
         for url in tqdm(train_url):
-            destination = cache_dir + "/" + url.rsplit('/', 1)[-1]
+            destination = train_path + "/" + url.rsplit('/', 1)[-1]
             print(f"\nDownloading {url} to {destination}...")
             response = requests.get(url)
             response.raise_for_status()
             with open(destination, 'wb') as file:
                 file.write(response.content)
-                
+        
+        val_path = os.path.join(cache_dir,'webdataset_avg_split/val')
+        os.makedirs(val_path,exist_ok=True)
         for url in tqdm(val_url):
-            destination = cache_dir + "/" + url.rsplit('/', 1)[-1]
+            destination = val_path + "/" + url.rsplit('/', 1)[-1]
             print(f"\nDownloading {url} to {destination}...")
             response = requests.get(url)
             response.raise_for_status()
             with open(destination, 'wb') as file:
                 file.write(response.content)
-                
+
+        test_path = os.path.join(cache_dir,'webdataset_avg_split/test')
+        os.makedirs(test_path,exist_ok=True)   
         for url in tqdm(test_url):
-            destination = cache_dir + "/" + url.rsplit('/', 1)[-1]
+            destination = test_path + "/" + url.rsplit('/', 1)[-1]
             print(f"\nDownloading {url} to {destination}...")
             response = requests.get(url)
             response.raise_for_status()
