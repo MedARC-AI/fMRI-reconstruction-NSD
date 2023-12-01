@@ -609,7 +609,7 @@ for epoch in progress_bar:
                 aligned_clip_voxels /= diffusion_prior.module.image_embed_scale if distributed else diffusion_prior.image_embed_scale
             else:
                 aligned_clip_voxels = clip_voxels
-
+            
             clip_voxels_norm = nn.functional.normalize(clip_voxels_proj.flatten(1), dim=-1)
             clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
 
