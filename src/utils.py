@@ -480,14 +480,22 @@ def reconstruction(
     img_variations=False,
     n_samples_save=1,
     num_retrieved=16,
+    image_target_embeds=None,
 ):
+    # to_pil_image = transforms.ToPILImage()
+    # pil_image = to_pil_image(image[0])
+    # # save the pil_image
+    # pil_image.save('image.png')
+
     assert n_samples_save==1, "n_samples_save must = 1. Function must be called one image at a time"
-    
+    diffusion_priors = None
     brain_recons = None
-    
+    print(image.shape)
+    print(voxel.shape)
     voxel=voxel[:n_samples_save]
     image=image[:n_samples_save]
-
+    print(image.shape)
+    print(voxel.shape)
     if unet is not None:
         do_classifier_free_guidance = guidance_scale > 1.0
         vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
@@ -534,11 +542,6 @@ def reconstruction(
         if recons_per_sample>0:
             brain_clip_embeddings = brain_clip_embeddings_sum / len(diffusion_priors)
     
-    if voxel2clip_cls is not None:
-        _, cls_embeddings = voxel2clip_cls(voxel.to(device).float())
-    else:
-        cls_embeddings = proj_embeddings
-    if verbose: print("cls_embeddings.",cls_embeddings.shape)
     
     if retrieve:
         image_retrieved = query_laion(emb=cls_embeddings.flatten(),groundtruth=None,num=num_retrieved,
@@ -552,7 +555,10 @@ def reconstruction(
             for samp in range(len(brain_clip_embeddings)):
                 brain_clip_embeddings[samp] = brain_clip_embeddings[samp]/(brain_clip_embeddings[samp,0].norm(dim=-1).reshape(-1, 1, 1) + 1e-6)
         else:
-            brain_clip_embeddings = brain_clip_embeddings.unsqueeze(1)
+            brain_clip_embeddings = image_target_embeds[:n_samples_save].unsqueeze(1)
+            print("brain_clip_embeddings",brain_clip_embeddings.shape)
+            print(brain_clip_embeddings)
+            # brain_clip_embeddings = brain_clip_embeddings.unsqueeze(1)
         
         input_embedding = brain_clip_embeddings#.repeat(recons_per_sample, 1, 1)
         if verbose: print("input_embedding",input_embedding.shape)
@@ -628,31 +634,6 @@ def reconstruction(
                     
     # pick best reconstruction out of several
     best_picks = np.zeros(n_samples_save).astype(np.int16)
-    
-    if retrieve==False:
-        v2c_reference_out = nn.functional.normalize(proj_embeddings.view(len(proj_embeddings),-1),dim=-1)
-        sims=[]
-        for im in range(recons_per_sample): 
-            currecon = clip_extractor.embed_image(brain_recons[0,[im]].float()).to(proj_embeddings.device).to(proj_embeddings.dtype)
-            currecon = nn.functional.normalize(currecon.view(len(currecon),-1),dim=-1)
-            cursim = batchwise_cosine_similarity(v2c_reference_out,currecon)
-            sims.append(cursim.item())
-        if verbose: print(sims)
-        best_picks[0] = int(np.nanargmax(sims))   
-        if verbose: print(best_picks)
-    else: 
-        v2c_reference_out = nn.functional.normalize(proj_embeddings.view(len(proj_embeddings),-1),dim=-1)
-        retrieved_clips = clip_extractor.embed_image(torch.Tensor(image_retrieved).to(device)).float()
-        sims=[]
-        for ii,im in enumerate(retrieved_clips):
-            currecon = nn.functional.normalize(im.flatten()[None],dim=-1)
-            if verbose: print(v2c_reference_out.shape, currecon.shape)
-            cursim = batchwise_cosine_similarity(v2c_reference_out,currecon)
-            sims.append(cursim.item())
-        if verbose: print(sims)
-        best_picks[0] = int(np.nanargmax(sims)) 
-        if verbose: print(best_picks)
-        recon_img = image_retrieved[best_picks[0]]
     
     if recons_per_sample==0 and retrieve:
         recon_is_laion = True

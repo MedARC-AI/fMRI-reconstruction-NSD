@@ -522,6 +522,7 @@ if hidden:
 else:
     prior_mult = .03
 val_voxel0 = val_image0 = None
+val_clip_target0 = None
 
 # Optionally resume from checkpoint #
 if resume_from_ckpt:
@@ -598,9 +599,12 @@ for epoch in progress_bar:
             if epoch < int(mixup_pct * num_epochs):
                 voxel, perm, betas, select = utils.mixco(voxel)
 
-            clip_target = clip_extractor.embed_image(image).float()   
+            clip_target = clip_extractor.embed_image(image).float()
+            print("clip_target.shape:",clip_target.shape)   
 
             clip_voxels, clip_voxels_proj = diffusion_prior.module.voxel2clip(voxel) if distributed else diffusion_prior.voxel2clip(voxel)
+            print("clip_voxels.shape:",clip_voxels.shape)
+            print("clip_voxels_proj.shape:",clip_voxels_proj.shape)
             if hidden:
                 clip_voxels = clip_voxels.view(len(voxel),-1,clip_size)
             
@@ -658,6 +662,8 @@ for epoch in progress_bar:
             if lr_scheduler_type is not None:
                 lr_scheduler.step()
 
+        break
+
     diffusion_prior.eval()
     for val_i, (voxel, image, coco) in enumerate(val_dl): 
         with torch.no_grad():
@@ -670,10 +676,6 @@ for epoch in progress_bar:
                 if use_image_aug:
                     image = img_augment(image)
 
-                if val_image0 is None:
-                    val_image0 = image.detach().clone()
-                    val_voxel0 = voxel.detach().clone()
-
                 clip_target = clip_extractor.embed_image(image).float()
 
                 clip_voxels, clip_voxels_proj = diffusion_prior.module.voxel2clip(voxel) if distributed else diffusion_prior.voxel2clip(voxel)
@@ -685,6 +687,11 @@ for epoch in progress_bar:
                     aligned_clip_voxels /= diffusion_prior.module.image_embed_scale if distributed else diffusion_prior.image_embed_scale
                 else:
                     aligned_clip_voxels = clip_voxels
+
+                if val_image0 is None:
+                    val_image0 = image.detach().clone()
+                    val_voxel0 = voxel.detach().clone()
+                    val_clip_target0 = clip_target.detach().clone()
 
                 clip_voxels_norm = nn.functional.normalize(clip_voxels_proj.flatten(1), dim=-1)
                 clip_target_norm = nn.functional.normalize(clip_target.flatten(1), dim=-1)
@@ -723,7 +730,7 @@ for epoch in progress_bar:
                 labels = torch.arange(len(clip_target_norm)).to(device)
                 val_fwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_voxels_norm,clip_target_norm), labels, k=1)
                 val_bwd_percent_correct += utils.topk(utils.batchwise_cosine_similarity(clip_target_norm, clip_voxels_norm), labels, k=1)
-
+        break
     if local_rank==0:        
         if (not save_at_end and ckpt_saving) or (save_at_end and epoch == num_epochs - 1):
             # save best model
@@ -776,7 +783,8 @@ for epoch in progress_bar:
                         retrieve = False,
                         plotting = True,
                         img_variations = not hidden,
-                        verbose=False,
+                        verbose=True,
+                        image_target_embeds = val_clip_target0,
                     )
                 if wandb_log:
                     logs[f"val/recons"] = wandb.Image(grid, caption=f"epoch{epoch:03d}")
