@@ -2,10 +2,11 @@
 
 cd ..
 
-DATA_DIR="/scratch/yl6624/Data/natural-scences-dataset"
+DATA_DIR="/home/ppwang/Data/NSD"
 
 python Train_MindEye.py --data_path $DATA_DIR \
                         --model_name training \
-                        --no-prior
+                        --no-hidden \
+                        --n_samples_save 1
 
 cd script

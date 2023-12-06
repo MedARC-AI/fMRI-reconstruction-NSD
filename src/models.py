@@ -364,7 +364,7 @@ class BrainDiffusionPriorOld(DiffusionPrior):
         return loss, pred#, text_embed
    
     @staticmethod
-    def from_pretrained(net_kwargs={}, prior_kwargs={}, voxel2clip_path=None, ckpt_dir='./checkpoints'):
+    def from_pretrained(net_kwargs={}, prior_kwargs={}, voxel2clip_path=None, ckpt_dir='./checkpoints/fmri/prior'):
         # "https://huggingface.co/nousr/conditioned-prior/raw/main/vit-l-14/aesthetic/prior_config.json"
         config_url = os.path.join(ckpt_dir, "prior_config.json")
         config = json.load(open(config_url))

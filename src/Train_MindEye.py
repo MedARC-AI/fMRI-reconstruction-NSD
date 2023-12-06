@@ -417,7 +417,7 @@ elif n_samples_save > 0:
     print('Creating SD image variations reconstruction pipeline...')
     from diffusers import AutoencoderKL, UNet2DConditionModel, UniPCMultistepScheduler
 
-    sd_cache_dir = '/fsx/home-paulscotti/.cache/huggingface/diffusers/models--lambdalabs--sd-image-variations-diffusers/snapshots/a2a13984e57db80adcc9e3f85d568dcccb9b29fc'
+    sd_cache_dir = './checkpoints/fmri/sd-image-variations-diffusers'
     unet = UNet2DConditionModel.from_pretrained(sd_cache_dir,subfolder="unet").to(device)
 
     unet.eval() # dont want to train model
