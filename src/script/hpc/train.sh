@@ -16,7 +16,10 @@ DATA_DIR="/scratch/yl6624/Data/natural-scences-dataset"
 
 python Train_MindEye.py --data_path $DATA_DIR \
                         --model_name mindeye \
-                        --wandb_log \
+                        --no-wandb_log \
+                        --ckpt_interval 1 \
+                        --n_samples_save 1 \
+                        --no-hidden \
                         --prior
 
 cd script/hpc
