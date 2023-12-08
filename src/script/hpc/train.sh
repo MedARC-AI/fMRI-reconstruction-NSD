@@ -13,7 +13,7 @@
 cd ../..
 
 DATA_DIR="/scratch/yl6624/Data/natural-scences-dataset"
-
+conda activate mindeye
 python Train_MindEye.py --data_path $DATA_DIR \
                         --model_name mindeye \
                         --no-wandb_log \
@@ -21,5 +21,5 @@ python Train_MindEye.py --data_path $DATA_DIR \
                         --n_samples_save 1 \
                         --no-hidden \
                         --prior
-
+conda deactivate
 cd script/hpc
