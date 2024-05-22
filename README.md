@@ -1,6 +1,6 @@
 # MindEye: fMRI-to-Image reconstruction & retrieval
 
-**May 22 2024: [Check out our new work, MindEye2](https://github.com/MedARC-AI/MindEyeV2), which beats MindEye1 across all metrics!
+**May 22 2024: [Check out our new work, MindEye2](https://github.com/MedARC-AI/MindEyeV2), which beats MindEye1 across all metrics!**
 
 ![](docs/pipeline.png)<br>
 
